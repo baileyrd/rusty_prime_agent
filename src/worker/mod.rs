@@ -72,7 +72,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
         WorkerMode::Resume => AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime).await?,
         WorkerMode::Recover => {
-            let session = AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime).await?;
+            let mut session = AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime).await?;
             session.emit_recovery_marker("worker recovered after a crash; transcript restored from disk");
             session
         }
@@ -108,13 +108,21 @@ async fn handle_private_connection(session: Arc<Mutex<AgentSession>>, mut conn: 
     match request {
         Request::Ping => conn.write_response(Context::Worker, &Response::Pong).await,
         Request::SessionAttach { .. } => {
-            let (session_id, snapshot, mut events) = {
-                let guard = session.lock().await;
-                (guard.state.session_id.clone(), guard.snapshot_event(), guard.subscribe())
+            let (session_id, snapshot, pending_marker, mut events) = {
+                let mut guard = session.lock().await;
+                (
+                    guard.state.session_id.clone(),
+                    guard.snapshot_event(),
+                    guard.take_pending_recovery_marker(),
+                    guard.subscribe(),
+                )
             };
             conn.write_response(Context::Worker, &Response::SessionAttachStarted { session_id })
                 .await?;
             conn.write_event(Context::Worker, &snapshot).await?;
+            if let Some(marker) = pending_marker {
+                conn.write_event(Context::Worker, &marker).await?;
+            }
             loop {
                 match events.recv().await {
                     Ok(event) => {
@@ -192,17 +200,30 @@ pub async fn spawn(exe_path: &Path, state_root: &Path, session_id: &str, mode: W
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     procutil::prepare_detached(&mut cmd);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| HarnessError::io(Context::Worker, Some(exe_path.to_owned()), e))?;
     let pid = child.id();
-    // The worker outlives this handle by design (`prepare_detached`);
-    // nothing in this process ever calls `wait()`/`kill()` on it -- the
-    // OS process keeps running detached (dropping without waiting just
-    // orphans it, `kill_on_drop` defaults to `false`), and its pid is
-    // what `state.json` (written by the worker itself moments after
-    // this) records as the recovery pointer.
-    drop(child);
+    // The worker outlives this *process* by design (`prepare_detached`'s
+    // `setsid`/`DETACHED_PROCESS`), but on Unix `setsid` alone does not
+    // reparent the child away from this supervisor the way a full
+    // double-fork daemonization would -- the kernel still considers the
+    // worker this process's child until something here calls `wait` on
+    // it, so a worker that dies while the supervisor is still running
+    // becomes a zombie under it, not silently reaped. That zombie still
+    // answers `kill(pid, 0)` successfully (POSIX: a zombie pid is very
+    // much still "alive" for that check), which would make
+    // `catalog::effective_status`'s crash detection never fire --
+    // `tests/worker_crash_recovery.rs`'s own repro. So the `Child` is
+    // handed to a fire-and-forget reaper task instead of dropped: it
+    // does nothing but wait, has no effect on "detached" (that's
+    // `setsid`'s doing, not whether anything here calls `wait`), and if
+    // the *supervisor* is the one that dies first, the worker is simply
+    // reparented to init, which reaps it the ordinary way -- this task
+    // only ever matters for the worker-dies-first ordering.
+    rusty_tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(pid)
 }
 

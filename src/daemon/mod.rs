@@ -64,6 +64,22 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         spawn_lock: Mutex::new(()),
     });
 
+    // Still here deliberately, not an oversight: these DBG lines (plus
+    // the throwaway-path probe bind right below) are what originally
+    // isolated the Windows AF_UNIX rebind bug this project hit --
+    // confirmed to be specific to reclaiming *this* socket path, not
+    // AF_UNIX binds in general, by the throwaway bind succeeding in the
+    // same process state. The fix landed upstream in `rustils`' own
+    // `unix_listen` (see `docs/decision-request-af-unix-stale-reclaim-
+    // race.md` in that repo, and this project's own ARCHITECTURE.md "IPC
+    // Model"), but this session had no native Windows execution
+    // available to confirm the fix actually resolves
+    // `tests/supervisor_restart_recovery.rs` on real hardware -- only a
+    // cross-compile check and a passing Linux run, where this bug never
+    // reproduced in the first place. Remove this block (and the
+    // throwaway bind) only once that's confirmed, not before -- see the
+    // decision-request doc's own "Open questions" for what a
+    // still-failing run after this fix would mean.
     eprintln!("DBG: before recover_on_startup");
     supervisor.recover_on_startup().await;
     eprintln!("DBG: after recover_on_startup, about to bind");

@@ -45,7 +45,13 @@ fn crashed_worker_is_recovered_with_full_transcript_replay() {
     let pid_after = common::worker_pid(state_dir.path(), &session_id);
     assert_ne!(pid_before, pid_after, "recovery must spawn a genuinely new worker process");
 
-    let lines = common::attach_lines(state_dir.path(), &session_id, 6, Duration::from_secs(5));
+    // 7, not 6: "attached to ..." + the snapshot header + 4 replayed
+    // transcript entries (before- and after-crash, one user/assistant
+    // pair each) already fill 6 lines on their own -- the recovery
+    // marker (sent after the snapshot; see `session::AgentSession::
+    // take_pending_recovery_marker`'s doc comment for why it can't be
+    // delivered any earlier) is the 7th.
+    let lines = common::attach_lines(state_dir.path(), &session_id, 7, Duration::from_secs(5));
     let joined = lines.join("\n");
     assert!(joined.contains("recovered"), "attach stream should surface the visible recovery marker, got: {joined}");
     assert!(

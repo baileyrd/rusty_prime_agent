@@ -72,6 +72,17 @@ pub struct AgentSession {
     /// to call it against.
     tool_runtime: Box<dyn ToolRuntime>,
     events: broadcast::Sender<SessionEvent>,
+    /// Set by [`emit_recovery_marker`](Self::emit_recovery_marker),
+    /// cleared by [`take_pending_recovery_marker`](Self::take_pending_recovery_marker).
+    /// A crash-recovered worker calls the former before its private
+    /// socket is even bound -- long before any client can possibly have
+    /// called [`subscribe`](Self::subscribe) yet -- so broadcasting the
+    /// marker at that point would reach zero receivers and be lost
+    /// (`broadcast::Sender::send`'s own contract: only receivers
+    /// subscribed *before* a send observe it, per `sync/broadcast.rs`).
+    /// Stashing it here instead lets the first attach after a recovery
+    /// deliver it deterministically, right after the snapshot.
+    pending_recovery_marker: Option<SessionEvent>,
 }
 
 impl AgentSession {
@@ -104,6 +115,7 @@ impl AgentSession {
             provider,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            pending_recovery_marker: None,
         };
         session.write_state().await?;
         Ok(session)
@@ -142,6 +154,7 @@ impl AgentSession {
             provider,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            pending_recovery_marker: None,
         };
         session.write_state().await?;
         Ok(session)
@@ -158,17 +171,34 @@ impl AgentSession {
         }
     }
 
-    /// Append a visible marker after this session was recovered from a
-    /// crashed worker (daemon.md: "appends a visible recovery marker to
-    /// the transcript"). Not part of the transcript's `Role`-tagged
-    /// turns -- delivered only as a `SessionEvent`, not persisted as a
-    /// `TranscriptEntry`, since it documents a host-side fact about this
-    /// process's lifetime, not something either party said.
-    pub fn emit_recovery_marker(&self, message: impl Into<String>) {
-        let _ = self.events.send(SessionEvent::RecoveryMarker {
+    /// Mark this session as recovered from a crashed worker (daemon.md:
+    /// "appends a visible recovery marker to the transcript"). Not part
+    /// of the transcript's `Role`-tagged turns -- delivered only as a
+    /// `SessionEvent`, not persisted as a `TranscriptEntry`, since it
+    /// documents a host-side fact about this process's lifetime, not
+    /// something either party said.
+    ///
+    /// Stashed in `pending_recovery_marker` rather than broadcast
+    /// directly: this is called during worker startup, before the
+    /// private socket is even bound, so there is no way any client could
+    /// have subscribed yet -- broadcasting now would reach zero
+    /// receivers and be silently lost. `take_pending_recovery_marker`
+    /// delivers it deterministically to the first attach instead.
+    pub fn emit_recovery_marker(&mut self, message: impl Into<String>) {
+        self.pending_recovery_marker = Some(SessionEvent::RecoveryMarker {
             message: message.into(),
             at_ms: now_ms(),
         });
+    }
+
+    /// Takes the pending recovery marker, if any -- delivered once, to
+    /// whichever attach happens to be first after a crash recovery; a
+    /// second, concurrent or later attach to the same still-running
+    /// worker sees `None` here (`supervisor_restart_recovery.rs`'s own
+    /// live-adopt case never calls `emit_recovery_marker` at all, so this
+    /// is `None` there from the start, not merely consumed).
+    pub fn take_pending_recovery_marker(&mut self) -> Option<SessionEvent> {
+        self.pending_recovery_marker.take()
     }
 
     /// Append a user turn, ask the (fake) provider for a reply, append
