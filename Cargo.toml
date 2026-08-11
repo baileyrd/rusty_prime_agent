@@ -1,0 +1,48 @@
+[package]
+name = "rusty-prime-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Cross-platform daemon-backed agent harness core (Phase 1: daemon/worker/session skeleton)."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime AND, as of the Windows process/signal/AF_UNIX gap-closing
+# work landing upstream, this project's sole process-spawn and local-IPC
+# layer too -- see ARCHITECTURE.md "Dependency Stack". `rusty_tokio::io::
+# UnixListener`/`UnixStream` and `rusty_tokio::process::Command` are now
+# genuinely cross-platform (Linux/macOS/BSD/Windows alike), so this
+# project no longer depends on `rustils` directly at all: rusty_tokio
+# already sits on it internally for exactly the primitives this project
+# would otherwise have wrapped by hand.
+rusty_tokio = { path = "../rusty_tokio" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[target.'cfg(windows)'.dependencies]
+# `src/procutil.rs` only: liveness/force-kill for an arbitrary pid this
+# process didn't spawn (`OpenProcess`+`GetExitCodeProcess`/
+# `TerminateProcess`) and clearing HANDLE_FLAG_INHERIT on our own
+# inherited std handles before spawning a detached child (see
+# `main::harden_inherited_stdio`'s doc comment). Small, direct FFI uses
+# `rusty_tokio::process::Command` has no reason to wrap itself.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# `src/procutil.rs`: `kill(pid, 0)`/`kill(pid, SIGKILL)` for liveness/
+# force-kill, `setsid()` in a `pre_exec` hook for real session detach
+# (`rusty_tokio::process::Command` exposes `process_group` but not a
+# session-leader/`setsid` builtin -- see `procutil::prepare_detached`'s
+# doc comment), and `main::harden_inherited_stdio`'s
+# `fcntl(F_SETFD, FD_CLOEXEC)` calls.
+libc = "0.2"
