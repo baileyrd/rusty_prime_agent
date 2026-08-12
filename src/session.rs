@@ -89,11 +89,15 @@ pub struct AgentSession {
     /// every other session, including one that's never actually
     /// prompted yet.
     mcp_client: Option<crate::mcp_client::McpClient>,
-    /// Held, started, and shut down (see `mark_stopped`) like a real
-    /// backend would be, but never called from `prompt()` -- Phase 1 has
-    /// no tool-execution requirement (non-goal). Wiring `execute` into
-    /// the turn loop is Phase 2's job, once a real kernel backend exists
-    /// to call it against.
+    /// Held and shut down (see `mark_stopped`) for every session
+    /// regardless of backend. `execute` is only ever reached from
+    /// `execute_python_tool_call`, itself only reachable when
+    /// `state.runtime == Some("ipython")` -- a `NoopToolRuntime` session
+    /// (every session that doesn't opt into `--runtime ipython`) never
+    /// offers the `execute_python` tool in the first place (see
+    /// `enabled_tool_defs`), so its own `execute` is exactly as unreached
+    /// as before Increment 5, just no longer by construction of the
+    /// trait alone.
     tool_runtime: Box<dyn ToolRuntime>,
     events: broadcast::Sender<SessionEvent>,
     /// Set by [`emit_recovery_marker`](Self::emit_recovery_marker),
@@ -125,6 +129,8 @@ pub struct NewSessionMeta {
     pub parent_id: Option<String>,
     pub thinking: Option<String>,
     pub tools: Option<String>,
+    /// See `protocol::Request::SessionNew::runtime`'s own doc comment.
+    pub runtime: Option<String>,
 }
 
 impl AgentSession {
@@ -144,6 +150,7 @@ impl AgentSession {
             parent_id,
             thinking,
             tools,
+            runtime,
         } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -173,6 +180,7 @@ impl AgentSession {
             parent_id,
             thinking,
             tools,
+            runtime,
         };
         let session = AgentSession {
             state,
@@ -274,12 +282,16 @@ impl AgentSession {
     /// Append a user turn, then loop with the provider until it returns
     /// a plain text reply: each `ProviderReply::ToolCalls` round appends
     /// an assistant tool-call-request entry, executes every requested
-    /// built-in tool (`tools::execute`), appends one `Role::Tool` result
-    /// entry per call, and asks the provider again with the tool results
-    /// now part of the conversation -- the same multi-turn tool-calling
-    /// shape `rp-server`'s own `ChatRequest.tools`/`Role::Tool` support
+    /// tool (`execute_tool_call` -- a built-in `tools::execute` call, an
+    /// MCP proxy call, or a real IPython kernel `execute_python` call,
+    /// depending on the tool's name and this session's `state.tools`/
+    /// `state.runtime`), appends one `Role::Tool` result entry per call,
+    /// and asks the provider again with the tool results now part of the
+    /// conversation -- the same multi-turn tool-calling shape
+    /// `rp-server`'s own `ChatRequest.tools`/`Role::Tool` support
     /// expects. `EchoProvider` never emits `ToolCalls`, so this is a
-    /// single round for every session that doesn't opt into `--tools`.
+    /// single round for every session that doesn't opt into `--tools`/
+    /// `--runtime`.
     ///
     /// Every step below goes through `append`, which synchronously
     /// persists to `transcript.jsonl` before returning -- a crash
@@ -334,40 +346,57 @@ impl AgentSession {
     }
 
     /// This session's offered tool set, per `state.tools` (`session new
-    /// --tools read|mcp`). `"read"` is a cheap, pure lookup; `"mcp"`
-    /// needs a live `tools/list` call against `rp-server`'s MCP gateway
-    /// (`mcp_client_or_connect`, lazily connecting/reusing one client for
-    /// this session's whole lifetime) -- both recomputed on every
-    /// `prompt` call rather than cached across prompts, so a session
-    /// picks up a newly-connected MCP upstream (or one that dropped)
-    /// without needing a restart.
+    /// --tools read|mcp`) plus, independently, `execute_python` when
+    /// `state.runtime == Some("ipython")` (`session new --runtime
+    /// ipython`) -- the two flags are orthogonal (see `protocol::
+    /// Request::SessionNew::runtime`'s own doc comment), so a session can
+    /// offer either, both, or neither. `"read"` is a cheap, pure lookup;
+    /// `"mcp"` needs a live `tools/list` call against `rp-server`'s MCP
+    /// gateway (`mcp_client_or_connect`, lazily connecting/reusing one
+    /// client for this session's whole lifetime) -- all recomputed on
+    /// every `prompt` call rather than cached across prompts, so a
+    /// session picks up a newly-connected MCP upstream (or one that
+    /// dropped) without needing a restart.
     async fn enabled_tool_defs(&mut self) -> Result<Vec<ToolDef>> {
-        match self.state.tools.as_deref() {
-            Some("read") => Ok(crate::tools::read_only_tool_defs()),
+        let mut defs = match self.state.tools.as_deref() {
+            Some("read") => crate::tools::read_only_tool_defs(),
             Some("mcp") => {
                 let client = self.mcp_client_or_connect().await?;
                 let tools = client.list_tools().await?;
-                Ok(tools
+                tools
                     .into_iter()
                     .map(|t| ToolDef {
                         name: t.name,
                         description: t.description,
                         parameters: t.input_schema,
                     })
-                    .collect())
+                    .collect()
             }
-            _ => Ok(Vec::new()),
+            _ => Vec::new(),
+        };
+        if self.state.runtime.as_deref() == Some("ipython") {
+            defs.push(crate::tools::execute_python_tool_def());
         }
+        Ok(defs)
     }
 
-    /// Runs one tool call by name, routed to whichever backend
-    /// `state.tools` selects -- `tools::execute` for `"read"`,
-    /// `mcp_client::McpClient::call_tool` (proxied through `rp-server`'s
-    /// gateway) for `"mcp"`. Only ever called with a name/arguments pair
-    /// the provider itself just requested against the tool list
-    /// `enabled_tool_defs` handed it, so `state.tools` can't have
-    /// changed to `None` in between within one `prompt` call.
+    /// Runs one tool call by name. `execute_python` (offered only when
+    /// `state.runtime == Some("ipython")`, see `enabled_tool_defs`) is
+    /// checked first and routed to `self.tool_runtime` -- the model-facing
+    /// code execution environment boundary, a different backend than the
+    /// OpenAI-style tool-calling ones below it and checked independently
+    /// of `state.tools`. Everything else is routed to whichever backend
+    /// `state.tools` selects -- `tools::execute` for `"read"` (and the
+    /// default, tool-less case), `mcp_client::McpClient::call_tool`
+    /// (proxied through `rp-server`'s gateway) for `"mcp"`. Only ever
+    /// called with a name/arguments pair the provider itself just
+    /// requested against the tool list `enabled_tool_defs` handed it, so
+    /// neither `state.tools` nor `state.runtime` can have changed
+    /// in between within one `prompt` call.
     async fn execute_tool_call(&mut self, name: &str, arguments: &str) -> Result<String> {
+        if name == "execute_python" && self.state.runtime.as_deref() == Some("ipython") {
+            return self.execute_python_tool_call(arguments).await;
+        }
         match self.state.tools.as_deref() {
             Some("mcp") => {
                 let client = self.mcp_client_or_connect().await?;
@@ -375,6 +404,41 @@ impl AgentSession {
             }
             _ => Ok(crate::tools::execute(name, arguments)),
         }
+    }
+
+    /// Parses `arguments` for a `code` string and runs it against this
+    /// session's real IPython kernel (`self.tool_runtime`), formatting
+    /// the resulting `ExecutionOutcome` into the plain-text shape every
+    /// other tool result is (`tools::execute`'s own convention: `stdout`
+    /// then `result`, one blank line apart when both are present). A
+    /// malformed `arguments` payload is reported the same
+    /// `"error: ..."`-prefixed way `tools::execute`'s own argument
+    /// parsing is -- a model sending bad JSON is normal, recoverable
+    /// model behavior, not a protocol failure. A genuine kernel-level
+    /// failure (the connection dropped, a timeout) still propagates as a
+    /// real `Result::Err`, the same as `mcp_client::McpClient::call_tool`'s
+    /// own failure path.
+    async fn execute_python_tool_call(&mut self, arguments: &str) -> Result<String> {
+        let value: serde_json::Value = match serde_json::from_str(arguments) {
+            Ok(v) => v,
+            Err(e) => return Ok(format!("error: invalid arguments JSON: {e}")),
+        };
+        let code = match value["code"].as_str() {
+            Some(c) => c.to_string(),
+            None => return Ok("error: missing required `code` argument".to_string()),
+        };
+        let outcome = self.tool_runtime.execute(&code).await?;
+        let mut text = outcome.stdout;
+        if let Some(result) = outcome.result {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&result);
+        }
+        if text.is_empty() {
+            text = "(no output)".to_string();
+        }
+        Ok(text)
     }
 
     /// Returns this session's cached `McpClient`, connecting one (against

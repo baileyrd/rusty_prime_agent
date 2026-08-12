@@ -81,6 +81,24 @@ pub enum Request {
         /// existing session's behavior completely unaffected. Fixed for
         /// this session's whole lifetime, same as `model`/`thinking`.
         tools: Option<String>,
+        /// Parity with `prime-agent`'s RLM programming model: selects
+        /// `tool_runtime::ToolRuntime`'s real backend for this session
+        /// (`session new --runtime ipython`), a real IPython kernel
+        /// subprocess this session's own turns can run code against --
+        /// see `ipython_runtime`. `None` (the default) keeps
+        /// `NoopToolRuntime`, leaving every existing session's behavior
+        /// unaffected. Deliberately a separate concept from `tools`
+        /// (`ToolRuntime` is the model-facing *code execution
+        /// environment* boundary; `tools` is the OpenAI-style
+        /// tool-calling loop against `rp-server`) -- see
+        /// `ARCHITECTURE.md`'s "ToolRuntime Trait Boundary" section for
+        /// why the two are kept distinct rather than merged into one
+        /// flag. Like `thinking` (not `tools`/`goal`/`parent_id`), always
+        /// supplied by the daemon at worker-spawn time, since
+        /// `worker::run` must pick a `ToolRuntime` implementation before
+        /// `AgentSession::create`/`recover` even exist to read
+        /// `state.tools` back from.
+        runtime: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -496,6 +514,11 @@ pub struct SessionState {
     /// `model`/`goal`/`harness`/`parent_id`/`thinking` have it.
     #[serde(default)]
     pub tools: Option<String>,
+    /// See `Request::SessionNew::runtime`'s own doc comment.
+    /// `#[serde(default)]` for the same pre-existing-`state.json` reason
+    /// `model`/`goal`/`harness`/`parent_id`/`thinking`/`tools` have it.
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +551,8 @@ pub struct SessionSummary {
     pub thinking: Option<String>,
     /// See `Request::SessionNew::tools`'s own doc comment.
     pub tools: Option<String>,
+    /// See `Request::SessionNew::runtime`'s own doc comment.
+    pub runtime: Option<String>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s

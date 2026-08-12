@@ -4,6 +4,7 @@ mod client;
 mod daemon;
 mod error;
 mod http_client;
+mod ipython_runtime;
 mod mcp_client;
 mod paths;
 mod procutil;
@@ -13,10 +14,12 @@ mod provider;
 mod rp_server;
 mod schedule;
 mod session;
+mod sha256;
 mod tool_runtime;
 mod tools;
 mod transport;
 mod worker;
+mod zmtp;
 
 use error::{HarnessError, Result};
 
@@ -164,8 +167,22 @@ async fn run(args: &[String]) -> Result<()> {
             goal,
             thinking,
             tools,
+            runtime,
         } => {
-            client::session_new(&state_root, name, model, goal, thinking, tools, output_mode).await
+            client::session_new(
+                &state_root,
+                session::NewSessionMeta {
+                    name,
+                    model,
+                    goal,
+                    parent_id: None,
+                    thinking,
+                    tools,
+                    runtime,
+                },
+                output_mode,
+            )
+            .await
         }
         cli::Command::SessionAttach { session_id } => {
             client::session_attach(&state_root, session_id, output_mode).await
@@ -270,6 +287,7 @@ async fn run(args: &[String]) -> Result<()> {
             parent_id,
             thinking,
             tools,
+            runtime,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -281,6 +299,7 @@ async fn run(args: &[String]) -> Result<()> {
                 parent_id,
                 thinking,
                 tools,
+                runtime,
             })
             .await
         }

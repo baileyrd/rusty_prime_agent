@@ -210,10 +210,12 @@ impl Supervisor {
                 goal: None,
                 parent_id: None,
                 tools: None,
-                // `thinking` follows `model`'s "always supplied"
-                // treatment (see `WorkerArgs::thinking`'s doc comment) --
-                // re-read from persisted state, not re-seeded.
+                // `thinking`/`runtime` follow `model`'s "always supplied"
+                // treatment (see `WorkerArgs::thinking`/`WorkerArgs::runtime`'s
+                // own doc comments) -- re-read from persisted state, not
+                // re-seeded.
                 thinking: state.thinking.clone(),
+                runtime: state.runtime.clone(),
             },
         )
         .await?;
@@ -237,6 +239,7 @@ impl Supervisor {
                 parent_id,
                 thinking,
                 tools,
+                runtime,
             } => {
                 self.handle_session_new(
                     &mut conn,
@@ -247,6 +250,7 @@ impl Supervisor {
                         parent_id,
                         thinking,
                         tools,
+                        runtime,
                     },
                 )
                 .await

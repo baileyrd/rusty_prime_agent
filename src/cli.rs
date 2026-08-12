@@ -64,6 +64,9 @@ pub enum Command {
         /// `--tools read`; see `Request::SessionNew::tools`'s own doc
         /// comment.
         tools: Option<String>,
+        /// `--runtime ipython`; see `Request::SessionNew::runtime`'s own
+        /// doc comment.
+        runtime: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -225,6 +228,7 @@ pub enum Command {
         parent_id: Option<String>,
         thinking: Option<String>,
         tools: Option<String>,
+        runtime: Option<String>,
     },
 }
 
@@ -301,12 +305,16 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 let tools = scan_named_flag(&rest, "--tools")?
                     .map(|v| parse_tools_value(&v))
                     .transpose()?;
+                let runtime = scan_named_flag(&rest, "--runtime")?
+                    .map(|v| parse_runtime_value(&v))
+                    .transpose()?;
                 Ok(Command::SessionNew {
                     name,
                     model,
                     goal,
                     thinking,
                     tools,
+                    runtime,
                 })
             }
             Some("attach") => {
@@ -509,6 +517,20 @@ fn parse_tools_value(value: &str) -> Result<String> {
         "read" | "mcp" => Ok(value.to_string()),
         other => Err(usage(format!(
             "unknown --tools value `{other}`, expected `read` or `mcp`"
+        ))),
+    }
+}
+
+/// `--runtime ipython`: selects `tool_runtime::ToolRuntime`'s real
+/// backend (`ipython_runtime::IpythonKernelRuntime`) for this session --
+/// see `Request::SessionNew::runtime`'s own doc comment for why this is a
+/// separate flag from `--tools` rather than folded into it. `"ipython"`
+/// is the only value accepted today; no other runtime backend exists.
+fn parse_runtime_value(value: &str) -> Result<String> {
+    match value {
+        "ipython" => Ok(value.to_string()),
+        other => Err(usage(format!(
+            "unknown --runtime value `{other}`, expected `ipython`"
         ))),
     }
 }
@@ -792,6 +814,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut parent_id = None;
     let mut thinking = None;
     let mut tools = None;
+    let mut runtime = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -854,6 +877,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--runtime" => {
+                runtime = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--runtime requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -867,5 +897,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         parent_id,
         thinking,
         tools,
+        runtime,
     })
 }

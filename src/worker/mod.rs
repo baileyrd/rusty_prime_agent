@@ -91,6 +91,17 @@ pub struct WorkerArgs {
     /// tool-calling loop reads the offered tool set back off
     /// `state.tools` (already persisted by then), not off `WorkerArgs`.
     pub tools: Option<String>,
+    /// See `protocol::Request::SessionNew::runtime`'s own doc comment.
+    /// Same "always supplied by the daemon at spawn time" treatment as
+    /// `model`/`thinking` (not `tools`'s "New-only" treatment): unlike
+    /// `state.tools`, which `AgentSession::prompt` re-reads off persisted
+    /// state on every call, [`run`] must pick a `ToolRuntime`
+    /// implementation *before* `AgentSession::create`/`recover` even run
+    /// -- there is no persisted state yet to read it back from at that
+    /// point on a fresh spawn, and re-deriving it from `state.json` on a
+    /// resume/recover respawn is exactly what `daemon::Supervisor::
+    /// ensure_worker_running` does, mirroring `thinking`.
+    pub runtime: Option<String>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -121,9 +132,25 @@ fn build_provider(
     )))
 }
 
+/// Builds this worker's `ToolRuntime`. `runtime.as_deref() != Some("ipython")`
+/// (the ordinary case) is `NoopToolRuntime`, no kernel subprocess spawned
+/// at all. Selected here, before `AgentSession::create`/`recover` even
+/// run -- see `WorkerArgs::runtime`'s own doc comment for why this can't
+/// wait until `state.tools`-style persisted-state lookup the way the
+/// tool-calling loop's own tool set does.
+fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn ToolRuntime> {
+    match runtime {
+        Some("ipython") => Box::new(crate::ipython_runtime::IpythonKernelRuntime::new(
+            session_dir.to_path_buf(),
+        )),
+        _ => Box::new(NoopToolRuntime),
+    }
+}
+
 /// The worker process entrypoint (`harness __worker-main`).
 pub async fn run(args: WorkerArgs) -> Result<()> {
-    let mut tool_runtime = Box::new(NoopToolRuntime);
+    let session_dir = paths::session_dir(&args.state_root, &args.session_id);
+    let mut tool_runtime = build_tool_runtime(&session_dir, args.runtime.as_deref());
     tool_runtime.start().await?;
     let provider = build_provider(&args.state_root, args.model.clone(), args.thinking.clone())?;
 
@@ -139,6 +166,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     parent_id: args.parent_id.clone(),
                     thinking: args.thinking.clone(),
                     tools: args.tools.clone(),
+                    runtime: args.runtime.clone(),
                 },
                 provider,
                 tool_runtime,
@@ -329,6 +357,7 @@ pub async fn spawn(
         parent_id,
         thinking,
         tools,
+        runtime,
     } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -359,6 +388,9 @@ pub async fn spawn(
     }
     if let Some(tools) = &tools {
         cmd.arg("--tools").arg(tools);
+    }
+    if let Some(runtime) = &runtime {
+        cmd.arg("--runtime").arg(runtime);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

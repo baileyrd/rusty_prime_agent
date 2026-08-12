@@ -6,6 +6,11 @@
 //! `session_autonomous --quality-gate`'s unsandboxed shell execution
 //! already established. `--tools shell`/write-capable tools are a
 //! natural v2 extension of the same flag, not built now.
+//!
+//! [`execute_python_tool_def`] is a separate, `--runtime ipython`-gated
+//! tool (see its own doc comment) also defined here for the same
+//! "every tool's `ToolDef` lives in one place" reason, even though
+//! calling it doesn't go through this module's own [`execute`].
 
 use crate::provider::ToolDef;
 
@@ -41,6 +46,33 @@ pub fn read_only_tool_defs() -> Vec<ToolDef> {
             }),
         },
     ]
+}
+
+/// The tool offered when a session's `state.runtime == Some("ipython")`
+/// (`session new --runtime ipython`, see `ipython_runtime`) -- unlike
+/// every other `ToolDef` in this module, a call to it is *not* routed
+/// through this module's own [`execute`]: `AgentSession::execute_tool_call`
+/// intercepts it and runs it against the session's live kernel connection
+/// (`tool_runtime::ToolRuntime::execute`) instead, since that needs
+/// session-level state (the open ZMTP sockets) this module has no access
+/// to. Defined here anyway so every tool's `ToolDef` lives in one place.
+pub fn execute_python_tool_def() -> ToolDef {
+    ToolDef {
+        name: "execute_python".to_string(),
+        description: "Execute Python code in a persistent IPython kernel and return its output. \
+                       State (variables, imports) persists across calls within the same session."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python code to execute.",
+                },
+            },
+            "required": ["code"],
+        }),
+    }
 }
 
 /// Executes one built-in tool call by name, returning the text to send
