@@ -15,7 +15,9 @@ use crate::cli::OutputMode;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
-use crate::protocol::{GoalAction, GoalState, Request, Response, SessionEvent, SessionStatus};
+use crate::protocol::{
+    GoalAction, GoalState, GoalStatus, Request, Response, SessionEvent, SessionStatus,
+};
 use crate::transport;
 
 /// `Response`/`SessionEvent` are plain derived-`Serialize` data (strings,
@@ -348,21 +350,33 @@ pub async fn session_prompt(
     text: String,
     mode: OutputMode,
 ) -> Result<()> {
+    let entry = send_prompt(state_root, &session_id, text).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+        OutputMode::Text => print_entry(&entry),
+    }
+    Ok(())
+}
+
+/// Shared by [`session_prompt`] and [`session_autonomous`]'s own
+/// continuation turns -- the latter needs the raw entry, not printed
+/// text, and drives many of these in a loop rather than just one.
+async fn send_prompt(
+    state_root: &Path,
+    session_id: &str,
+    text: String,
+) -> Result<crate::protocol::TranscriptEntry> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
-        &Request::SessionPrompt { session_id, text },
+        &Request::SessionPrompt {
+            session_id: session_id.to_string(),
+            text,
+        },
     )
     .await?;
     match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
-        response @ Response::SessionPromptAck { .. } => {
-            match (&response, mode) {
-                (_, OutputMode::Json) => print_json(&response),
-                (Response::SessionPromptAck { entry }, OutputMode::Text) => print_entry(entry),
-                _ => unreachable!(),
-            }
-            Ok(())
-        }
+        Response::SessionPromptAck { entry } => Ok(entry),
         other => Err(unexpected_response(other)),
     }
 }
@@ -531,41 +545,59 @@ pub async fn goal_update(
     action: GoalAction,
     mode: OutputMode,
 ) -> Result<()> {
+    let goal = set_goal(state_root, &session_id, action).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::GoalUpdateAck { goal }),
+        OutputMode::Text => print_goal_text(&goal),
+    }
+    Ok(())
+}
+
+pub async fn goal_show(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let goal = fetch_goal(state_root, &session_id).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::GoalShow { goal }),
+        OutputMode::Text => print_goal_text(&goal),
+    }
+    Ok(())
+}
+
+/// Shared by [`goal_show`] and [`session_autonomous`]'s per-iteration
+/// re-check -- the latter needs the raw value, not printed text.
+async fn fetch_goal(state_root: &Path, session_id: &str) -> Result<Option<GoalState>> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::GoalUpdate { session_id, action })
-        .await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::GoalShow {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
     match read_response(&mut conn).await? {
-        response @ Response::GoalUpdateAck { .. } => {
-            if mode == OutputMode::Json {
-                print_json(&response);
-                return Ok(());
-            }
-            let Response::GoalUpdateAck { goal } = response else {
-                unreachable!()
-            };
-            print_goal_text(&goal);
-            Ok(())
-        }
+        Response::GoalShow { goal } => Ok(goal),
         other => Err(unexpected_response(other)),
     }
 }
 
-pub async fn goal_show(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+/// Shared by [`goal_update`] and [`session_autonomous`]'s own
+/// `Complete` transition when its quality gate passes -- the latter
+/// needs the raw value, not printed text.
+async fn set_goal(
+    state_root: &Path,
+    session_id: &str,
+    action: GoalAction,
+) -> Result<Option<GoalState>> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::GoalShow { session_id })
-        .await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::GoalUpdate {
+            session_id: session_id.to_string(),
+            action,
+        },
+    )
+    .await?;
     match read_response(&mut conn).await? {
-        response @ Response::GoalShow { .. } => {
-            if mode == OutputMode::Json {
-                print_json(&response);
-                return Ok(());
-            }
-            let Response::GoalShow { goal } = response else {
-                unreachable!()
-            };
-            print_goal_text(&goal);
-            Ok(())
-        }
+        Response::GoalUpdateAck { goal } => Ok(goal),
         other => Err(unexpected_response(other)),
     }
 }
@@ -575,13 +607,127 @@ fn print_goal_text(goal: &Option<GoalState>) {
         None => println!("no goal"),
         Some(g) => {
             let status = match g.status {
-                crate::protocol::GoalStatus::Active => "active",
-                crate::protocol::GoalStatus::Paused => "paused",
-                crate::protocol::GoalStatus::Completed => "completed",
+                GoalStatus::Active => "active",
+                GoalStatus::Paused => "paused",
+                GoalStatus::Completed => "completed",
             };
             println!("{status}\t{}", g.text);
         }
     }
+}
+
+/// Bounded parity with `prime-agent /autonomous`: repeatedly sends a
+/// continuation `SessionPrompt` toward the session's existing `Active`
+/// goal until `max_turns` turns have gone out, `max_time_ms` (if given)
+/// has elapsed, or `quality_gate` (if given) exits zero -- at which
+/// point the goal is marked `Complete`. No token budget: neither
+/// `EchoProvider` nor `RustyProviderModel`'s `rp-server` round trip
+/// surfaces token counts today, so this tracks only turns and
+/// wall-clock time (see `PARITY.md`).
+///
+/// Unlike `prime-agent`'s own `/autonomous`, which runs inside an
+/// already-live interactive session, this is a one-shot foreground CLI
+/// call -- parity with every other subcommand in this project (`session
+/// prompt` included), not a background daemon-side loop. A persistent,
+/// always-on autonomous daemon loop is the larger, separate piece this
+/// increment doesn't attempt.
+///
+/// The goal is re-fetched at the top of every iteration (not just once
+/// up front): if another client pauses, completes, or clears it out
+/// from under a running autonomous loop, that's honored as a normal stop
+/// condition on the very next turn, not raced against.
+pub async fn session_autonomous(
+    state_root: &Path,
+    session_id: String,
+    max_turns: u32,
+    max_time_ms: Option<u64>,
+    quality_gate: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    match fetch_goal(state_root, &session_id).await? {
+        Some(g) if g.status == GoalStatus::Active => {}
+        _ => {
+            return Err(HarnessError::conflict(
+                Context::Daemon,
+                "`session autonomous` requires an active goal -- run `session goal set <id> <text...>` first",
+            ));
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let mut turns_used = 0u32;
+    let stop_reason: &'static str;
+
+    loop {
+        let goal = fetch_goal(state_root, &session_id).await?;
+        let goal = match &goal {
+            Some(g) if g.status == GoalStatus::Active => g,
+            _ => {
+                stop_reason = "goal is no longer active";
+                break;
+            }
+        };
+
+        if let Some(gate) = &quality_gate {
+            if run_quality_gate(gate).await? {
+                set_goal(state_root, &session_id, GoalAction::Complete).await?;
+                stop_reason = "quality gate passed";
+                break;
+            }
+        }
+
+        if turns_used >= max_turns {
+            stop_reason = "max turns reached";
+            break;
+        }
+        if let Some(budget_ms) = max_time_ms {
+            if start.elapsed().as_millis() as u64 >= budget_ms {
+                stop_reason = "max time reached";
+                break;
+            }
+        }
+
+        let prompt_text = format!("Continue working toward the goal: {}", goal.text);
+        send_prompt(state_root, &session_id, prompt_text).await?;
+        turns_used += 1;
+    }
+
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({
+            "type": "autonomous_stopped",
+            "reason": stop_reason,
+            "turns_used": turns_used,
+        })),
+        OutputMode::Text => {
+            println!("autonomous run stopped: {stop_reason} (turns={turns_used})")
+        }
+    }
+    Ok(())
+}
+
+/// Cross-platform "run this arbitrary shell command and report whether
+/// it exited zero" -- `sh -c` on Unix, `cmd /C` on Windows, matching
+/// this project's own CI matrix (`ubuntu`/`macos`/`windows-latest`).
+/// Stdout/stderr are left inherited (`rusty_tokio::process::Command`'s
+/// own default, same as `std::process::Command`), not `Stdio::null()`,
+/// so a failing gate's own output stays visible to whoever is watching
+/// this CLI invocation.
+async fn run_quality_gate(command: &str) -> Result<bool> {
+    use rusty_tokio::process::Command;
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| HarnessError::io(Context::Cli, None, e))?;
+    Ok(status.success())
 }
 
 /// Response reads get a bounded timeout: a `connect()` that completed
