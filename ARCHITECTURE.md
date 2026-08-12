@@ -27,13 +27,14 @@ current shape.
 | `client` | The CLI-side half of every request: connects to `daemon.sock`, sends a `Request`, prints the `Response`/event stream. Also owns `session_autonomous`'s bounded continuation loop (`session autonomous`), `session_refine`'s Continual Harness review loop (`session refine`), `session_spawn`/`session_children`/`session_message`'s recursive-subagent composition, and `session_repl`'s minimal interactive loop (`session repl`, see `PARITY.md` for all four) -- pure client-side orchestration over existing `SessionNew`/`SessionList`/`SessionPrompt`/`SessionAttach`/`ScheduleAdd`/`GoalShow`/`GoalUpdate`/`HarnessShow`/`HarnessUpdate` requests, no daemon/worker changes needed beyond threading `parent_id` through `SessionNew`/`SessionState` |
 | `daemon` | The supervisor process: binds the public socket, routes requests, recovers sessions on its own startup |
 | `worker` | The per-session process: binds a private socket, owns one `AgentSession`, serves `SessionAttach`/`SessionPrompt`/`WorkerShutdown` |
-| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, Continual Harness `harness: HarnessState`, recursive-subagent `parent_id: Option<String>`, and `thinking: Option<String>` (`--thinking low/medium/high`), see `PARITY.md`), the (fake) model provider, the per-worker event broadcast. Also owns `NewSessionMeta`, the bundled creation-time metadata (`name`/`model`/`goal`/`parent_id`/`thinking`) `AgentSession::create`/`worker::spawn` both take, keeping their own argument lists from growing every time a new `session new`-seedable field is added |
+| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, Continual Harness `harness: HarnessState`, recursive-subagent `parent_id: Option<String>`, `thinking: Option<String>` (`--thinking low/medium/high`), and `tools: Option<String>` (`--tools read`), see `PARITY.md`), the (fake) model provider, the per-worker event broadcast. `prompt`'s own tool-calling loop (build the turn history, call the provider, execute any requested tools via `tools::execute`, loop) lives here too, capped at 8 rounds. Also owns `NewSessionMeta`, the bundled creation-time metadata (`name`/`model`/`goal`/`parent_id`/`thinking`/`tools`) `AgentSession::create`/`worker::spawn` both take, keeping their own argument lists from growing every time a new `session new`-seedable field is added |
 | `catalog` | `session list`'s directory scan, cross-checked against process liveness |
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
 | `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,schedules.json}`, `provider.{json,log}`) |
-| `provider` | `ModelProvider` trait + `EchoProvider` (the default); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md` |
+| `provider` | `ModelProvider` trait (`respond(turns, tools) -> ProviderReply`) + `EchoProvider` (the default, ignores `tools`); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md`. Also owns the turn/tool wire types (`ChatTurn`/`TurnRole`/`ToolDef`/`ProviderReply`) the real tool-calling loop uses, hand-rolled to `rp-server`'s own shape |
+| `tools` | Built-in tools offered to a model via `session new --tools read` (`read_file`/`list_dir`, no path sandboxing) -- see `PARITY.md`. A separate capability from `tool_runtime::ToolRuntime` below, not a second backend for it |
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers. Also owns `known_providers`, the env-var-driven provider catalog `harness model list` reads (see `PARITY.md`) -- the same check `write_config` itself uses, so the two can't drift -- and `fetch_model_catalog`, a direct `GET /v1/models` query against a sidecar `harness model list --detailed` starts itself (no daemon involved) |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server` use to talk to `rp-server` |
 | `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
@@ -150,6 +151,15 @@ real IPython kernel subprocess, itself spawned via
 `rusty_tokio::process::Command`/`rusty_tokio` pipes -- the trait's boxed
 futures exist specifically so that `.await`ing subprocess I/O won't need
 a redesign when that lands), so it alone earns the indirection now.
+
+**Not the same thing as the real tool-calling loop** (`provider`/`tools`
+modules, `session new --tools read`, see `PARITY.md`): that's `rp-server`
+answering `ChatRequest.tools`/`tool_calls` over the same HTTP connection
+`RustyProviderModel` already uses, independent of any kernel process --
+it needed no new seam, just a richer `ModelProvider::respond` signature.
+`ToolRuntime` stays exactly what it was: the specific boundary to a
+model-facing *code execution environment* (Phase 2's IPython kernel),
+still `NoopToolRuntime`, still unrevised.
 
 ## Known gaps
 

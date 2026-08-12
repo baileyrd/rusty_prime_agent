@@ -61,6 +61,9 @@ pub enum Command {
         /// `--thinking low|medium|high`; see
         /// `Request::SessionNew::thinking`'s own doc comment.
         thinking: Option<String>,
+        /// `--tools read`; see `Request::SessionNew::tools`'s own doc
+        /// comment.
+        tools: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -221,6 +224,7 @@ pub enum Command {
         goal: Option<String>,
         parent_id: Option<String>,
         thinking: Option<String>,
+        tools: Option<String>,
     },
 }
 
@@ -294,11 +298,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 let thinking = scan_named_flag(&rest, "--thinking")?
                     .map(|v| parse_thinking_level(&v))
                     .transpose()?;
+                let tools = scan_named_flag(&rest, "--tools")?
+                    .map(|v| parse_tools_value(&v))
+                    .transpose()?;
                 Ok(Command::SessionNew {
                     name,
                     model,
                     goal,
                     thinking,
+                    tools,
                 })
             }
             Some("attach") => {
@@ -485,6 +493,19 @@ fn parse_thinking_level(value: &str) -> Result<String> {
         "low" | "medium" | "high" => Ok(value.to_string()),
         other => Err(usage(format!(
             "unknown --thinking value `{other}`, expected `low`, `medium`, or `high`"
+        ))),
+    }
+}
+
+/// `--tools read`: validated against `tools::read_only_tool_defs`'s one
+/// supported value today -- `--tools shell`/write-capable tools are a
+/// natural v2 extension of this same flag (see `PARITY.md`), not
+/// accepted yet.
+fn parse_tools_value(value: &str) -> Result<String> {
+    match value {
+        "read" => Ok(value.to_string()),
+        other => Err(usage(format!(
+            "unknown --tools value `{other}`, expected `read`"
         ))),
     }
 }
@@ -767,6 +788,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut goal = None;
     let mut parent_id = None;
     let mut thinking = None;
+    let mut tools = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -822,6 +844,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--tools" => {
+                tools = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--tools requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -834,5 +863,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         goal,
         parent_id,
         thinking,
+        tools,
     })
 }

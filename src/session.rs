@@ -38,9 +38,9 @@ use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
     GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState,
-    Role, SessionEvent, SessionState, SessionStatus, TranscriptEntry,
+    Role, SessionEvent, SessionState, SessionStatus, ToolCallRequest, TranscriptEntry,
 };
-use crate::provider::ModelProvider;
+use crate::provider::{ChatTurn, ModelProvider, ProviderReply, ToolDef, TurnRole};
 use crate::tool_runtime::ToolRuntime;
 
 /// Generates a session id unique enough for this project's needs: not
@@ -113,6 +113,7 @@ pub struct NewSessionMeta {
     pub goal: Option<String>,
     pub parent_id: Option<String>,
     pub thinking: Option<String>,
+    pub tools: Option<String>,
 }
 
 impl AgentSession {
@@ -131,6 +132,7 @@ impl AgentSession {
             goal: goal_text,
             parent_id,
             thinking,
+            tools,
         } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -159,6 +161,7 @@ impl AgentSession {
             harness: HarnessState::default(),
             parent_id,
             thinking,
+            tools,
         };
         let session = AgentSession {
             state,
@@ -253,21 +256,127 @@ impl AgentSession {
         self.pending_recovery_marker.take()
     }
 
-    /// Append a user turn, ask the (fake) provider for a reply, append
-    /// its assistant turn, and return that assistant entry as the
-    /// prompt's ack.
+    /// Append a user turn, then loop with the provider until it returns
+    /// a plain text reply: each `ProviderReply::ToolCalls` round appends
+    /// an assistant tool-call-request entry, executes every requested
+    /// built-in tool (`tools::execute`), appends one `Role::Tool` result
+    /// entry per call, and asks the provider again with the tool results
+    /// now part of the conversation -- the same multi-turn tool-calling
+    /// shape `rp-server`'s own `ChatRequest.tools`/`Role::Tool` support
+    /// expects. `EchoProvider` never emits `ToolCalls`, so this is a
+    /// single round for every session that doesn't opt into `--tools`.
+    ///
+    /// Every step below goes through `append`, which synchronously
+    /// persists to `transcript.jsonl` before returning -- a crash
+    /// mid-loop just leaves a coherent partial transcript (e.g. a
+    /// dangling tool-call request with no result yet), the same
+    /// "an in-flight prompt might not complete if the worker dies
+    /// mid-call" gap that already exists today for a plain, tool-less
+    /// prompt, not a new one this loop introduces.
+    ///
+    /// Capped at `MAX_TOOL_ROUNDS` rounds to bound a runaway loop (a
+    /// model that keeps requesting tools and never settles on a final
+    /// reply) -- similar in spirit to `session_autonomous`'s own
+    /// bounded-loop reasoning. Hitting the cap appends a synthetic
+    /// assistant note instead of erroring, so the client still gets a
+    /// coherent ack.
     pub async fn prompt(&mut self, text: String) -> Result<TranscriptEntry> {
-        self.append(Role::User, text.clone()).await?;
-        let reply = self.provider.respond(&text).await?;
-        self.append(Role::Assistant, reply).await
+        self.append(Role::User, text, None, None, None).await?;
+        let tools = self.enabled_tool_defs();
+
+        const MAX_TOOL_ROUNDS: usize = 8;
+        for _ in 0..MAX_TOOL_ROUNDS {
+            let turns = self.build_turns();
+            match self.provider.respond(&turns, &tools).await? {
+                ProviderReply::Text(reply) => {
+                    return self.append(Role::Assistant, reply, None, None, None).await;
+                }
+                ProviderReply::ToolCalls(calls) => {
+                    self.append(
+                        Role::Assistant,
+                        String::new(),
+                        Some(calls.clone()),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    for call in calls {
+                        let result = crate::tools::execute(&call.name, &call.arguments);
+                        self.append(Role::Tool, result, None, Some(call.id), Some(call.name))
+                            .await?;
+                    }
+                }
+            }
+        }
+        self.append(
+            Role::Assistant,
+            format!("(stopped after {MAX_TOOL_ROUNDS} tool-call rounds without a final reply)"),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
-    async fn append(&mut self, role: Role, text: String) -> Result<TranscriptEntry> {
+    /// This session's offered tool set, per `state.tools` (`session new
+    /// --tools read`) -- recomputed on every `prompt` call rather than
+    /// cached, since it's a cheap, pure function of already-loaded state.
+    fn enabled_tool_defs(&self) -> Vec<ToolDef> {
+        match self.state.tools.as_deref() {
+            Some("read") => crate::tools::read_only_tool_defs(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Maps the persisted transcript into the turn shape a
+    /// `ModelProvider` expects -- see `provider::ChatTurn`'s own doc
+    /// comment for why this is a separate type from `TranscriptEntry`.
+    fn build_turns(&self) -> Vec<ChatTurn> {
+        self.transcript
+            .iter()
+            .map(|entry| {
+                let role = match entry.role {
+                    Role::User => TurnRole::User,
+                    Role::Assistant => TurnRole::Assistant,
+                    Role::System => TurnRole::System,
+                    Role::Tool => TurnRole::Tool,
+                };
+                // An assistant tool-call-request entry is persisted with
+                // empty `text` (nothing user-visible to show) -- mirror
+                // that back to `None` rather than `Some("")`, matching
+                // `rp-server`'s own `content: null` convention for it.
+                let content = if entry.role == Role::Assistant && entry.tool_calls.is_some() {
+                    None
+                } else {
+                    Some(entry.text.clone())
+                };
+                ChatTurn {
+                    role,
+                    content,
+                    tool_calls: entry.tool_calls.clone(),
+                    tool_call_id: entry.tool_call_id.clone(),
+                    name: entry.name.clone(),
+                }
+            })
+            .collect()
+    }
+
+    async fn append(
+        &mut self,
+        role: Role,
+        text: String,
+        tool_calls: Option<Vec<ToolCallRequest>>,
+        tool_call_id: Option<String>,
+        name: Option<String>,
+    ) -> Result<TranscriptEntry> {
         let entry = TranscriptEntry {
             sequence: self.state.last_sequence + 1,
             timestamp_ms: now_ms(),
             role,
             text,
+            tool_calls,
+            tool_call_id,
+            name,
         };
         append_transcript_line(&self.session_dir, &entry).await?;
         self.transcript.push(entry.clone());

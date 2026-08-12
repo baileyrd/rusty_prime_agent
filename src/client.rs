@@ -138,6 +138,7 @@ pub async fn print_once(
             goal: None,
             parent_id: None,
             thinking: None,
+            tools: None,
         },
     )
     .await?;
@@ -230,6 +231,7 @@ async fn create_session(
     goal: Option<String>,
     parent_id: Option<String>,
     thinking: Option<String>,
+    tools: Option<String>,
 ) -> Result<String> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -240,6 +242,7 @@ async fn create_session(
             goal,
             parent_id,
             thinking,
+            tools,
         },
     )
     .await?;
@@ -255,9 +258,10 @@ pub async fn session_new(
     model: Option<String>,
     goal: Option<String>,
     thinking: Option<String>,
+    tools: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
-    let session_id = create_session(state_root, name, model, goal, None, thinking).await?;
+    let session_id = create_session(state_root, name, model, goal, None, thinking, tools).await?;
     match mode {
         OutputMode::Json => print_json(&Response::SessionNew { session_id }),
         OutputMode::Text => println!("{session_id}"),
@@ -364,7 +368,8 @@ pub async fn session_spawn(
                 .model
         }
     };
-    let child_id = create_session(state_root, name, model, None, Some(parent_id), None).await?;
+    let child_id =
+        create_session(state_root, name, model, None, Some(parent_id), None, None).await?;
     add_schedule(
         state_root,
         child_id.clone(),
@@ -512,7 +517,20 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
         crate::protocol::Role::User => "user",
         crate::protocol::Role::Assistant => "assistant",
         crate::protocol::Role::System => "system",
+        crate::protocol::Role::Tool => "tool",
     };
+    // A tool-call-request entry (`Role::Assistant`, `tool_calls: Some`)
+    // has no user-visible `text` of its own -- show which tools were
+    // requested instead of an empty line.
+    if let Some(calls) = &entry.tool_calls {
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        println!(
+            "[{}] {role}: <requested tool call(s): {}>",
+            entry.sequence,
+            names.join(", ")
+        );
+        return;
+    }
     println!("[{}] {role}: {}", entry.sequence, entry.text);
 }
 
@@ -1117,6 +1135,7 @@ fn build_refine_prompt(transcript: &[TranscriptEntry], notes: &[HarnessNote]) ->
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
+            Role::Tool => "tool",
         };
         prompt.push_str(&format!("[{}] {role}: {}\n", entry.sequence, entry.text));
     }
