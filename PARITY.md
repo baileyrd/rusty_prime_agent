@@ -669,7 +669,8 @@ daemon/worker split rather than requiring the Python control environment:
 ## Out of scope for this project's current shape
 
 Architecturally significant `prime-agent` capabilities that would each
-require a genuinely new subsystem (a Python control environment) -- not
+require a genuinely new subsystem this project has no analog of (most a
+Python control environment, one an account/identity system) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
@@ -684,6 +685,21 @@ attempted here, and not silently implied by anything in
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
   read-a-line/send-a-prompt loop underneath the TUI itself is done --
   `session repl`, see the medium-effort section above.)
+- **`/login`**, an in-session OAuth-style flow to Prime Intellect's own
+  hosted account system. `prime-agent`'s own
+  [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md)
+  presents `/login` and setting an API key beforehand
+  (`export ANTHROPIC_API_KEY=...`) as two alternative paths to the same
+  destination -- a configured model backend. This project only ever had
+  the second path: `rp_server.rs` reads `OPENAI_API_KEY`/
+  `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GROQ_API_KEY` straight from the
+  environment (see the "Medium-effort" section's provider-selection
+  entry above). There's no Prime Intellect account for a local
+  single-user harness to log into, and no other identity/account system
+  this project has ever needed. Unlike the rest of this section, the
+  missing subsystem isn't a Python control environment -- it's an OAuth
+  client plus somewhere real to send it, and there's nothing on the
+  other end for this project to authenticate against.
 
 ## Process
 
