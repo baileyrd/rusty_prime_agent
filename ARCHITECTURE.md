@@ -27,15 +27,18 @@ current shape.
 | `client` | The CLI-side half of every request: connects to `daemon.sock`, sends a `Request`, prints the `Response`/event stream. Also owns `session_autonomous`'s bounded continuation loop (`session autonomous`), `session_refine`'s Continual Harness review loop (`session refine`), `session_spawn`/`session_children`/`session_message`'s recursive-subagent composition, and `session_repl`'s minimal interactive loop (`session repl`, see `PARITY.md` for all four) -- pure client-side orchestration over existing `SessionNew`/`SessionList`/`SessionPrompt`/`SessionAttach`/`ScheduleAdd`/`GoalShow`/`GoalUpdate`/`HarnessShow`/`HarnessUpdate` requests, no daemon/worker changes needed beyond threading `parent_id` through `SessionNew`/`SessionState` |
 | `daemon` | The supervisor process: binds the public socket, routes requests, recovers sessions on its own startup |
 | `worker` | The per-session process: binds a private socket, owns one `AgentSession`, serves `SessionAttach`/`SessionPrompt`/`WorkerShutdown` |
-| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, Continual Harness `harness: HarnessState`, recursive-subagent `parent_id: Option<String>`, `thinking: Option<String>` (`--thinking low/medium/high`), and `tools: Option<String>` (`--tools read|mcp`), see `PARITY.md`), the (fake) model provider, a lazily-connected `mcp_client::McpClient`, the per-worker event broadcast. `prompt`'s own tool-calling loop (build the turn history, call the provider, execute any requested tools -- `tools::execute` for `--tools read`, `McpClient::call_tool` for `--tools mcp`, mutually exclusive in this pass -- loop) lives here too, capped at 8 rounds. Also owns `NewSessionMeta`, the bundled creation-time metadata (`name`/`model`/`goal`/`parent_id`/`thinking`/`tools`) `AgentSession::create`/`worker::spawn` both take, keeping their own argument lists from growing every time a new `session new`-seedable field is added |
+| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, Continual Harness `harness: HarnessState`, recursive-subagent `parent_id: Option<String>`, `thinking: Option<String>` (`--thinking low/medium/high`), `tools: Option<String>` (`--tools read|mcp`), and `runtime: Option<String>` (`--runtime ipython`), see `PARITY.md`), the (fake) model provider, a lazily-connected `mcp_client::McpClient`, a real or no-op `tool_runtime::ToolRuntime`, the per-worker event broadcast. `prompt`'s own tool-calling loop (build the turn history, call the provider, execute any requested tools -- `tools::execute` for `--tools read`, `McpClient::call_tool` for `--tools mcp`, `tool_runtime::ToolRuntime::execute` for the `execute_python` tool `--runtime ipython` offers, independent of and combinable with `--tools` -- loop) lives here too, capped at 8 rounds. Also owns `NewSessionMeta`, the bundled creation-time metadata (`name`/`model`/`goal`/`parent_id`/`thinking`/`tools`/`runtime`) `AgentSession::create`/`worker::spawn` both take, keeping their own argument lists from growing every time a new `session new`-seedable field is added |
 | `catalog` | `session list`'s directory scan, cross-checked against process liveness |
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
 | `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,schedules.json}`, `provider.{json,log}`) |
 | `provider` | `ModelProvider` trait (`respond(turns, tools) -> ProviderReply`) + `EchoProvider` (the default, ignores `tools`); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md`. Also owns the turn/tool wire types (`ChatTurn`/`TurnRole`/`ToolDef`/`ProviderReply`) the real tool-calling loop uses, hand-rolled to `rp-server`'s own shape |
-| `tools` | Built-in tools offered to a model via `session new --tools read` (`read_file`/`list_dir`, no path sandboxing) -- see `PARITY.md`. A separate capability from `tool_runtime::ToolRuntime` below, not a second backend for it |
+| `tools` | Built-in tools offered to a model via `session new --tools read` (`read_file`/`list_dir`, no path sandboxing), plus `execute_python_tool_def`'s `ToolDef` for `session new --runtime ipython` (its call is routed to `tool_runtime::ToolRuntime` by `AgentSession`, not to this module's own `execute`) -- see `PARITY.md`. A separate capability from `tool_runtime::ToolRuntime` below, not a second backend for it |
 | `mcp_client` | Minimal MCP (Model Context Protocol) client against `rp-server`'s own built-in `/mcp` gateway (`session new --tools mcp`) -- `initialize`/`notifications/initialized` + `tools/list` + `tools/call` only, hand-rolled to the exact wire behavior a direct probe of a real sidecar confirmed (SSE-framed responses, chunked transfer encoding, `Mcp-Session-Id` session affinity) -- see `PARITY.md` |
+| `sha256` | Hand-rolled SHA-256/HMAC-SHA256 (FIPS 180-4/RFC 2104), pinned against official test vectors -- exists solely for `ipython_runtime`'s Jupyter message signing, see below |
+| `zmtp` | Hand-rolled ZMTP 3.0 client (NULL mechanism, DEALER/SUB socket semantics) on top of `rusty_tokio::io::TcpStream` -- exists solely for `ipython_runtime`, see below and "Dependency Stack" |
+| `ipython_runtime` | `IpythonKernelRuntime`, the real `tool_runtime::ToolRuntime` backend (`session new --runtime ipython`) -- see below |
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers. Also owns `known_providers`, the env-var-driven provider catalog `harness model list` reads (see `PARITY.md`) -- the same check `write_config` itself uses, so the two can't drift -- `fetch_model_catalog`, a direct `GET /v1/models` query against a sidecar `harness model list --detailed` starts itself (no daemon involved) -- and emits `[mcp] enabled = true` unconditionally in every generated `provider-config.toml`, the same "harmless with nothing configured" reasoning `[providers.ollama]` already gets |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server`/`mcp_client` use to talk to `rp-server`. Decodes `Transfer-Encoding: chunked` responses (`decode_chunked`) -- needed only for `mcp_client`'s SSE-framed calls, a no-op for every other caller, which had only ever seen `Content-Length` framing |
 | `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
@@ -76,6 +79,22 @@ project spawns goes through `rusty_tokio` directly. This project depends
 on `rustils` (via `platform::error`, transitively) not at all in its own
 `Cargo.toml` -- `rusty_tokio` already sits on top of it internally for
 exactly the primitives this project would otherwise have wrapped by hand.
+
+**No `zeromq` crate, despite `ipython_runtime` needing a real ZMTP
+client.** The plan for that increment (`PARITY.md`'s RLM programming
+model entry) originally named `zeromq` (pure-Rust ZMTP) as an explicit,
+justified dependency exception. Its actual `Cargo.toml` (checked via
+`cargo tree` against a throwaway scratch crate before committing to it)
+depends directly on real `tokio` unconditionally -- exactly the "two
+async runtimes competing in one process" shape this section's own
+`rp-server` note explains this project avoids by never linking that
+sidecar in as a library either. `zmtp.rs`/`sha256.rs` hand-roll the wire
+protocol and its HMAC-SHA256 signing scheme directly on `rusty_tokio::
+io::TcpStream` instead, so this dependency stack stays exactly the same
+two-hop shape below -- see `PARITY.md`'s RLM entry for the full story
+(what the plan assumed, what `cargo tree` actually showed, and why
+hand-rolling was judged the better fit for this project's existing
+"hand-roll wire protocols" posture, not a compromise).
 
 **No bridging layer.** An earlier revision of `transport.rs` bridged
 `rustils`' blocking `Net` trait through `spawn_blocking` by hand, because
@@ -131,36 +150,55 @@ kill -- goes through `rusty_tokio::process::Command`/`Child` directly.
 The one deliberate ports-and-adapters seam this project leaves open, per
 the original Phase 1 brief's Architecture Constraints ("design the trait
 boundary [to the model-facing IPython kernel] ... but implement only a
-no-op/mock runtime") -- still the one genuinely open seam, unrevised by
-anything in this session's own work.
+no-op/mock runtime") -- now backed by a real implementation, see below.
 
 `tool_runtime::ToolRuntime` (object-safe, `Box<dyn ToolRuntime>`,
 boxed-future async methods rather than a real `async fn` in the trait --
 see that module's own doc comment for why) is the host-side handle to a
 model-facing code execution environment: `start`/`execute`/`shutdown`.
-Phase 1 backs it only with `NoopToolRuntime`, which never spawns a
-process and never executes anything -- it exists so `AgentSession` and
-the worker's lifecycle plumbing are built and tested end to end against
-the real trait shape before a Phase 2 kernel backend exists.
+Every session still gets `NoopToolRuntime` by default (never spawns a
+process, never executes anything) unless it opts in via `session new
+--runtime ipython`, in which case it gets `ipython_runtime::
+IpythonKernelRuntime` -- a real, spawned Jupyter/IPython kernel
+subprocess (`python3 -m ipykernel_launcher`), driven over a hand-rolled
+ZMTP 3.0 client (`zmtp.rs`, NULL mechanism, `shell`/`iopub` sockets only)
+with HMAC-SHA256-signed messages (`sha256.rs`) -- see `PARITY.md`'s RLM
+programming model entry for the full story (what was originally planned,
+what a `zeromq` crate `cargo tree` check ruled out, and what the
+hand-rolled alternative actually covers/still defers). `worker::
+build_tool_runtime` is the one place this selection happens, based on
+`WorkerArgs::runtime` -- picked before `AgentSession::create`/`recover`
+even run, the same `--thinking`-shaped "always supplied by the daemon at
+spawn time" thread-through `WorkerArgs::thinking` already established,
+not `--tools`'/`--goal`'s "New-only" one, since a `ToolRuntime`
+implementation has to exist before there's any persisted `state.json` to
+read a resumed session's choice back from.
 
 Every *other* subsystem in this crate calls `rusty_tokio` (and, through
 it, `rustils`) directly rather than wrapping them behind a speculative
 trait -- `transport.rs` calls `rusty_tokio::io` directly, `worker::spawn`
-calls `rusty_tokio::process::Command` directly. `ToolRuntime` is the one
-boundary that genuinely has a second, concrete backend coming (Phase 2's
-real IPython kernel subprocess, itself spawned via
-`rusty_tokio::process::Command`/`rusty_tokio` pipes -- the trait's boxed
-futures exist specifically so that `.await`ing subprocess I/O won't need
-a redesign when that lands), so it alone earns the indirection now.
+calls `rusty_tokio::process::Command` directly. `ToolRuntime` remains the
+one boundary with a genuinely swappable second backend, and its
+boxed-future shape is exactly why `IpythonKernelRuntime::start`/`execute`
+being real, `.await`-heavy subprocess-and-socket I/O needed no trait
+redesign to land.
 
 **Not the same thing as the real tool-calling loop** (`provider`/`tools`
-modules, `session new --tools read`, see `PARITY.md`): that's `rp-server`
-answering `ChatRequest.tools`/`tool_calls` over the same HTTP connection
-`RustyProviderModel` already uses, independent of any kernel process --
-it needed no new seam, just a richer `ModelProvider::respond` signature.
-`ToolRuntime` stays exactly what it was: the specific boundary to a
-model-facing *code execution environment* (Phase 2's IPython kernel),
-still `NoopToolRuntime`, still unrevised.
+modules, `session new --tools read|mcp`, see `PARITY.md`): that's
+`rp-server` answering `ChatRequest.tools`/`tool_calls` over the same HTTP
+connection `RustyProviderModel` already uses, independent of any kernel
+process. `ToolRuntime` stays the specific boundary to a model-facing
+*code execution environment* -- but the two *do* meet at exactly one
+point: `session new --runtime ipython` offers an `execute_python` tool
+(`tools::execute_python_tool_def`) through that same tool-calling loop,
+and `AgentSession::execute_tool_call` routes a call to it straight to
+`self.tool_runtime.execute(code)` instead of `tools::execute`/
+`McpClient::call_tool`. This is the natural way to make a real kernel
+*reachable* from an ordinary prompt/response turn without inventing a
+second turn-loop mechanism alongside the one Increment 3 already built --
+the tool-calling loop is "how a turn asks for something to happen
+outside the model," and the kernel is one more thing that can happen,
+not a different kind of turn.
 
 ## Known gaps
 

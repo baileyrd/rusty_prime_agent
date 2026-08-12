@@ -10,11 +10,13 @@ still-running process remembers.
 
 This project deliberately mirrors one slice of
 [`PrimeIntellect-ai/prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent)'s
-daemon/worker operational architecture, plus a bounded, non-Python
+daemon/worker operational architecture, plus a bounded, mostly-non-Python
 subset of its higher-level features (scheduling, persistent goals,
 bounded autonomous mode, prompt templates, the Continual Harness,
-recursive subagents, a minimal REPL, model catalog listing) -- without
-attempting to reimplement `prime-agent` itself. See
+recursive subagents, a minimal REPL, model catalog listing, real
+tool-calling/MCP integration, and a real persistent IPython kernel for
+its RLM programming model) -- without attempting to reimplement
+`prime-agent` itself. See
 [`PARITY.md`](PARITY.md) for exactly what's mirrored, what's a
 deliberate simplification, and what's out of scope for this project's
 current shape, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
@@ -72,6 +74,21 @@ harness session new --model ollama/qwen2.5:0.5b --tools read
 harness session new --model ollama/qwen2.5:0.5b --tools mcp
 ```
 
+Add `--runtime ipython` to give the session a real, persistent IPython
+kernel it can run code in -- parity with `prime-agent`'s RLM programming
+model. Spawns a real `python3 -m ipykernel_launcher` subprocess (needs
+`python3` with `ipykernel` installed: `pip install ipykernel`) and offers
+an `execute_python` tool through the same tool-calling loop `--tools`
+uses (independent of, and combinable with, `--tools read`/`mcp`): the
+model sends code, gets stdout/the last expression's value back, and
+variables/imports persist across calls within the session. Off by
+default; `EchoProvider` sessions can set it too, but never actually
+invoke it.
+
+```sh
+harness session new --model ollama/qwen2.5:0.5b --runtime ipython
+```
+
 ## Global flags
 
 - `--mode json|text` (must come first, before the subcommand) -- switches
@@ -91,7 +108,7 @@ harness daemon shutdown              # gracefully stops every worker, then exits
 ### Sessions
 
 ```sh
-harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read|mcp]
+harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read|mcp] [--runtime ipython]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>
@@ -219,6 +236,7 @@ per-model catalog instead (id, owning provider, context length) -- needs
 | `RUSTY_PRIME_AGENT_MODEL` | Default `--model` for `session new` when no explicit flag is given. |
 | `RUSTY_PRIME_AGENT_RP_SERVER_BIN` | Path/name of the `rp-server` binary (default: `rp-server` on `PATH`). |
 | `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL` | Base URL for the Ollama provider (default: `http://127.0.0.1:11434/v1`). |
+| `RUSTY_PRIME_AGENT_IPYTHON_BIN` | Path/name of the Python interpreter `--runtime ipython` spawns (default: `python3`, or `python` on Windows). Must have `ipykernel` installed. |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` | Activate the matching provider when set. |
 
 Setting a `--model` on `session new` (directly, or via

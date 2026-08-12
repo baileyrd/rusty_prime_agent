@@ -207,10 +207,11 @@ daemon/worker split rather than requiring the Python control environment:
   live editor. This is deliberately **not** parity with real
   `prime-agent` "skills" (`packages/coding-agent/docs/skills.md`), which
   are "importable Python packages" wired to the RLM control environment
-  -- that half needs real code execution (`tool_runtime::ToolRuntime`'s
-  deliberately open seam, Phase 1 backs it with `NoopToolRuntime` only)
-  and stays out of scope below; this increment covers only the
-  plain-text template half of that surface, which needed none.
+  -- `tool_runtime::ToolRuntime`'s code-execution boundary is real now
+  (see the RLM programming model entry below), but actual Python-package
+  "skills" on top of it are a separate, larger surface still out of
+  scope; this increment covers only the plain-text template half of that
+  surface, which needed none.
 - [x] **The Continual Harness** (`session harness (add <id> <prompt|
   memory|skill> <text...>|list <id>|rollback <id> <index>)`, `session
   refine <id>`, parity with `prime-agent`'s Continual Harness paper
@@ -261,8 +262,11 @@ daemon/worker split rather than requiring the Python control environment:
   single local caller, so this doesn't need server-side enforcement of
   its own) and delivered as an ordinary, visible `SessionPrompt`.
   Skills/tools/retry-policy inheritance (the rest of that same
-  `rlm(...)` sentence) don't apply here -- this project's tool runtime
-  is `NoopToolRuntime` and it has no retry-policy concept to inherit.
+  `rlm(...)` sentence) don't apply here -- `session spawn` doesn't thread
+  a `--runtime`/`--tools` flag of its own (a child session gets
+  `NoopToolRuntime`/no tools regardless of its parent's, unlike `model`,
+  which it does inherit), and there's no retry-policy concept to inherit
+  either way.
 - [x] **A minimal interactive REPL** (`session repl <id>`), bounded,
   non-Python parity with `prime-agent`'s interactive TUI. Reads lines
   from stdin, sends each as an ordinary `SessionPrompt`, prints the
@@ -354,8 +358,9 @@ daemon/worker split rather than requiring the Python control environment:
   Python-bound and out of scope -- reading `rusty_provider`'s actual
   source (`crates/core/src/types.rs`) showed that conflated two
   different things: `tool_runtime::ToolRuntime` really is that boundary
-  (still `NoopToolRuntime`, still out of scope below, untouched by this
-  entry), but `rp-server`'s `/v1/chat/completions` already speaks full
+  (still `NoopToolRuntime` as of this entry, untouched by it -- see the
+  RLM programming model entry further down for where that later changed),
+  but `rp-server`'s `/v1/chat/completions` already speaks full
   OpenAI-style tool-calling (`ChatRequest.tools`/`tool_choice`,
   `ChatMessage.tool_calls`, `Role::Tool`) independently of any kernel --
   our own `ModelProvider` just never asked for any of it. `provider::
@@ -428,6 +433,107 @@ daemon/worker split rather than requiring the Python control environment:
   this small test model reliably emits a real structured tool call for
   this specific tool/prompt pair, unlike its unreliable behavior with
   `read_file`.
+- [x] **The RLM programming model's IPython-kernel boundary** (`session
+  new --runtime ipython`, `execute_python` tool), parity with
+  `prime-agent`'s persistent-IPython RLM control environment. Every prior
+  revision of this file marked this "genuinely out of scope" as
+  architecturally Python-bound; that held for the actual code-execution
+  half, but not for the reason assumed. `tool_runtime::ToolRuntime` was
+  always the right boundary (still true) -- what changed is that backing
+  it with something real turned out tractable within this project's own
+  shape, not a TypeScript-scale undertaking.
+
+  The original plan for this increment named the `zeromq` crate (pure-Rust
+  ZMTP) as an explicit, justified dependency exception. Reading its actual
+  `Cargo.toml` (`cargo tree` against a throwaway scratch crate) found it
+  depends directly on real `tokio` unconditionally (`default =
+  ["tokio-runtime", ...]`; its `async-std-runtime` feature swaps to a
+  *different* foreign runtime, not a fix) -- exactly the "two async
+  runtimes competing in one process" anti-pattern `rp_server`'s own doc
+  comment explains why `rp-server` runs as a separate OS process rather
+  than being linked in as a library. Rather than accept that (or bridge it
+  across a second OS thread running its own runtime), the wire protocol
+  itself was hand-rolled directly on `rusty_tokio::io::TcpStream`
+  (`zmtp.rs`): the ZMTP 3.0 NULL-mechanism greeting, `READY` command
+  exchange, and DEALER/SUB multipart framing, confirmed byte-exact against
+  a real, running `ipykernel` via raw-socket probes (no pyzmq, no libzmq)
+  before any Rust code was written -- the same "reproduce first"
+  discipline this project used for the original AF_UNIX bug and the MCP
+  gateway spike. This is no bigger an undertaking than `http_client`'s own
+  hand-rolled HTTP/1.1 client, and more consistent with this project's
+  established "hand-roll wire protocols over pulling in a dependency"
+  posture than the plan's original `zeromq` assumption was.
+  Jupyter's message-signing scheme (HMAC-SHA256 over each message's
+  header/parent_header/metadata/content frames) needed a second thing this
+  project had never needed before: a hash function. `sha256.rs`
+  hand-rolls SHA-256 and HMAC-SHA256 directly from FIPS 180-4/RFC 2104
+  rather than adding a `sha2`/`hmac` crate exception alongside the
+  now-avoided `zeromq` one -- unlike ZMTP's or HTTP's own framing, SHA-256
+  is a small, exactly-specified algorithm with no ambiguity to get subtly
+  wrong, and the implementation is pinned against the official FIPS 180-4
+  and RFC 4231 test vectors, not just self-consistency. The HMAC key
+  itself is generated locally (timestamp + pid, mixed through `sha256`,
+  the same non-cryptographic-but-adequate approach `session::
+  new_session_id` already established) rather than needing a `rand`
+  dependency -- adequate because the real security boundary is the same
+  one a genuine Jupyter installation relies on: the connection file never
+  leaves this session's own, already-private state directory.
+
+  `ipython_runtime::IpythonKernelRuntime` backs `ToolRuntime` for real:
+  `start` spawns `python3 -m ipykernel_launcher -f <connection file>` (five
+  ports picked the same way `rp_server::pick_free_port` picks `rp-server`'s
+  one), opens `shell` (DEALER) and `iopub` (SUB, subscribed to
+  everything), and completes a `kernel_info_request`/`reply` handshake;
+  `execute` sends `execute_request` and reads iopub until `status: idle`,
+  capturing `stream` (stdout/stderr), `execute_result`, and `error`
+  content into `ExecutionOutcome`. Direct testing against a real kernel
+  caught a real bug worth recording: an early version broke its iopub loop
+  on the *first* `status: idle` it saw, but a freshly-booted kernel emits
+  its own unsolicited `busy`/`idle` pair during startup, unrelated to any
+  request -- the fix checks `parent_header.msg_id` against the
+  `execute_request`'s own `msg_id`, the same correlation a real Jupyter
+  client performs, to tell a request's own iopub traffic apart from
+  everything else on the same broadcast socket. Only `shell`+`iopub` are
+  opened; `stdin` (kernel-side `input()`), `control` (interrupt/
+  `shutdown_request`), and `heartbeat` are out of scope for this pass, so
+  `shutdown` tears the kernel down with a plain process kill rather than a
+  graceful control-channel request. The kernel subprocess is deliberately
+  left un-detached (unlike every other spawned process this project
+  manages): it's meant to live and die with the one worker/session that
+  owns it, which also means `ipykernel`'s own parent-poller kills it for
+  free if the worker crashes without a clean `shutdown`.
+
+  Reaching the kernel from a prompt reuses the existing tool-calling loop
+  (Increment 3) rather than inventing a second turn-loop mechanism:
+  `session new --runtime ipython` offers an `execute_python` tool
+  (independent of, and combinable with, `--tools read|mcp`) whose calls
+  are routed to `self.tool_runtime.execute(code)` instead of
+  `tools::execute`/the MCP client. A Python-level exception (e.g. `raise
+  ValueError(...)`) comes back as an ordinary tool result the model can
+  see and recover from, not a `HarnessError` -- only a genuine plumbing
+  failure (a dropped connection, a timed-out handshake) propagates as one.
+  Real end-to-end coverage (spawn, handshake, `execute_request` round
+  trip, state persisting across calls within one kernel, a Python
+  exception surfacing correctly, clean shutdown) lives as an `#[ignore]`d
+  test directly in `ipython_runtime.rs`'s own test module rather than
+  `tests/`, since this project's binary has no `[lib]` target for an
+  integration test to link a Rust-level unit test against -- run
+  explicitly against a real local `ipykernel` install (`pip install
+  ipykernel`), the same infra-gated pattern `tests/ollama_provider.rs`
+  uses. CI-safe coverage (`tests/ipython_runtime.rs`) proves the flag
+  reaches all the way from `session new` through the daemon to the
+  worker's `ToolRuntime` selection without needing a real kernel, by
+  pointing `RUSTY_PRIME_AGENT_IPYTHON_BIN` at a binary name that can't
+  exist.
+
+  Explicitly still out of scope: interrupt/cancel (needs `control`),
+  kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
+  `execute_result`'s `data` only ever reads `text/plain` here), and
+  multi-kernel pooling beyond one kernel per session. Real `prime-agent`
+  "skills" (importable Python packages, `packages/coding-agent/docs/
+  skills.md`) and `/heartbeat`/`rlm_heartbeat`'s TUI/RLM-function trigger
+  surfaces stay out of scope below for their own, separate reasons -- see
+  those entries.
 
 ## Out of scope for this project's current shape
 
@@ -436,27 +542,26 @@ require a genuinely new subsystem (a Python control environment) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
-- **The RLM programming model** (persistent IPython kernel,
-  `tool_runtime::ToolRuntime`'s one deliberate open seam is exactly this
-  boundary, but Phase 1 backs it with `NoopToolRuntime` only; recursive
-  subagents' own Python invocation surface, `rlm(...)` itself, is the
-  same boundary -- see the medium-effort section above for the
-  session-level mechanism underneath it, which is done).
 - **Skills, extensions, themes.** (Prompt templates -- the plain-text,
-  non-Python half of `prime-agent skills.md`'s surface -- are done; see
-  the medium-effort section above. Real "skills" stay out of scope:
-  they're "importable Python packages" wired to the RLM control
-  environment, same boundary as the RLM programming model item above.
-  MCP integrations turned out to be a separate thing entirely from any
-  of this -- see the medium-effort section above, now done.)
+  non-Python half of `prime-agent skills.md`'s surface -- are done, and
+  the underlying code-execution boundary those real "skills" would need
+  is now real too (`tool_runtime::ToolRuntime` backed by
+  `IpythonKernelRuntime`, see the medium-effort section above) -- but
+  actual "skills" packaging (`prime-agent`'s "importable Python packages",
+  a module/manifest/distribution system on top of that boundary) is a
+  separate, larger surface this project hasn't built. MCP integrations
+  turned out to be a separate thing entirely from any of this -- see the
+  medium-effort section above, now done.)
 - **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
   triggers for the same "re-enter a session periodically" mechanism
   `prime-agent schedule`/`session schedule` already covers server-side
   (see the medium-effort section above); these two are just alternate
-  entry points into it that need the TUI or the RLM programming model,
-  both themselves out of scope below. (Scheduling, persistent goals, and
-  bounded autonomous mode -- `prime-agent schedule`/`--goal`/`/goal`/
-  `/autonomous` -- are all done; see the medium-effort section above.)
+  entry points into it that need the TUI (out of scope below) or a
+  kernel-side `rlm_heartbeat()` Python binding (a specific piece of the
+  same "skills" packaging gap above, not the kernel boundary itself,
+  which is now real). (Scheduling, persistent goals, and bounded
+  autonomous mode -- `prime-agent schedule`/`--goal`/`/goal`/`/autonomous`
+  -- are all done; see the medium-effort section above.)
 - **The interactive TUI**'s rich editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare

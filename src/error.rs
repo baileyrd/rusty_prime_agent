@@ -33,6 +33,10 @@ pub enum Context {
     /// The `rp-server` sidecar (spawn, health check) or a `ModelProvider`
     /// backend's HTTP call to it -- see `rp_server`/`provider::OllamaProvider`.
     Provider,
+    /// The real `ToolRuntime` backend: the IPython kernel subprocess
+    /// (spawn, connection-file handshake) or its ZMTP wire protocol --
+    /// see `zmtp`/`ipython_runtime`.
+    Runtime,
 }
 
 impl fmt::Display for Context {
@@ -44,6 +48,7 @@ impl fmt::Display for Context {
             Context::Catalog => "catalog",
             Context::Cli => "cli",
             Context::Provider => "provider",
+            Context::Runtime => "runtime",
         };
         f.write_str(s)
     }

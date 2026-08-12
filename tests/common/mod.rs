@@ -205,6 +205,33 @@ pub fn session_new_with_model_and_tools(
     stdout_string(&out)
 }
 
+/// Same as [`session_new_with_model`] plus `--runtime ipython`. Kept as
+/// its own function for the same reason `session_new_with_model_and_tools`
+/// is.
+pub fn session_new_with_runtime(
+    state_dir: &Path,
+    name: Option<&str>,
+    model: Option<&str>,
+    runtime: Option<&str>,
+) -> String {
+    let mut args = vec!["session", "new"];
+    if let Some(n) = name {
+        args.push("--name");
+        args.push(n);
+    }
+    if let Some(m) = model {
+        args.push("--model");
+        args.push(m);
+    }
+    if let Some(r) = runtime {
+        args.push("--runtime");
+        args.push(r);
+    }
+    let out = run(state_dir, &args);
+    assert_success("session new", &out);
+    stdout_string(&out)
+}
+
 pub fn session_prompt(state_dir: &Path, session_id: &str, text: &str) -> String {
     let out = run(state_dir, &["session", "prompt", session_id, text]);
     assert_success("session prompt", &out);

@@ -139,6 +139,7 @@ pub async fn print_once(
             parent_id: None,
             thinking: None,
             tools: None,
+            runtime: None,
         },
     )
     .await?;
@@ -223,16 +224,22 @@ pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> 
 }
 
 /// Shared by [`session_new`] and [`session_spawn`] -- the latter needs
-/// the raw id, not printed text, plus a non-`None` `parent_id`.
-async fn create_session(
-    state_root: &Path,
-    name: Option<String>,
-    model: Option<String>,
-    goal: Option<String>,
-    parent_id: Option<String>,
-    thinking: Option<String>,
-    tools: Option<String>,
-) -> Result<String> {
+/// the raw id, not printed text, and sets `parent_id` itself. Takes the
+/// same `NewSessionMeta` bundle `AgentSession::create`/`worker::spawn`
+/// already use rather than one parameter per field, both to stay under
+/// clippy's `too_many_arguments` and because it's the same "this argument
+/// list keeps growing every time a new `session new`-seedable field is
+/// added" problem `NewSessionMeta`'s own doc comment already names.
+async fn create_session(state_root: &Path, meta: crate::session::NewSessionMeta) -> Result<String> {
+    let crate::session::NewSessionMeta {
+        name,
+        model,
+        goal,
+        parent_id,
+        thinking,
+        tools,
+        runtime,
+    } = meta;
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
@@ -243,6 +250,7 @@ async fn create_session(
             parent_id,
             thinking,
             tools,
+            runtime,
         },
     )
     .await?;
@@ -254,14 +262,10 @@ async fn create_session(
 
 pub async fn session_new(
     state_root: &Path,
-    name: Option<String>,
-    model: Option<String>,
-    goal: Option<String>,
-    thinking: Option<String>,
-    tools: Option<String>,
+    meta: crate::session::NewSessionMeta,
     mode: OutputMode,
 ) -> Result<()> {
-    let session_id = create_session(state_root, name, model, goal, None, thinking, tools).await?;
+    let session_id = create_session(state_root, meta).await?;
     match mode {
         OutputMode::Json => print_json(&Response::SessionNew { session_id }),
         OutputMode::Text => println!("{session_id}"),
@@ -368,8 +372,19 @@ pub async fn session_spawn(
                 .model
         }
     };
-    let child_id =
-        create_session(state_root, name, model, None, Some(parent_id), None, None).await?;
+    let child_id = create_session(
+        state_root,
+        crate::session::NewSessionMeta {
+            name,
+            model,
+            goal: None,
+            parent_id: Some(parent_id),
+            thinking: None,
+            tools: None,
+            runtime: None,
+        },
+    )
+    .await?;
     add_schedule(
         state_root,
         child_id.clone(),
