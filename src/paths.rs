@@ -122,6 +122,26 @@ pub fn worker_socket_path(state_root: &std::path::Path, session_id: &str) -> Pat
         .join(format!("{:016x}.sock", hasher.finish()))
 }
 
+/// Where `rp_server::ensure_running` records the sidecar's chosen port
+/// and pid, so a worker process (started separately from the supervisor
+/// that spawned the sidecar) can find it without a lookup service of its
+/// own -- same "small JSON file, read by whichever process needs it"
+/// shape as `state_file_path`.
+pub fn provider_state_path(state: &std::path::Path) -> PathBuf {
+    state.join("provider.json")
+}
+
+/// The generated `config.toml` `rp_server::ensure_running` writes and
+/// launches `rp-server` against -- see that function's own doc comment.
+pub fn provider_config_path(state: &std::path::Path) -> PathBuf {
+    state.join("provider-config.toml")
+}
+
+/// `rp-server`'s own stderr, same reasoning as `daemon_log_path`.
+pub fn provider_log_path(state: &std::path::Path) -> PathBuf {
+    state.join("provider.log")
+}
+
 /// Create `dir` (and parents) if missing.
 pub fn ensure_dir(context: Context, dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(context, Some(dir.to_path_buf()), e))
