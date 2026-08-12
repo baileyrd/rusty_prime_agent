@@ -179,6 +179,12 @@ pub enum Command {
         to_id: String,
         text: String,
     },
+    /// `harness session repl <id>` -- minimal, non-Python parity with
+    /// `prime-agent`'s interactive TUI. See `client::session_repl`'s own
+    /// doc comment for exactly what it does and doesn't cover.
+    SessionRepl {
+        session_id: String,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -402,8 +408,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     text: text.join(" "),
                 })
             }
+            Some("repl") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session repl` requires a session id"))?;
+                Ok(Command::SessionRepl { session_id })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -423,7 +436,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
