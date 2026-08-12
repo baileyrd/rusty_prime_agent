@@ -185,6 +185,11 @@ pub enum Command {
     SessionRepl {
         session_id: String,
     },
+    /// `harness model list` -- bounded parity with `prime-agent model
+    /// list`'s catalog browse. See `client::model_list`'s own doc
+    /// comment for exactly what it does and doesn't cover. No daemon
+    /// needed: a pure environment-variable check.
+    ModelList,
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -433,10 +438,14 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 "expected `prompt-template list|render`, got {other:?}"
             ))),
         },
+        Some("model") => match it.next().map(String::as_str) {
+            Some("list") => Ok(Command::ModelList),
+            other => Err(usage(format!("expected `model list`, got {other:?}"))),
+        },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, `model list`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
