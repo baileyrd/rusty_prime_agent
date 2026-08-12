@@ -132,8 +132,8 @@ async fn run(args: &[String]) -> Result<()> {
         }
         cli::Command::DaemonStatus => client::daemon_status(&state_root, output_mode).await,
         cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root, output_mode).await,
-        cli::Command::SessionNew { name, model } => {
-            client::session_new(&state_root, name, model, output_mode).await
+        cli::Command::SessionNew { name, model, goal } => {
+            client::session_new(&state_root, name, model, goal, output_mode).await
         }
         cli::Command::SessionAttach { session_id } => {
             client::session_attach(&state_root, session_id, output_mode).await
@@ -160,6 +160,12 @@ async fn run(args: &[String]) -> Result<()> {
             session_id,
             schedule_id,
         } => client::schedule_cancel(&state_root, session_id, schedule_id, output_mode).await,
+        cli::Command::GoalUpdate { session_id, action } => {
+            client::goal_update(&state_root, session_id, action, output_mode).await
+        }
+        cli::Command::GoalShow { session_id } => {
+            client::goal_show(&state_root, session_id, output_mode).await
+        }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }
@@ -170,6 +176,7 @@ async fn run(args: &[String]) -> Result<()> {
             mode,
             name,
             model,
+            goal,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -177,6 +184,7 @@ async fn run(args: &[String]) -> Result<()> {
                 mode,
                 name,
                 model,
+                goal,
             })
             .await
         }

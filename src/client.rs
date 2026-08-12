@@ -15,7 +15,7 @@ use crate::cli::OutputMode;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
-use crate::protocol::{Request, Response, SessionEvent, SessionStatus};
+use crate::protocol::{GoalAction, GoalState, Request, Response, SessionEvent, SessionStatus};
 use crate::transport;
 
 /// `Response`/`SessionEvent` are plain derived-`Serialize` data (strings,
@@ -127,8 +127,15 @@ pub async fn print_once(
     ensure_daemon_started(state_root, exe_path).await?;
 
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name: None, model })
-        .await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionNew {
+            name: None,
+            model,
+            goal: None,
+        },
+    )
+    .await?;
     let session_id = match read_response(&mut conn).await? {
         Response::SessionNew { session_id } => session_id,
         other => return Err(unexpected_response(other)),
@@ -213,10 +220,11 @@ pub async fn session_new(
     state_root: &Path,
     name: Option<String>,
     model: Option<String>,
+    goal: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name, model })
+    conn.write_request(Context::Daemon, &Request::SessionNew { name, model, goal })
         .await?;
     match read_response(&mut conn).await? {
         response @ Response::SessionNew { .. } => {
@@ -514,6 +522,65 @@ pub async fn schedule_cancel(
             Ok(())
         }
         other => Err(unexpected_response(other)),
+    }
+}
+
+pub async fn goal_update(
+    state_root: &Path,
+    session_id: String,
+    action: GoalAction,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::GoalUpdate { session_id, action })
+        .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::GoalUpdateAck { .. } => {
+            if mode == OutputMode::Json {
+                print_json(&response);
+                return Ok(());
+            }
+            let Response::GoalUpdateAck { goal } = response else {
+                unreachable!()
+            };
+            print_goal_text(&goal);
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+pub async fn goal_show(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::GoalShow { session_id })
+        .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::GoalShow { .. } => {
+            if mode == OutputMode::Json {
+                print_json(&response);
+                return Ok(());
+            }
+            let Response::GoalShow { goal } = response else {
+                unreachable!()
+            };
+            print_goal_text(&goal);
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+fn print_goal_text(goal: &Option<GoalState>) {
+    match goal {
+        None => println!("no goal"),
+        Some(g) => {
+            let status = match g.status {
+                crate::protocol::GoalStatus::Active => "active",
+                crate::protocol::GoalStatus::Paused => "paused",
+                crate::protocol::GoalStatus::Completed => "completed",
+            };
+            println!("{status}\t{}", g.text);
+        }
     }
 }
 

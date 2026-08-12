@@ -36,7 +36,10 @@ use rusty_tokio::sync::broadcast;
 
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
-use crate::protocol::{Role, SessionEvent, SessionState, SessionStatus, TranscriptEntry};
+use crate::protocol::{
+    GoalAction, GoalState, GoalStatus, Role, SessionEvent, SessionState, SessionStatus,
+    TranscriptEntry,
+};
 use crate::provider::ModelProvider;
 use crate::tool_runtime::ToolRuntime;
 
@@ -93,12 +96,23 @@ impl AgentSession {
         session_id: String,
         name: Option<String>,
         model: Option<String>,
+        goal_text: Option<String>,
         provider: Box<dyn ModelProvider>,
         tool_runtime: Box<dyn ToolRuntime>,
     ) -> Result<Self> {
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
         let now = now_ms();
+        // Parity with `prime-agent --goal`: "starts a persistent goal
+        // only for a new root session" -- this is the one place a goal
+        // can be seeded at creation time; every other path goes through
+        // `update_goal`'s `Set` action on an already-existing session.
+        let goal = goal_text.map(|text| GoalState {
+            text,
+            status: GoalStatus::Active,
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
         let state = SessionState {
             session_id,
             name,
@@ -109,6 +123,7 @@ impl AgentSession {
             created_at_ms: now,
             updated_at_ms: now,
             model,
+            goal,
         };
         let session = AgentSession {
             state,
@@ -247,6 +262,50 @@ impl AgentSession {
         self.state.name = name;
         self.state.updated_at_ms = now_ms();
         self.write_state().await
+    }
+
+    /// Parity with `prime-agent --goal`/`/goal`. `Pause`/`Resume`/
+    /// `Complete` on a session with no current goal are accepted as
+    /// no-ops rather than errors -- a caller racing a `Clear` (or one
+    /// that simply mis-tracked state) gets back "no goal" (`None`)
+    /// either way, the same observable outcome a rejected transition
+    /// would have left it in, without needing a separate error path
+    /// this project's own `Response::Error` "conflict" flag would just
+    /// have to explain away.
+    pub async fn update_goal(&mut self, action: GoalAction) -> Result<Option<GoalState>> {
+        let now = now_ms();
+        match action {
+            GoalAction::Set { text } => {
+                self.state.goal = Some(GoalState {
+                    text,
+                    status: GoalStatus::Active,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                });
+            }
+            GoalAction::Clear => self.state.goal = None,
+            GoalAction::Pause => {
+                if let Some(goal) = &mut self.state.goal {
+                    goal.status = GoalStatus::Paused;
+                    goal.updated_at_ms = now;
+                }
+            }
+            GoalAction::Resume => {
+                if let Some(goal) = &mut self.state.goal {
+                    goal.status = GoalStatus::Active;
+                    goal.updated_at_ms = now;
+                }
+            }
+            GoalAction::Complete => {
+                if let Some(goal) = &mut self.state.goal {
+                    goal.status = GoalStatus::Completed;
+                    goal.updated_at_ms = now;
+                }
+            }
+        }
+        self.state.updated_at_ms = now;
+        self.write_state().await?;
+        Ok(self.state.goal.clone())
     }
 
     pub async fn mark_stopped(&mut self) -> Result<()> {

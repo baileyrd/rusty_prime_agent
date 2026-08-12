@@ -1,21 +1,22 @@
 //! Argument parsing and dispatch for the public CLI surface (Required
 //! Behavior: `daemon start/status/shutdown`, `session new/attach/list`,
-//! plus `session stop`/`session rename`/`-p`/`--print` -- parity with
-//! `prime-agent stop <agent>`/`rename <agent> <name>`/`-p`, see
-//! `PARITY.md`) plus the two hidden entrypoints this binary spawns itself
-//! as (`__supervisor-main`, `__worker-main`).
+//! plus `session stop`/`session rename`/`session schedule`/`session
+//! goal`/`-p`/`--print` -- parity with `prime-agent stop <agent>`/`rename
+//! <agent> <name>`/`--goal`/`/goal`/`-p`, see `PARITY.md`) plus the two
+//! hidden entrypoints this binary spawns itself as (`__supervisor-main`,
+//! `__worker-main`).
 //!
-//! Hand-rolled, not `clap`: the surface is eleven fixed subcommands with
-//! at most two positional/flag arguments each -- a dependency buys
-//! nothing here that fifty lines of matching doesn't already give
-//! directly, and this project's dependency floor (`platform`,
-//! `rusty_tokio`, `serde`/`serde_json`, `thiserror`) is deliberately
-//! narrow.
+//! Hand-rolled, not `clap`: the surface is a fixed, small set of
+//! subcommands with at most a few positional/flag arguments each -- a
+//! dependency buys nothing here that a few hundred lines of matching
+//! doesn't already give directly, and this project's dependency floor
+//! (`platform`, `rusty_tokio`, `serde`/`serde_json`, `thiserror`) is
+//! deliberately narrow.
 
 use std::path::PathBuf;
 
 use crate::error::{HarnessError, Result};
-use crate::protocol::ScheduleKind;
+use crate::protocol::{GoalAction, ScheduleKind};
 use crate::worker::WorkerMode;
 
 /// Parity with `prime-agent --mode json`: a leading, global `--mode
@@ -54,6 +55,9 @@ pub enum Command {
         /// Parity with `prime-agent --model provider/id`; see
         /// `Request::SessionNew::model`'s own doc comment.
         model: Option<String>,
+        /// Parity with `prime-agent --goal`; see
+        /// `Request::SessionNew::goal`'s own doc comment.
+        goal: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -88,6 +92,15 @@ pub enum Command {
         session_id: String,
         schedule_id: String,
     },
+    /// `harness session goal (set <text...>|show|pause|resume|complete|
+    /// clear) <id>` -- parity with `prime-agent --goal`/`/goal`.
+    GoalUpdate {
+        session_id: String,
+        action: GoalAction,
+    },
+    GoalShow {
+        session_id: String,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -108,6 +121,7 @@ pub enum Command {
         mode: WorkerMode,
         name: Option<String>,
         model: Option<String>,
+        goal: Option<String>,
     },
 }
 
@@ -177,7 +191,8 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 let rest: Vec<&String> = it.collect();
                 let name = scan_named_flag(&rest, "--name")?;
                 let model = scan_named_flag(&rest, "--model")?;
-                Ok(Command::SessionNew { name, model })
+                let goal = scan_named_flag(&rest, "--goal")?;
+                Ok(Command::SessionNew { name, model, goal })
             }
             Some("attach") => {
                 let session_id = it
@@ -223,8 +238,9 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 })
             }
             Some("schedule") => parse_schedule(&mut it),
+            Some("goal") => parse_goal(&mut it),
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal`, got {other:?}"
             ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
@@ -341,6 +357,52 @@ fn parse_schedule<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Comma
     }
 }
 
+/// `session goal (set <text...>|show|pause|resume|complete|clear) <id>`.
+fn parse_goal<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> {
+    match it.next().map(String::as_str) {
+        Some("set") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session goal set` requires a session id"))?;
+            let text: Vec<String> = it.cloned().collect();
+            if text.is_empty() {
+                return Err(usage("`session goal set` requires goal text"));
+            }
+            Ok(Command::GoalUpdate {
+                session_id,
+                action: GoalAction::Set {
+                    text: text.join(" "),
+                },
+            })
+        }
+        Some("show") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session goal show` requires a session id"))?;
+            Ok(Command::GoalShow { session_id })
+        }
+        Some(verb @ ("pause" | "resume" | "complete" | "clear")) => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage(format!("`session goal {verb}` requires a session id")))?;
+            let action = match verb {
+                "pause" => GoalAction::Pause,
+                "resume" => GoalAction::Resume,
+                "complete" => GoalAction::Complete,
+                "clear" => GoalAction::Clear,
+                _ => unreachable!(),
+            };
+            Ok(Command::GoalUpdate { session_id, action })
+        }
+        other => Err(usage(format!(
+            "expected `session goal set|show|pause|resume|complete|clear`, got {other:?}"
+        ))),
+    }
+}
+
 /// A duration string like `30s`/`5m`/`2h`/`1d` (a number plus one of
 /// `s`/`m`/`h`/`d`) -- deliberately not a full ISO 8601 duration parser;
 /// this project doesn't pull in a dependency for `--every`'s narrow
@@ -386,6 +448,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut mode = None;
     let mut name = None;
     let mut model = None;
+    let mut goal = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -420,6 +483,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--goal" => {
+                goal = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--goal requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -429,5 +499,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         mode: mode.ok_or_else(|| usage("__worker-main requires --mode"))?,
         name,
         model,
+        goal,
     })
 }
