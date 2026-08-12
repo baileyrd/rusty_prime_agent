@@ -37,20 +37,16 @@ fn print_json(value: &impl serde::Serialize) {
 /// before its own retry loop has had its full chance.
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `harness daemon start`: idempotent. If a supervisor is already
-/// reachable, reports that and returns; otherwise spawns one detached
-/// and waits for its socket to come up.
-pub async fn daemon_start(state_root: &Path, exe_path: &Path, mode: OutputMode) -> Result<()> {
+/// Shared by `daemon_start` (which reports what it did) and `print_once`
+/// (which stays silent about it -- parity with `prime-agent -p`, whose
+/// whole point is "just the answer, nothing else"): idempotent, spawns a
+/// detached supervisor and waits for its socket only if one isn't
+/// already reachable. `Some(pid)` if a fresh supervisor was spawned,
+/// `None` if one was already running.
+async fn ensure_daemon_started(state_root: &Path, exe_path: &Path) -> Result<Option<u32>> {
     let socket_path = paths::daemon_socket_path(state_root);
     if transport::probe(Context::Daemon, socket_path.clone()).await {
-        match mode {
-            OutputMode::Json => print_json(&serde_json::json!({
-                "type": "daemon_already_running",
-                "socket": socket_path,
-            })),
-            OutputMode::Text => println!("daemon already running ({})", socket_path.display()),
-        }
-        return Ok(());
+        return Ok(None);
     }
     paths::ensure_dir(Context::Daemon, state_root)?;
 
@@ -80,19 +76,82 @@ pub async fn daemon_start(state_root: &Path, exe_path: &Path, mode: OutputMode) 
     let pid = child.id();
     drop(child); // detached: the supervisor outlives this CLI invocation.
 
-    transport::wait_ready(Context::Daemon, socket_path.clone(), DAEMON_READY_TIMEOUT).await?;
-    match mode {
-        OutputMode::Json => print_json(&serde_json::json!({
-            "type": "daemon_started",
-            "pid": pid,
-            "socket": socket_path,
-        })),
-        OutputMode::Text => println!(
-            "daemon started (pid {pid}, socket {})",
-            socket_path.display()
-        ),
+    transport::wait_ready(Context::Daemon, socket_path, DAEMON_READY_TIMEOUT).await?;
+    Ok(Some(pid))
+}
+
+/// `harness daemon start`: idempotent. If a supervisor is already
+/// reachable, reports that and returns; otherwise spawns one detached
+/// and waits for its socket to come up.
+pub async fn daemon_start(state_root: &Path, exe_path: &Path, mode: OutputMode) -> Result<()> {
+    let socket_path = paths::daemon_socket_path(state_root);
+    match ensure_daemon_started(state_root, exe_path).await? {
+        None => match mode {
+            OutputMode::Json => print_json(&serde_json::json!({
+                "type": "daemon_already_running",
+                "socket": socket_path,
+            })),
+            OutputMode::Text => println!("daemon already running ({})", socket_path.display()),
+        },
+        Some(pid) => match mode {
+            OutputMode::Json => print_json(&serde_json::json!({
+                "type": "daemon_started",
+                "pid": pid,
+                "socket": socket_path,
+            })),
+            OutputMode::Text => println!(
+                "daemon started (pid {pid}, socket {})",
+                socket_path.display()
+            ),
+        },
     }
     Ok(())
+}
+
+/// `harness -p`/`--print`: parity with `prime-agent -p`. Transparently
+/// ensures a daemon is running (unlike every other subcommand, which
+/// assumes `daemon start` already happened), creates a new, unnamed
+/// session, prompts it once, and prints just the reply -- no session id,
+/// no daemon-startup noise, no `[seq] role:` prefix -- matching
+/// `prime-agent -p`'s own "print response and exit" contract. The
+/// session itself is not torn down afterward: it stays reachable via its
+/// id the same as any `session new`-created one, for parity with
+/// `prime-agent`'s own sessions-are-always-persisted default.
+pub async fn print_once(
+    state_root: &Path,
+    exe_path: &Path,
+    text: String,
+    mode: OutputMode,
+) -> Result<()> {
+    ensure_daemon_started(state_root, exe_path).await?;
+
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::SessionNew { name: None })
+        .await?;
+    let session_id = match read_response(&mut conn).await? {
+        Response::SessionNew { session_id } => session_id,
+        other => return Err(unexpected_response(other)),
+    };
+
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionPrompt { session_id, text },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::SessionPromptAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::SessionPromptAck { entry }, OutputMode::Text) => {
+                    println!("{}", entry.text)
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
 }
 
 async fn connect(state_root: &Path) -> Result<transport::LineStream> {

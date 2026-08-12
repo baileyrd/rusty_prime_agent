@@ -4,8 +4,10 @@ Phase 1 skeleton for a cross-platform, daemon-backed agent harness:
 `daemon start` launches a supervisor that owns a public Unix-domain (or
 Windows `AF_UNIX`) socket, `session new`/`session prompt`/`session attach`
 spawn and talk to per-session worker processes over private sockets of
-their own, `session stop` gracefully tears one of them back down, and
-both crash-recovery paths (supervisor restart, worker crash) rebuild
+their own, `session stop` gracefully tears one of them back down,
+`-p`/`--print` is one-shot sugar over `session new` + `session prompt`
+that starts a daemon transparently if none is running, and both
+crash-recovery paths (supervisor restart, worker crash) rebuild
 in-memory state from disk rather than trusting anything a still-running
 process remembers.
 
