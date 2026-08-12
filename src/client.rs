@@ -589,6 +589,33 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         if text == "/exit" || text == "/quit" {
             break;
         }
+        if text == "/heartbeat" {
+            // Parity with `prime-agent`'s `/heartbeat` -- a manual,
+            // immediate entry point into the same "continue toward the
+            // goal" re-entry `session schedule`/`session autonomous`
+            // already cover; see `session::HEARTBEAT_MARKER`'s own doc
+            // comment for `rlm_heartbeat()`, the kernel-callable sibling
+            // of this. Unlike that sibling (called from inside a
+            // still-in-flight `prompt()` call, so it has to go through
+            // the daemon's async schedule-firing loop instead), this is
+            // a fresh top-level REPL action -- free to just send the
+            // continuation prompt immediately, same as any other line
+            // typed here, no scheduling indirection needed.
+            match fetch_goal(state_root, &session_id).await? {
+                Some(goal) if goal.status == GoalStatus::Active => {
+                    let continue_text = format!("Continue working toward the goal: {}", goal.text);
+                    let entry = send_prompt(state_root, &session_id, continue_text).await?;
+                    match mode {
+                        OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+                        OutputMode::Text => print_entry(&entry),
+                    }
+                }
+                _ => println!(
+                    "no active goal -- set one with `session goal set {session_id} <text...>` first"
+                ),
+            }
+            continue;
+        }
         let entry = send_prompt(state_root, &session_id, text.to_string()).await?;
         match mode {
             OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),

@@ -218,15 +218,40 @@ execute` already takes.
 
 Global tier only -- deliberately no project-local tier the way
 `prompt_template::discover` has one, since the one place skill *loading*
-needs to run (`worker::run`, right after `tool_runtime.start()` succeeds:
-one `execute_request` puts the skills directory on the kernel's own
-`sys.path`) is the worker process, which has no access to the CLI
-caller's own cwd the way `prompt_template::discover`'s always-client-side
-callers do. `session::enabled_tool_defs` appends every discovered
-skill's name/description to the `execute_python` tool's own description,
-so the model knows what it can `import` without being told in the
-prompt. `harness skill list` is the human-facing view, same shape as
-`prompt-template list`.
+needs to run (`worker::bootstrap_kernel`, right after `tool_runtime.
+start()` succeeds: one `execute_request` puts the skills directory on
+the kernel's own `sys.path`) is the worker process, which has no access
+to the CLI caller's own cwd the way `prompt_template::discover`'s
+always-client-side callers do. `session::enabled_tool_defs` appends
+every discovered skill's name/description to the `execute_python` tool's
+own description, so the model knows what it can `import` without being
+told in the prompt. `harness skill list` is the human-facing view, same
+shape as `prompt-template list`.
+
+## `/heartbeat` and `rlm_heartbeat()`
+
+Two manual entry points into the same re-entry mechanism `schedule.rs`
+already covers server-side -- see `PARITY.md` for the full story
+(including a real concurrent-write hazard found by reading `schedule.rs`
+directly, not assumed: it has exactly one safe writer, the daemon's own
+background firing loop). `worker::bootstrap_kernel` (the same function
+that installs skills, above) always defines `rlm_heartbeat()` in the
+kernel's globals when `--runtime ipython`; calling it prints a fixed
+marker (`session::HEARTBEAT_MARKER`) that `session::
+execute_python_tool_call` watches every call's stdout for, strips out of
+what the model sees, and dispatches to `session::trigger_heartbeat` --
+which, with an `Active` goal, opens an ordinary client connection to this
+process's own `daemon.sock` and sends `Request::ScheduleAdd` (the same
+wire path every `client.rs` function already uses to talk to the
+daemon -- the first time a *worker* process is the one dialing in,
+instead of only ever being dialed into) rather than writing
+`schedules.json` directly or reentrantly calling `self.prompt()` (which
+would append a second prompt's turns out of order relative to the
+in-flight call's own pending tool-result turn). `session_repl`'s
+`/heartbeat` needs none of that indirection -- a fresh top-level REPL
+action, not nested inside anything, so it fetches the goal
+(`client::fetch_goal`, already shared with `goal_show`/
+`session_autonomous`) and sends the continuation prompt immediately.
 
 ## Known gaps
 

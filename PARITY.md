@@ -529,12 +529,11 @@ daemon/worker split rather than requiring the Python control environment:
   Explicitly still out of scope: interrupt/cancel (needs `control`),
   kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
   `execute_result`'s `data` only ever reads `text/plain` here), and
-  multi-kernel pooling beyond one kernel per session. `/heartbeat`/
-  `rlm_heartbeat`'s TUI/RLM-function trigger surfaces stay out of scope
-  below for their own, separate reasons -- see that entry. Real
-  `prime-agent` "skills" (importable Python packages,
-  `packages/coding-agent/docs/skills.md`) turned out to be tractable on
-  top of this same kernel boundary -- see the next entry.
+  multi-kernel pooling beyond one kernel per session. Real `prime-agent`
+  "skills" (importable Python packages, `packages/coding-agent/docs/
+  skills.md`) and `/heartbeat`/`rlm_heartbeat` (its manual re-entry
+  triggers) both turned out to be tractable on top of this same kernel
+  boundary -- see the next two entries.
 - [x] **Skills packaging** (real, importable Python packages for
   `session new --runtime ipython`), parity with `prime-agent skills.md`.
   Every prior revision of this file bundled this in with "extensions,
@@ -604,6 +603,68 @@ daemon/worker split rather than requiring the Python control environment:
   skill is code the model imports and calls itself inside
   `execute_python`, not a second tool-generation surface alongside
   `--tools read|mcp`.
+- [x] **`/heartbeat` and `rlm_heartbeat()`** -- the REPL-command and
+  RLM-function manual entry points into the same "re-enter a session
+  periodically" mechanism `session schedule` already covers server-side,
+  parity with `prime-agent`'s two triggers. Every prior revision of this
+  file cut both together, needing either "the TUI" (this project's
+  `session repl` is the bare loop underneath the TUI, not the TUI itself,
+  but plenty for a REPL command) or a real kernel to call something *from*
+  (real now). Both send the exact same continuation prompt
+  `session_autonomous` already sends each turn (`"Continue working toward
+  the goal: <text>"`), requiring an `Active` goal -- the same precondition
+  `session_autonomous` itself has.
+
+  A real hazard surfaced by reading `schedule.rs` directly before
+  assuming anything, not just recalling it from memory: its own module
+  doc comment says it's "owned entirely by the daemon supervisor" --
+  `write_all` is a plain, unlocked `std::fs::write`, and `take_due` is
+  read-modify-write. A second process calling `schedule::add` on the same
+  `schedules.json` concurrently with the daemon's own background
+  `fire_due_schedules` poll is a real lost-update race, not a theoretical
+  one -- which rules out `rlm_heartbeat()` (running *inside the worker
+  process*, via `tool_runtime::ToolRuntime::execute`) touching that file
+  directly. Fixed by routing through the daemon's existing public
+  `Request::ScheduleAdd` handler instead: nothing stops a worker process
+  from opening an ordinary client connection to its own `daemon.sock`
+  (`transport::connect`, exactly what every `client.rs` function already
+  does) -- `daemon::handle_schedule_add` already works for any
+  `session_id`, including a worker scheduling on behalf of its own
+  session, so no daemon-side code changed at all.
+
+  `rlm_heartbeat()` also can't just call `self.prompt()` directly: it's
+  invoked from inside `execute_python_tool_call`, itself inside the
+  *outer* `prompt()` call's own tool-loop -- reentrant recursion there
+  would append a second prompt's turns before the outer call's own
+  pending tool-result turn, an incoherent transcript ordering, not merely
+  a borrow-checker inconvenience. `worker::bootstrap_kernel` (renamed
+  from `install_skills`, generalized to always run when `--runtime
+  ipython` rather than only when skills exist) defines `rlm_heartbeat()`
+  in the kernel's own globals -- calling it prints a fixed marker
+  (`session::HEARTBEAT_MARKER`) `execute_python_tool_call` watches every
+  call's stdout for, strips out of what the model sees, and dispatches to
+  a new `trigger_heartbeat` method (no `Active` goal: explains, schedules
+  nothing; otherwise: one `Request::ScheduleAdd` round trip,
+  `ScheduleKind::Once { at_ms: now_ms() }`, the same near-immediate
+  one-shot pattern `client::session_spawn` already established) --
+  sequencing it as a distinct, later top-level turn once the daemon's
+  next poll (`SCHEDULE_POLL_INTERVAL`) picks it up, instead of racing the
+  in-flight call.
+
+  `/heartbeat` in `session_repl` needs none of that indirection -- it's a
+  fresh top-level REPL action, not nested inside anything, so it fetches
+  the goal via the already-existing `fetch_goal` helper (shared with
+  `goal_show`/`session_autonomous`) and calls the exact same
+  `send_prompt` every other REPL line already uses, immediately, no
+  scheduling latency.
+
+  Explicitly out of scope: rate-limiting/deduplicating rapid repeated
+  `rlm_heartbeat()` calls (same "no sandboxing for a single local user"
+  trust model already accepted elsewhere), arguments to either trigger
+  (both parameterless, matching `prime-agent`'s own simplest form), and
+  any change to `session_autonomous`'s own bounded loop -- these are two
+  more manual entry points into the same mechanism, not a third
+  continuation policy.
 
 ## Out of scope for this project's current shape
 
@@ -618,16 +679,6 @@ attempted here, and not silently implied by anything in
   `prime-agent`'s docs this project has read -- left here rather than
   silently dropped, since scoping an undefined surface isn't this
   document's job to invent.
-- **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
-  triggers for the same "re-enter a session periodically" mechanism
-  `prime-agent schedule`/`session schedule` already covers server-side
-  (see the medium-effort section above); these two are just alternate
-  entry points into it that need the TUI (out of scope below) or a
-  kernel-side `rlm_heartbeat()` Python binding (a specific piece of the
-  same "skills" packaging gap above, not the kernel boundary itself,
-  which is now real). (Scheduling, persistent goals, and bounded
-  autonomous mode -- `prime-agent schedule`/`--goal`/`/goal`/`/autonomous`
-  -- are all done; see the medium-effort section above.)
 - **The interactive TUI**'s rich editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
