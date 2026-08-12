@@ -98,8 +98,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         Context::Worker,
         socket_path.parent().expect("socket path has a parent"),
     )?;
+    // 20s, not 5s -- see `daemon::run`'s identical bump for `daemon.sock`
+    // and its own doc comment for the CI evidence behind the number.
     let mut listener =
-        transport::Listener::bind_with_retry(Context::Worker, socket_path, Duration::from_secs(5))
+        transport::Listener::bind_with_retry(Context::Worker, socket_path, Duration::from_secs(20))
             .await?;
 
     loop {

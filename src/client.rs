@@ -13,7 +13,11 @@ use crate::procutil;
 use crate::protocol::{Request, Response, SessionEvent, SessionStatus};
 use crate::transport;
 
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Kept strictly larger than `daemon::run`'s own internal
+/// `bind_with_retry` budget for `daemon.sock` (20s -- see that call
+/// site's doc comment) so this CLI doesn't give up on the supervisor
+/// before its own retry loop has had its full chance.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `harness daemon start`: idempotent. If a supervisor is already
 /// reachable, reports that and returns; otherwise spawns one detached

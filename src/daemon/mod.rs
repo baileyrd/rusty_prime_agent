@@ -23,8 +23,11 @@ use crate::transport::{self, LineStream};
 use crate::worker::{self, WorkerMode};
 
 /// How long `session new` / a recovery respawn will wait for the new
-/// worker's private socket to become connectable before giving up.
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// worker's private socket to become connectable before giving up. Kept
+/// larger than `worker::spawn`'s own internal `bind_with_retry` budget
+/// (20s -- see that call site's doc comment) for the same reason
+/// `client::DAEMON_READY_TIMEOUT` is kept larger than the supervisor's.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Recorded in `daemon.pid` across restarts so a replacement supervisor
 /// (Required Behavior's crash-recovery path) has a generation number to
@@ -96,10 +99,20 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         Ok(_) => eprintln!("DBG: throwaway bind SUCCEEDED"),
         Err(e) => eprintln!("DBG: throwaway bind FAILED: {e:?}"),
     }
+    // 20s, not 5s: CI evidence (a real windows-latest run of this
+    // project's own supervisor-restart test) showed the reclaim
+    // genuinely taking longer than 5s in the exact repro condition --
+    // rebinding right after force-killing a supervisor that had also
+    // made an outbound connection to a worker's private socket -- even
+    // with the upstream rustils fix landed (docs/decision-request-
+    // af-unix-stale-reclaim-race.md in that repo). `client::
+    // DAEMON_READY_TIMEOUT` is kept strictly larger than this so the
+    // CLI doesn't give up on `wait_ready` before the supervisor's own
+    // retry loop here has had its full budget.
     let mut listener = match transport::Listener::bind_with_retry(
         Context::Daemon,
         paths::daemon_socket_path(&state_root),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     )
     .await
     {
