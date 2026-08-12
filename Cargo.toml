@@ -28,7 +28,7 @@ path = "src/main.rs"
 # dependency documents for itself. Bump the rev deliberately (matching
 # `rusty_tokio`'s own convention for its `rustils` pin); never track a
 # branch.
-rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "2e2c302cddcc520f748e0681f10cea567484a5a3" }
+rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "5e59c184db6d753b12abb9b3c7f83db8e486c9ff" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
