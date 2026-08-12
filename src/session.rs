@@ -77,7 +77,18 @@ pub struct AgentSession {
     pub state: SessionState,
     pub transcript: Vec<TranscriptEntry>,
     session_dir: PathBuf,
+    /// Needed only to lazily connect an `mcp_client::McpClient` the
+    /// first time a `--tools mcp` session actually prompts (not at
+    /// construction time, so a session that's never prompted never pays
+    /// for a handshake it might not need) -- every other subsystem here
+    /// already gets what it needs from `session_dir` alone.
+    state_root: PathBuf,
     provider: Box<dyn ModelProvider>,
+    /// Lazily connected on first use by a `--tools mcp` session (see
+    /// `mcp_client_or_connect`) and reused after that -- `None` for
+    /// every other session, including one that's never actually
+    /// prompted yet.
+    mcp_client: Option<crate::mcp_client::McpClient>,
     /// Held, started, and shut down (see `mark_stopped`) like a real
     /// backend would be, but never called from `prompt()` -- Phase 1 has
     /// no tool-execution requirement (non-goal). Wiring `execute` into
@@ -167,7 +178,9 @@ impl AgentSession {
             state,
             transcript: Vec::new(),
             session_dir,
+            state_root: state_root.to_path_buf(),
             provider,
+            mcp_client: None,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             pending_recovery_marker: None,
@@ -206,7 +219,9 @@ impl AgentSession {
             state,
             transcript,
             session_dir,
+            state_root: state_root.to_path_buf(),
             provider,
+            mcp_client: None,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             pending_recovery_marker: None,
@@ -282,7 +297,7 @@ impl AgentSession {
     /// coherent ack.
     pub async fn prompt(&mut self, text: String) -> Result<TranscriptEntry> {
         self.append(Role::User, text, None, None, None).await?;
-        let tools = self.enabled_tool_defs();
+        let tools = self.enabled_tool_defs().await?;
 
         const MAX_TOOL_ROUNDS: usize = 8;
         for _ in 0..MAX_TOOL_ROUNDS {
@@ -301,7 +316,7 @@ impl AgentSession {
                     )
                     .await?;
                     for call in calls {
-                        let result = crate::tools::execute(&call.name, &call.arguments);
+                        let result = self.execute_tool_call(&call.name, &call.arguments).await?;
                         self.append(Role::Tool, result, None, Some(call.id), Some(call.name))
                             .await?;
                     }
@@ -319,13 +334,70 @@ impl AgentSession {
     }
 
     /// This session's offered tool set, per `state.tools` (`session new
-    /// --tools read`) -- recomputed on every `prompt` call rather than
-    /// cached, since it's a cheap, pure function of already-loaded state.
-    fn enabled_tool_defs(&self) -> Vec<ToolDef> {
+    /// --tools read|mcp`). `"read"` is a cheap, pure lookup; `"mcp"`
+    /// needs a live `tools/list` call against `rp-server`'s MCP gateway
+    /// (`mcp_client_or_connect`, lazily connecting/reusing one client for
+    /// this session's whole lifetime) -- both recomputed on every
+    /// `prompt` call rather than cached across prompts, so a session
+    /// picks up a newly-connected MCP upstream (or one that dropped)
+    /// without needing a restart.
+    async fn enabled_tool_defs(&mut self) -> Result<Vec<ToolDef>> {
         match self.state.tools.as_deref() {
-            Some("read") => crate::tools::read_only_tool_defs(),
-            _ => Vec::new(),
+            Some("read") => Ok(crate::tools::read_only_tool_defs()),
+            Some("mcp") => {
+                let client = self.mcp_client_or_connect().await?;
+                let tools = client.list_tools().await?;
+                Ok(tools
+                    .into_iter()
+                    .map(|t| ToolDef {
+                        name: t.name,
+                        description: t.description,
+                        parameters: t.input_schema,
+                    })
+                    .collect())
+            }
+            _ => Ok(Vec::new()),
         }
+    }
+
+    /// Runs one tool call by name, routed to whichever backend
+    /// `state.tools` selects -- `tools::execute` for `"read"`,
+    /// `mcp_client::McpClient::call_tool` (proxied through `rp-server`'s
+    /// gateway) for `"mcp"`. Only ever called with a name/arguments pair
+    /// the provider itself just requested against the tool list
+    /// `enabled_tool_defs` handed it, so `state.tools` can't have
+    /// changed to `None` in between within one `prompt` call.
+    async fn execute_tool_call(&mut self, name: &str, arguments: &str) -> Result<String> {
+        match self.state.tools.as_deref() {
+            Some("mcp") => {
+                let client = self.mcp_client_or_connect().await?;
+                client.call_tool(name, arguments).await
+            }
+            _ => Ok(crate::tools::execute(name, arguments)),
+        }
+    }
+
+    /// Returns this session's cached `McpClient`, connecting one (against
+    /// the `rp-server` sidecar `rp_server::read_port` finds recorded for
+    /// this state root) the first time it's needed. `read_port` returning
+    /// `None` would mean `--tools mcp` reached a worker whose sidecar
+    /// was never started -- `daemon::Supervisor::handle_session_new`'s
+    /// own `ensure_running` call for `tools == Some("mcp")` is what's
+    /// supposed to prevent that, so treat it as the same "this is a bug
+    /// in spawn ordering" condition `worker::build_provider` already
+    /// does for a session with a `model` set.
+    async fn mcp_client_or_connect(&mut self) -> Result<&crate::mcp_client::McpClient> {
+        if self.mcp_client.is_none() {
+            let port = crate::rp_server::read_port(&self.state_root).ok_or_else(|| {
+                HarnessError::conflict(
+                    Context::Provider,
+                    "session has --tools mcp set but no rp-server sidecar is recorded -- \
+                     this is a bug in daemon::Supervisor's spawn ordering",
+                )
+            })?;
+            self.mcp_client = Some(crate::mcp_client::McpClient::connect(port).await?);
+        }
+        Ok(self.mcp_client.as_ref().expect("just set it above"))
     }
 
     /// Maps the persisted transcript into the turn shape a

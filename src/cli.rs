@@ -497,15 +497,18 @@ fn parse_thinking_level(value: &str) -> Result<String> {
     }
 }
 
-/// `--tools read`: validated against `tools::read_only_tool_defs`'s one
-/// supported value today -- `--tools shell`/write-capable tools are a
-/// natural v2 extension of this same flag (see `PARITY.md`), not
-/// accepted yet.
+/// `--tools read|mcp`: `read` offers `tools::read_only_tool_defs`'s
+/// built-in tools; `mcp` offers whatever `rp-server`'s own MCP gateway
+/// currently exposes (its native tools, plus any configured
+/// `[[mcp.upstreams]]`) instead -- see `PARITY.md`'s MCP entry for why
+/// these two are mutually exclusive in this pass rather than merged
+/// (`--tools shell`, and combining tool sources, are natural v2/v3
+/// extensions of this same flag, not built now).
 fn parse_tools_value(value: &str) -> Result<String> {
     match value {
-        "read" => Ok(value.to_string()),
+        "read" | "mcp" => Ok(value.to_string()),
         other => Err(usage(format!(
-            "unknown --tools value `{other}`, expected `read`"
+            "unknown --tools value `{other}`, expected `read` or `mcp`"
         ))),
     }
 }

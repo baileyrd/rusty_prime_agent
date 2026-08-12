@@ -60,8 +60,16 @@ during a prompt: the model can request one, get the result back, and
 continue, looped up to 8 rounds per prompt. Off by default; `EchoProvider`
 sessions can set it too, but never actually invoke a tool.
 
+Add `--tools mcp` instead to offer whatever `rp-server`'s own MCP
+(Model Context Protocol) gateway exposes -- its native `chat_completion`/
+`list_models`/`embeddings` tools, plus any upstream MCP server configured
+via `[[mcp.upstreams]]` in `rp-server`'s own config, all namespaced
+`"{upstream}/{tool}"`. Needs `rp-server` reachable (same as `--model`) even
+without one set. `read` and `mcp` are mutually exclusive for now -- pick one.
+
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --tools read
+harness session new --model ollama/qwen2.5:0.5b --tools mcp
 ```
 
 ## Global flags
@@ -83,7 +91,7 @@ harness daemon shutdown              # gracefully stops every worker, then exits
 ### Sessions
 
 ```sh
-harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read]
+harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read|mcp]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>

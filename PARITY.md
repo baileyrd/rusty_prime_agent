@@ -381,6 +381,53 @@ daemon/worker split rather than requiring the Python control environment:
   narrates a tool call as prose instead of emitting one), a known
   small-model limitation, not a plumbing gap -- `tests/ollama_provider.rs`'s
   own real-tool-call test is written to tolerate that.
+- [x] **MCP integration** (`session new --tools mcp`), parity with
+  `prime-agent`'s MCP support. Last revision of this file lumped this in
+  with "Skills, extensions, themes" as out of scope -- `rp-server`
+  already ships its own built-in MCP gateway (`crates/mcp/`): its native
+  tools (`chat_completion`/`list_models`/`embeddings`) merged with
+  every tool proxied from a configured `[[mcp.upstreams]]` entry
+  (namespaced `"{upstream}/{tool}"`), all served over one `/mcp`
+  endpoint -- so this project only ever needs a *minimal client* against
+  that one endpoint, not a from-scratch multi-upstream gateway. `[mcp]
+  enabled = true` is now emitted unconditionally by `rp_server::
+  write_config` (harmless with no upstreams configured, same reasoning
+  `[providers.ollama]` already gets there).
+  New `mcp_client::McpClient`: `initialize`/`notifications/initialized`
+  + `tools/list` + `tools/call` against `rp-server`'s `/mcp`, hand-rolled
+  to match its actual wire behavior -- **spiked first** by probing a
+  real sidecar directly (`curl`), the same "reproduce first" discipline
+  this project used for its original AF_UNIX bug, before writing any
+  client code. Two things the spike caught that weren't obvious from the
+  docs alone: every response is SSE-framed (`Content-Type: text/
+  event-stream`) *even for a single non-streaming call* -- `rp-server`
+  answers `406 Not Acceptable` unless `Accept` includes both
+  `application/json` and `text/event-stream` -- and those SSE responses
+  are `Transfer-Encoding: chunked`, which this project's hand-rolled
+  `http_client` had never needed to decode before (`get`/`post_json`'s
+  peers had only ever answered with `Content-Length` framing);
+  `http_client::decode_chunked` is the fix, exercised only by MCP calls,
+  a no-op for every existing caller. The server closes the connection
+  after answering one request (confirmed by direct probe), so no change
+  to this client's existing "one request per connection, read to EOF"
+  design was needed beyond that. `--tools mcp` is a separate, mutually
+  exclusive value from `--tools read` in this pass (`AgentSession`
+  dispatches tool-set discovery and tool execution to either
+  `tools::execute` or `McpClient` based on `state.tools`, not both at
+  once) -- merging multiple tool sources into one offered set is a
+  natural v3 extension of the same flag, not built now. Needs a running
+  `rp-server` sidecar even for an `EchoProvider` session (the tools live
+  on `rp-server` itself, independent of chat completions), so `session
+  new --tools mcp` triggers `rp_server::ensure_running` the same way
+  `--model` already does, and fails loudly (not silently) when it can't
+  come up. Manually verified end to end against this sandbox's real
+  Ollama + `rp-server` setup: a real model actually called `rp-server`'s
+  native `list_models` tool through the gateway and incorporated the
+  (real, if empty in this minimal test config) result into its reply --
+  stronger confirmation than the built-in-tools entry above got, since
+  this small test model reliably emits a real structured tool call for
+  this specific tool/prompt pair, unlike its unreliable behavior with
+  `read_file`.
 
 ## Out of scope for this project's current shape
 
@@ -395,12 +442,13 @@ attempted here, and not silently implied by anything in
   subagents' own Python invocation surface, `rlm(...)` itself, is the
   same boundary -- see the medium-effort section above for the
   session-level mechanism underneath it, which is done).
-- **Skills, extensions, themes, MCP integrations.** (Prompt templates --
-  the plain-text, non-Python half of `prime-agent skills.md`'s surface --
-  are done; see the medium-effort section above. Real "skills" stay out
-  of scope: they're "importable Python packages" wired to the RLM
-  control environment, same boundary as the RLM programming model item
-  above.)
+- **Skills, extensions, themes.** (Prompt templates -- the plain-text,
+  non-Python half of `prime-agent skills.md`'s surface -- are done; see
+  the medium-effort section above. Real "skills" stay out of scope:
+  they're "importable Python packages" wired to the RLM control
+  environment, same boundary as the RLM programming model item above.
+  MCP integrations turned out to be a separate thing entirely from any
+  of this -- see the medium-effort section above, now done.)
 - **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
   triggers for the same "re-enter a session periodically" mechanism
   `prime-agent schedule`/`session schedule` already covers server-side
