@@ -288,6 +288,20 @@ daemon/worker split rather than requiring the Python control environment:
   catalog (real model IDs within each provider): that needs a live
   query against each provider's own API, untestable in CI (no real API
   keys there) and out of scope below.
+- [x] **`--thinking <level>`** (`session new --thinking low|medium|
+  high`), parity with `prime-agent --thinking <level>`. Last revision of
+  this file marked this "genuinely out of scope" on the assumption that
+  `rp-server`'s wire contract for it was unknown/unverifiable -- reading
+  `rusty_provider`'s actual source (`crates/core/src/types.rs`) showed
+  `ChatRequest.reasoning: Option<ReasoningConfig>` already exists,
+  `ReasoningConfig.effort` taking exactly OpenAI's `"low"`/`"medium"`/
+  `"high"` vocabulary. `SessionState.thinking` is threaded through
+  `session new`/`WorkerArgs`/`RustyProviderModel` the same way `model`
+  is (fixed for a session's whole lifetime, re-supplied from persisted
+  state on every worker respawn -- see `worker::WorkerArgs::thinking`'s
+  own doc comment for why that's `model`'s pattern and not `goal`'s);
+  `RustyProviderModel`'s request body includes `"reasoning":
+  {"effort": ...}` only when set. No effect on `EchoProvider` sessions.
 
 ## Out of scope for this project's current shape
 
@@ -321,15 +335,15 @@ attempted here, and not silently implied by anything in
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
   read-a-line/send-a-prompt loop underneath the TUI itself is done --
   `session repl`, see the medium-effort section above.)
-- **`--thinking <level>`, and per-model catalog entries within `harness
-  model list`.** (Multi-provider *selection* -- `--model provider/
-  model` -- and the provider tier of `prime-agent model list`'s catalog
-  browse -- `harness model list`, which providers are configured -- are
-  both done; see the medium-effort section above. Real per-model IDs
-  within each provider need a live query against that provider's own
-  API, and `--thinking <level>` needs `rp-server`'s actual wire contract
-  for it -- this session has no access to `rusty_provider`'s source to
-  verify either, so both stay unattempted rather than guessed at.)
+- **Per-model catalog entries within `harness model list`** (real model
+  IDs/pricing/context length within each configured provider, not just
+  which providers are configured -- the latter is done, see the
+  medium-effort section above). Not actually Python-bound: `rp-server`
+  exposes `GET /v1/models` with exactly this data, sourced from its own
+  router rather than a live per-provider API query -- tracked as a
+  near-term increment now that this is understood, not left here
+  permanently. (`--thinking <level>` turned out to be the same kind of
+  mis-scoping and is now done; see the medium-effort section above.)
 
 ## Process
 

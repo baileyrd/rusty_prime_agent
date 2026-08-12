@@ -50,22 +50,42 @@ impl ModelProvider for EchoProvider {
 pub struct RustyProviderModel {
     port: u16,
     model: String,
+    /// `ReasoningConfig.effort` on `rp-server`'s wire types: `"low"`/
+    /// `"medium"`/`"high"`, or `None` for no reasoning requested. See
+    /// `Request::SessionNew::thinking`'s own doc comment for the
+    /// end-to-end thread-through this comes from.
+    thinking: Option<String>,
 }
 
 impl RustyProviderModel {
-    pub fn new(port: u16, model: String) -> Self {
-        RustyProviderModel { port, model }
+    pub fn new(port: u16, model: String, thinking: Option<String>) -> Self {
+        RustyProviderModel {
+            port,
+            model,
+            thinking,
+        }
+    }
+
+    /// Builds the JSON body for `POST /v1/chat/completions`, separated
+    /// out from `respond` so it's unit-testable without a real network
+    /// call -- in particular, that `reasoning.effort` appears iff
+    /// `self.thinking` is set.
+    fn build_request_body(&self, prompt: &str) -> String {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+        if let Some(thinking) = &self.thinking {
+            body["reasoning"] = serde_json::json!({"effort": thinking});
+        }
+        body.to_string()
     }
 }
 
 impl ModelProvider for RustyProviderModel {
     fn respond<'a>(&'a mut self, prompt: &'a str) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let body = serde_json::json!({
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-            })
-            .to_string();
+            let body = self.build_request_body(prompt);
             let (status, body) =
                 http_client::post_json(self.port, "/v1/chat/completions", &body).await?;
             if status != 200 {
@@ -86,5 +106,33 @@ impl ModelProvider for RustyProviderModel {
                     )
                 })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_body_omits_reasoning_when_thinking_is_none() {
+        let provider = RustyProviderModel::new(1234, "ollama/qwen2.5:0.5b".to_string(), None);
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.build_request_body("hello")).unwrap();
+        assert_eq!(body["model"], "ollama/qwen2.5:0.5b");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort_when_thinking_is_set() {
+        let provider = RustyProviderModel::new(
+            1234,
+            "ollama/qwen2.5:0.5b".to_string(),
+            Some("high".to_string()),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.build_request_body("hello")).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 }

@@ -77,6 +77,13 @@ pub struct WorkerArgs {
     /// See `Request::SessionNew::parent_id`'s own doc comment. Same
     /// "only meaningful for `WorkerMode::New`" reasoning as `goal`.
     pub parent_id: Option<String>,
+    /// See `Request::SessionNew::thinking`'s own doc comment. Same
+    /// "always supplied by the daemon at spawn time" treatment as
+    /// `model` (not `goal`/`parent_id`'s "New-only" treatment), since
+    /// it's consumed by `build_provider` on every worker spawn --
+    /// `RustyProviderModel` needs it for every subsequent request, not
+    /// just at session-creation time.
+    pub thinking: Option<String>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -90,6 +97,7 @@ pub struct WorkerArgs {
 fn build_provider(
     state_root: &Path,
     model: Option<String>,
+    thinking: Option<String>,
 ) -> Result<Box<dyn crate::provider::ModelProvider>> {
     let Some(model) = model else {
         return Ok(Box::new(EchoProvider));
@@ -102,7 +110,7 @@ fn build_provider(
         )
     })?;
     Ok(Box::new(crate::provider::RustyProviderModel::new(
-        port, model,
+        port, model, thinking,
     )))
 }
 
@@ -110,7 +118,7 @@ fn build_provider(
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut tool_runtime = Box::new(NoopToolRuntime);
     tool_runtime.start().await?;
-    let provider = build_provider(&args.state_root, args.model.clone())?;
+    let provider = build_provider(&args.state_root, args.model.clone(), args.thinking.clone())?;
 
     let session = match args.mode {
         WorkerMode::New => {
@@ -122,6 +130,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     model: args.model.clone(),
                     goal: args.goal.clone(),
                     parent_id: args.parent_id.clone(),
+                    thinking: args.thinking.clone(),
                 },
                 provider,
                 tool_runtime,
@@ -310,6 +319,7 @@ pub async fn spawn(
         model,
         goal,
         parent_id,
+        thinking,
     } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -334,6 +344,9 @@ pub async fn spawn(
     }
     if let Some(parent_id) = &parent_id {
         cmd.arg("--parent-id").arg(parent_id);
+    }
+    if let Some(thinking) = &thinking {
+        cmd.arg("--thinking").arg(thinking);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

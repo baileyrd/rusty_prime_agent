@@ -137,6 +137,7 @@ pub async fn print_once(
             model,
             goal: None,
             parent_id: None,
+            thinking: None,
         },
     )
     .await?;
@@ -228,6 +229,7 @@ async fn create_session(
     model: Option<String>,
     goal: Option<String>,
     parent_id: Option<String>,
+    thinking: Option<String>,
 ) -> Result<String> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -237,6 +239,7 @@ async fn create_session(
             model,
             goal,
             parent_id,
+            thinking,
         },
     )
     .await?;
@@ -251,9 +254,10 @@ pub async fn session_new(
     name: Option<String>,
     model: Option<String>,
     goal: Option<String>,
+    thinking: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
-    let session_id = create_session(state_root, name, model, goal, None).await?;
+    let session_id = create_session(state_root, name, model, goal, None, thinking).await?;
     match mode {
         OutputMode::Json => print_json(&Response::SessionNew { session_id }),
         OutputMode::Text => println!("{session_id}"),
@@ -360,7 +364,7 @@ pub async fn session_spawn(
                 .model
         }
     };
-    let child_id = create_session(state_root, name, model, None, Some(parent_id)).await?;
+    let child_id = create_session(state_root, name, model, None, Some(parent_id), None).await?;
     add_schedule(
         state_root,
         child_id.clone(),

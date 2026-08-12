@@ -133,9 +133,12 @@ async fn run(args: &[String]) -> Result<()> {
         }
         cli::Command::DaemonStatus => client::daemon_status(&state_root, output_mode).await,
         cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root, output_mode).await,
-        cli::Command::SessionNew { name, model, goal } => {
-            client::session_new(&state_root, name, model, goal, output_mode).await
-        }
+        cli::Command::SessionNew {
+            name,
+            model,
+            goal,
+            thinking,
+        } => client::session_new(&state_root, name, model, goal, thinking, output_mode).await,
         cli::Command::SessionAttach { session_id } => {
             client::session_attach(&state_root, session_id, output_mode).await
         }
@@ -235,6 +238,7 @@ async fn run(args: &[String]) -> Result<()> {
             model,
             goal,
             parent_id,
+            thinking,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -244,6 +248,7 @@ async fn run(args: &[String]) -> Result<()> {
                 model,
                 goal,
                 parent_id,
+                thinking,
             })
             .await
         }

@@ -63,6 +63,15 @@ pub enum Request {
         /// name. Fixed for this session's whole lifetime, same as
         /// `model`/`goal`.
         parent_id: Option<String>,
+        /// Parity with `prime-agent --thinking <level>`: requests a
+        /// visible reasoning/thinking trace from `model`, when set
+        /// (`rp-server`'s `ChatRequest.reasoning.effort` -- see
+        /// `provider::RustyProviderModel`). One of `"low"`/`"medium"`/
+        /// `"high"`, `rp-server`'s own `effort` vocabulary. `None` (the
+        /// default) means no reasoning requested; irrelevant for
+        /// `EchoProvider` sessions. Fixed for this session's whole
+        /// lifetime, same as `model`/`goal`.
+        thinking: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -436,6 +445,11 @@ pub struct SessionState {
     /// `model`/`goal`/`harness` have it.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// See `Request::SessionNew::thinking`'s own doc comment.
+    /// `#[serde(default)]` for the same pre-existing-`state.json` reason
+    /// `model`/`goal`/`harness`/`parent_id` have it.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +478,8 @@ pub struct SessionSummary {
     /// straight off `session list` rather than needing a dedicated
     /// request.
     pub parent_id: Option<String>,
+    /// See `Request::SessionNew::thinking`'s own doc comment.
+    pub thinking: Option<String>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s

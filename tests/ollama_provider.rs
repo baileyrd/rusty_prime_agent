@@ -60,3 +60,42 @@ fn ollama_provider_answers_a_real_prompt_end_to_end() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Same shape as the test above, but also exercises `--thinking low` end
+/// to end -- not asserting the model "actually reasoned" (a 0.5B test
+/// model likely won't produce a meaningfully different reply either way),
+/// just that a session created with `--thinking` still round-trips a real
+/// prompt/reply through `rp-server` without error.
+#[test]
+#[ignore]
+fn ollama_provider_accepts_a_thinking_level_end_to_end() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-thinking-e2e");
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new_with_model_and_thinking(
+        state_dir.path(),
+        None,
+        Some(&model),
+        Some("low"),
+    );
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains(&format!("model={model}")),
+        "session list should show the session's real model, got: {listing}"
+    );
+
+    let ack = common::session_prompt(state_dir.path(), &session_id, "Say hello.");
+    assert!(
+        !ack.contains("] assistant: echo:"),
+        "reply looks like EchoProvider's output, not a real model's -- got: {ack}"
+    );
+    assert!(
+        ack.contains("] assistant: ") && !ack.trim_end().ends_with("assistant:"),
+        "expected a non-empty assistant reply, got: {ack}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
