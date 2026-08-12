@@ -115,6 +115,28 @@ pub enum Command {
         max_time_ms: Option<u64>,
         quality_gate: Option<String>,
     },
+    /// `harness prompt-template list` -- parity with `prime-agent`'s `/`
+    /// autocomplete listing every discovered template with its
+    /// description. No daemon needed: this is a local directory scan
+    /// (`prompt_template::discover`), not a session-scoped operation.
+    PromptTemplateList,
+    /// `harness prompt-template render <name> [args...]` -- prints the
+    /// expanded prompt text to stdout without sending it anywhere. No
+    /// daemon needed, same reasoning as `PromptTemplateList`.
+    PromptTemplateRender {
+        name: String,
+        args: Vec<String>,
+    },
+    /// `harness session prompt-template <id> <name> [args...]` -- parity
+    /// with typing `/name args...` in `prime-agent`'s live editor:
+    /// expands the named template (`prompt_template::discover`) against
+    /// `args` and sends the result as an ordinary `SessionPrompt`, same
+    /// as `session prompt` would with that expanded text.
+    SessionPromptTemplate {
+        session_id: String,
+        name: String,
+        args: Vec<String>,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -254,14 +276,44 @@ fn parse_command(args: &[String]) -> Result<Command> {
             Some("schedule") => parse_schedule(&mut it),
             Some("goal") => parse_goal(&mut it),
             Some("autonomous") => parse_autonomous(&mut it),
+            Some("prompt-template") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session prompt-template` requires a session id"))?;
+                let name = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session prompt-template` requires a template name"))?;
+                let args: Vec<String> = it.cloned().collect();
+                Ok(Command::SessionPromptTemplate {
+                    session_id,
+                    name,
+                    args,
+                })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template`, got {other:?}"
+            ))),
+        },
+        Some("prompt-template") => match it.next().map(String::as_str) {
+            Some("list") => Ok(Command::PromptTemplateList),
+            Some("render") => {
+                let name = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`prompt-template render` requires a template name"))?;
+                let args: Vec<String> = it.cloned().collect();
+                Ok(Command::PromptTemplateRender { name, args })
+            }
+            other => Err(usage(format!(
+                "expected `prompt-template list|render`, got {other:?}"
             ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous>`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }

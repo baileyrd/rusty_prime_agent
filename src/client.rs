@@ -381,6 +381,76 @@ async fn send_prompt(
     }
 }
 
+/// `harness prompt-template list` -- a pure local directory scan, no
+/// daemon connection at all (unlike almost every other subcommand in
+/// this file).
+pub async fn prompt_template_list(state_root: &Path, mode: OutputMode) -> Result<()> {
+    let cwd = current_dir()?;
+    let templates = crate::prompt_template::discover(state_root, &cwd)?;
+    match mode {
+        OutputMode::Json => print_json(&templates),
+        OutputMode::Text => {
+            if templates.is_empty() {
+                println!("no prompt templates");
+            }
+            for t in &templates {
+                println!("{}\t{}", t.name, t.description.as_deref().unwrap_or(""));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `harness prompt-template render <name> [args...]` -- expands the
+/// named template and prints it, without sending it anywhere. Also a
+/// pure local operation, no daemon connection.
+pub async fn prompt_template_render(
+    state_root: &Path,
+    name: String,
+    args: Vec<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    let template = find_template(state_root, &name)?;
+    let text = template.expand(&args);
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({ "name": name, "text": text })),
+        OutputMode::Text => println!("{text}"),
+    }
+    Ok(())
+}
+
+/// `harness session prompt-template <id> <name> [args...]` -- parity
+/// with typing `/name args...` in `prime-agent`'s live editor: expands
+/// the named template and sends it as an ordinary `SessionPrompt`, same
+/// as `session_prompt` would with that already-expanded text.
+pub async fn session_prompt_template(
+    state_root: &Path,
+    session_id: String,
+    name: String,
+    args: Vec<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    let template = find_template(state_root, &name)?;
+    let text = template.expand(&args);
+    let entry = send_prompt(state_root, &session_id, text).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+        OutputMode::Text => print_entry(&entry),
+    }
+    Ok(())
+}
+
+fn current_dir() -> Result<std::path::PathBuf> {
+    std::env::current_dir().map_err(|e| HarnessError::io(Context::Cli, None, e))
+}
+
+fn find_template(state_root: &Path, name: &str) -> Result<crate::prompt_template::PromptTemplate> {
+    let cwd = current_dir()?;
+    crate::prompt_template::find(state_root, &cwd, name)?.ok_or_else(|| {
+        HarnessError::conflict(Context::Cli, format!("no such prompt template: {name}"))
+    })
+}
+
 pub async fn session_stop(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionStop { session_id })
