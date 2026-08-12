@@ -388,7 +388,12 @@ impl Supervisor {
         let session_id = crate::session::new_session_id();
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
-        if meta.model.is_some() {
+        // `--tools mcp` needs a running sidecar for its MCP gateway
+        // even when this session has no `--model` set (`EchoProvider`,
+        // no chat completions at all) -- the tools live on `rp-server`
+        // itself, independent of which (if any) provider a prompt
+        // actually routes to.
+        if meta.model.is_some() || meta.tools.as_deref() == Some("mcp") {
             if let Err(err) = crate::rp_server::ensure_running(&self.state_root).await {
                 return conn
                     .write_response(

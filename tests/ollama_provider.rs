@@ -143,3 +143,54 @@ fn ollama_provider_can_round_trip_a_real_tool_call() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Real end-to-end coverage for MCP integration (`PARITY.md`'s MCP
+/// entry): a session with `--tools mcp` actually round-trips a real
+/// `rp-server`-native tool call (`list_models`, proxied through
+/// `mcp_client::McpClient`) through a real model. Manually confirmed
+/// against this project's own sandbox during development that
+/// `qwen2.5:0.5b` reliably calls `list_models` for this exact prompt
+/// (unlike the built-in-tools test's own small-model caveat) -- still
+/// asserts loosely (a real reply, `Role::Tool` content in the JSON
+/// transcript) rather than the exact wording, since small-model output
+/// is never worth pinning exactly. Deliberately `#[ignore]`d for the
+/// same infra reasons as this file's other tests.
+#[test]
+#[ignore]
+fn ollama_provider_can_round_trip_a_real_mcp_tool_call() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-mcp-e2e");
+    common::daemon_start(state_dir.path());
+
+    let session_id =
+        common::session_new_with_model_and_tools(state_dir.path(), None, Some(&model), Some("mcp"));
+    let ack = common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "Use the list_models tool to see what models are available, then tell me.",
+    );
+    assert!(
+        !ack.contains("] assistant: echo:"),
+        "reply looks like EchoProvider's output, not a real model's -- got: {ack}"
+    );
+    assert!(
+        ack.contains("] assistant: ") && !ack.trim_end().ends_with("assistant:"),
+        "expected a non-empty final assistant reply, got: {ack}"
+    );
+
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let snapshot = lines.join("\n");
+    assert!(
+        snapshot.contains("\"role\":\"tool\""),
+        "expected a Role::Tool transcript entry (a real MCP tool call happened), got: {snapshot}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}

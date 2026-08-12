@@ -207,6 +207,16 @@ fn write_config(state_root: &Path, port: u16) -> Result<()> {
         "\n[providers.ollama]\nkind = \"openai\"\nbase_url = \"{}\"\napi_key_env = \"OLLAMA_API_KEY\"\n",
         ollama_base_url()
     ));
+    // `[mcp] enabled = true` unconditionally, same reasoning as
+    // `[providers.ollama]` above: harmless with no `[[mcp.upstreams]]`
+    // configured (`rp-server`'s own docs: "gives you just the native
+    // chat_completion/list_models/embeddings tools, no gateway
+    // proxying"), and `session new --tools mcp` (`PARITY.md`) needs it
+    // on every sidecar this project spawns, not just ones a caller
+    // happened to ask for MCP on -- `ensure_running` has no per-session
+    // knowledge to gate this on, and the sidecar is shared across every
+    // session anyway.
+    toml.push_str("\n[mcp]\nenabled = true\n");
     std::fs::write(&path, toml).map_err(|e| HarnessError::io(Context::Provider, Some(path), e))
 }
 

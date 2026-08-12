@@ -4,6 +4,7 @@ mod client;
 mod daemon;
 mod error;
 mod http_client;
+mod mcp_client;
 mod paths;
 mod procutil;
 mod prompt_template;

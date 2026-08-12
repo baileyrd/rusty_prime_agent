@@ -58,6 +58,34 @@ fn a_session_without_tools_never_offers_them_either() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// `--tools mcp` needs a real `rp-server` sidecar (its MCP gateway) even
+/// for a plain `EchoProvider` session (no `--model`) -- this project's
+/// own CI has no `rp-server` binary on `PATH` (see `tests/
+/// ollama_provider.rs` for the real, manually-run end-to-end coverage
+/// that does). `session new` itself must fail loudly here, not silently
+/// create a session that would only fail later on its first prompt --
+/// same reasoning `session_new_with_model_fails_loudly_when_rp_server_
+/// is_unavailable` (`tests/session_lifecycle.rs`) already establishes
+/// for `--model`.
+#[test]
+fn tools_mcp_fails_loudly_when_rp_server_is_unavailable() {
+    let state_dir = common::TempDir::new("tools-mcp-no-sidecar");
+    common::daemon_start(state_dir.path());
+
+    let out = common::run(state_dir.path(), &["session", "new", "--tools", "mcp"]);
+    assert!(
+        !out.status.success(),
+        "session new --tools mcp should fail when rp-server isn't reachable"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rp-server"),
+        "expected an error mentioning rp-server, got: {stderr}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 /// A session survives a worker respawn with its `--tools` setting
 /// intact -- `tools` follows `goal`/`parent_id`'s "only meaningful for
 /// `WorkerMode::New`" thread-through pattern (re-read from persisted
