@@ -84,6 +84,17 @@ on `rusty_tokio::io::{UnixListener, UnixStream}`, genuinely non-blocking
 on every platform this project targets (Linux/macOS/BSD via epoll/kqueue,
 Windows via IOCP+AFD-poll).
 
+**Pinned `rusty_tokio` rev bumped past an epoll busy-spin fix
+(`baileyrd/rusty_tokio#265`).** Every socket this process holds open --
+worker/daemon private sockets very much included -- registers with the
+Linux reactor; a level-triggered registration bug there meant the
+reactor thread pegged a full CPU core in a tight spin for as long as
+any such socket sat open, not just the one that surfaced it
+(`rp_server`'s HTTP client). See `PARITY.md`'s own entry on this for
+the full story -- it's a `rusty_tokio`-side fix, not this project's own
+code, but worth flagging here since every long-lived connection this
+project holds (worker sockets in particular) was affected.
+
 **`procutil.rs`'s narrow remaining gap.** Two things `rusty_tokio::process`
 doesn't cover, both because they're about a pid or a spawn-time detail
 outside what a process-spawning wrapper naturally exposes:

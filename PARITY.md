@@ -316,6 +316,24 @@ daemon/worker split rather than requiring the Python control environment:
   error path and `WorkerShutdown`/`handle_daemon_shutdown` already use),
   not by changing `rp_server.rs`'s existing, daemon-tested reaping
   behavior -- see `main.rs`'s own doc comment for the full reasoning.
+- **Upstream fix: `rusty_tokio` epoll reactor busy-spin.** Manually
+  verifying the real success path above (a `session prompt` against a
+  real, slow model backend) surfaced a second, unrelated bug one layer
+  down: the CLI process was burning most of its wall-clock wait time as
+  actual CPU, not blocked I/O. Isolated with a minimal repro against a
+  real slow HTTP response and confirmed with `strace -c`: `rusty_tokio`'s
+  Linux epoll reactor (`Reactor::register`) registered every fd
+  level-triggered (no `EPOLLET`), and a connected socket is almost
+  always writable, so `epoll_wait` returned immediately on *every* call
+  for as long as any fd sat open -- ~864k calls in a 12s wait that
+  should have needed exactly one. `kqueue.rs` (macOS/BSD) already got
+  this right (`EV_CLEAR`); `epoll.rs` was just missing the equivalent
+  flag, which the crate's own retry-until-`WouldBlock` I/O design
+  already assumed. Fixed and merged upstream
+  (`baileyrd/rusty_tokio#265`); this repo's own `Cargo.toml` pin bumped
+  to pick it up. Not this project's own code to fix -- flagged here
+  since it's the kind of cross-repo dependency issue this document
+  otherwise wouldn't have a home for.
 - [x] **`--thinking <level>`** (`session new --thinking low|medium|
   high`), parity with `prime-agent --thinking <level>`. Last revision of
   this file marked this "genuinely out of scope" on the assumption that
