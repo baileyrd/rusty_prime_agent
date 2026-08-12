@@ -39,12 +39,19 @@ impl Listener {
     /// try. A short retry window is the fix -- the file reliably reads
     /// as stale a moment later, once the OS has actually finished
     /// releasing it.
-    pub async fn bind_with_retry(context: Context, path: PathBuf, timeout: Duration) -> Result<Self> {
+    pub async fn bind_with_retry(
+        context: Context,
+        path: PathBuf,
+        timeout: Duration,
+    ) -> Result<Self> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match UnixListener::bind(&path) {
                 Ok(inner) => return Ok(Listener { inner }),
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
                     rusty_tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(HarnessError::io(context, Some(path), e)),
@@ -54,7 +61,11 @@ impl Listener {
 
     /// Block until one connection arrives.
     pub async fn accept(&mut self, context: Context) -> Result<LineStream> {
-        let (stream, _peer) = self.inner.accept().await.map_err(|e| HarnessError::io(context, None, e))?;
+        let (stream, _peer) = self
+            .inner
+            .accept()
+            .await
+            .map_err(|e| HarnessError::io(context, None, e))?;
         Ok(LineStream::new(stream))
     }
 }
@@ -77,7 +88,10 @@ pub struct LineStream {
 
 impl LineStream {
     fn new(stream: UnixStream) -> Self {
-        LineStream { stream, buf: Vec::new() }
+        LineStream {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     /// Reads one `\n`-terminated line (the trailing `\n`, and a `\r`
@@ -139,7 +153,8 @@ impl LineStream {
     where
         T: serde::Serialize,
     {
-        let line = serde_json::to_string(value).map_err(|e| HarnessError::json(context, None, e))?;
+        let line =
+            serde_json::to_string(value).map_err(|e| HarnessError::json(context, None, e))?;
         self.write_line(context, line).await
     }
 
@@ -199,11 +214,20 @@ pub async fn probe(context: Context, path: PathBuf) -> bool {
         conn.write_request(context, &Request::Ping).await?;
         match conn.read_response(context).await? {
             Some(Response::Pong) => Ok(()),
-            Some(other) => Err(HarnessError::protocol(context, format!("expected Pong, got {other:?}"))),
-            None => Err(HarnessError::protocol(context, "connection closed before Pong")),
+            Some(other) => Err(HarnessError::protocol(
+                context,
+                format!("expected Pong, got {other:?}"),
+            )),
+            None => Err(HarnessError::protocol(
+                context,
+                "connection closed before Pong",
+            )),
         }
     };
-    matches!(rusty_tokio::time::timeout(PROBE_TIMEOUT, attempt).await, Ok(Ok(())))
+    matches!(
+        rusty_tokio::time::timeout(PROBE_TIMEOUT, attempt).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Polls [`probe`] until it succeeds or `overall_timeout` elapses.
@@ -217,7 +241,10 @@ pub async fn wait_ready(context: Context, path: PathBuf, overall_timeout: Durati
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(HarnessError::conflict(context, format!("{} did not become ready in time", path.display())));
+            return Err(HarnessError::conflict(
+                context,
+                format!("{} did not become ready in time", path.display()),
+            ));
         }
         rusty_tokio::time::sleep(Duration::from_millis(25)).await;
     }

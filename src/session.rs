@@ -225,7 +225,9 @@ impl AgentSession {
         // No receivers is the ordinary "nobody attached right now" case,
         // not an error -- the transcript write above is what actually
         // makes this turn durable.
-        let _ = self.events.send(SessionEvent::Turn { entry: entry.clone() });
+        let _ = self.events.send(SessionEvent::Turn {
+            entry: entry.clone(),
+        });
         Ok(entry)
     }
 
@@ -245,14 +247,16 @@ impl AgentSession {
 
 fn read_state(session_dir: &Path) -> Result<SessionState> {
     let path = paths::state_file_path(session_dir);
-    let text = std::fs::read_to_string(&path).map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
     serde_json::from_str(&text).map_err(|e| HarnessError::json(Context::Session, Some(path), e))
 }
 
 async fn write_state(session_dir: &Path, state: &SessionState) -> Result<()> {
     let path = paths::state_file_path(session_dir);
     let state = state.clone();
-    let json = serde_json::to_string_pretty(&state).map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
     let join = rusty_tokio::spawn_blocking(move || {
         // Write-to-temp-then-rename: a crash mid-write must never leave
         // `state.json` truncated/partial, since recovery reads it
@@ -273,7 +277,8 @@ fn read_transcript(session_dir: &Path) -> Result<Vec<TranscriptEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = std::fs::File::open(&path).map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
+    let file = std::fs::File::open(&path)
+        .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
     let reader = std::io::BufReader::new(file);
     let mut entries = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
@@ -297,7 +302,8 @@ fn read_transcript(session_dir: &Path) -> Result<Vec<TranscriptEntry>> {
 
 async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> Result<()> {
     let path = paths::transcript_path(session_dir);
-    let line = serde_json::to_string(entry).map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
+    let line = serde_json::to_string(entry)
+        .map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
     let join = rusty_tokio::spawn_blocking(move || {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -305,7 +311,8 @@ async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> 
             .open(&path)
             .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
         writeln!(file, "{line}").map_err(|e| HarnessError::io(Context::Session, Some(path), e))?;
-        file.flush().map_err(|e| HarnessError::io(Context::Session, None, e))
+        file.flush()
+            .map_err(|e| HarnessError::io(Context::Session, None, e))
     })
     .await;
     join.map_err(|_| HarnessError::protocol(Context::Session, "transcript append task panicked"))?

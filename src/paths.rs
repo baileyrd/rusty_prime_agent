@@ -80,7 +80,7 @@ pub fn state_file_path(session_dir: &std::path::Path) -> PathBuf {
 /// **not** nested under `session_dir` (`sessions/<id>/worker.sock`):
 /// Windows AF_UNIX's `sun_path` has a hard 107-usable-byte cap (rustils'
 /// own `platform-windows` doc: "`UNIX_PATH_CAP = 108`, 107 usable bytes
-/// + NUL"), and `<state_root>/sessions/<session-id>/worker.sock` blows
+/// plus NUL"), and `<state_root>/sessions/<session-id>/worker.sock` blows
 /// through that the moment `state_root` is a real per-user profile path
 /// (`%LOCALAPPDATA%\...`) or, worse, a test's own long temp-directory
 /// name -- caught by this project's own `tests/session_lifecycle.rs`
@@ -98,7 +98,9 @@ pub fn worker_socket_path(state_root: &std::path::Path, session_id: &str) -> Pat
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     session_id.hash(&mut hasher);
-    state_root.join("sock").join(format!("{:016x}.sock", hasher.finish()))
+    state_root
+        .join("sock")
+        .join(format!("{:016x}.sock", hasher.finish()))
 }
 
 /// Create `dir` (and parents) if missing.

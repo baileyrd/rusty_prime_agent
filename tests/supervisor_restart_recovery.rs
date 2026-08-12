@@ -26,7 +26,10 @@ fn restarted_supervisor_adopts_a_still_running_worker() {
     // alive even though its supervisor just died.
     assert!(
         common::wait_until(
-            || common::run(state_dir.path(), &["daemon", "status"]).status.code() != Some(0),
+            || common::run(state_dir.path(), &["daemon", "status"])
+                .status
+                .code()
+                != Some(0),
             Duration::from_secs(5)
         ),
         "the old daemon socket should stop answering once its supervisor is killed"
@@ -36,7 +39,10 @@ fn restarted_supervisor_adopts_a_still_running_worker() {
     // supervisor died mid-flight (stale socket file, stale pid file).
     common::daemon_start(state_dir.path());
     let new_supervisor_pid = common::daemon_pid(state_dir.path());
-    assert_ne!(supervisor_pid, new_supervisor_pid, "daemon start after a crash must launch a genuinely new supervisor");
+    assert_ne!(
+        supervisor_pid, new_supervisor_pid,
+        "daemon start after a crash must launch a genuinely new supervisor"
+    );
 
     // The startup recovery scan (`Supervisor::recover_on_startup`) runs
     // synchronously before the new supervisor's socket is ready, so this
@@ -58,7 +64,10 @@ fn restarted_supervisor_adopts_a_still_running_worker() {
     );
 
     let ack = common::session_prompt(state_dir.path(), &session_id, "after supervisor restart");
-    assert!(ack.contains("echo: after supervisor restart"), "the adopted worker must still serve prompts, got: {ack}");
+    assert!(
+        ack.contains("echo: after supervisor restart"),
+        "the adopted worker must still serve prompts, got: {ack}"
+    );
 
     let lines = common::attach_lines(state_dir.path(), &session_id, 6, Duration::from_secs(5));
     let joined = lines.join("\n");
