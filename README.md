@@ -181,12 +181,17 @@ existing transcript first.
 
 ```sh
 harness model list
+harness model list --detailed
 ```
 
 Lists which providers (`openai`/`anthropic`/`gemini`/`groq`/`ollama`)
 this process's environment currently has configured (see
 [Environment variables](#environment-variables)). `ollama` is always
 listed as configured -- it needs no API key.
+
+`--detailed` starts (or reuses) an `rp-server` sidecar and lists its real
+per-model catalog instead (id, owning provider, context length) -- needs
+`rp-server` on `PATH`, unlike the plain listing above.
 
 ## Environment variables
 

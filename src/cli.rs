@@ -188,11 +188,16 @@ pub enum Command {
     SessionRepl {
         session_id: String,
     },
-    /// `harness model list` -- bounded parity with `prime-agent model
-    /// list`'s catalog browse. See `client::model_list`'s own doc
-    /// comment for exactly what it does and doesn't cover. No daemon
-    /// needed: a pure environment-variable check.
-    ModelList,
+    /// `harness model list [--detailed]` -- bounded parity with
+    /// `prime-agent model list`'s catalog browse. See `client::
+    /// model_list`'s own doc comment for exactly what it does and
+    /// doesn't cover. Plain `model list` needs no daemon: a pure
+    /// environment-variable check. `--detailed` additionally starts (or
+    /// reuses) an `rp-server` sidecar and queries its real per-model
+    /// catalog.
+    ModelList {
+        detailed: bool,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -451,7 +456,11 @@ fn parse_command(args: &[String]) -> Result<Command> {
             ))),
         },
         Some("model") => match it.next().map(String::as_str) {
-            Some("list") => Ok(Command::ModelList),
+            Some("list") => {
+                let rest: Vec<&String> = it.collect();
+                let detailed = rest.iter().any(|a| a.as_str() == "--detailed");
+                Ok(Command::ModelList { detailed })
+            }
             other => Err(usage(format!("expected `model list`, got {other:?}"))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
