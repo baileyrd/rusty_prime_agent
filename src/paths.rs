@@ -94,6 +94,15 @@ pub fn state_file_path(session_dir: &std::path::Path) -> PathBuf {
     session_dir.join("state.json")
 }
 
+/// Parity with `prime-agent schedule` -- see `crate::schedule`'s own
+/// module doc comment. A JSON array of `protocol::ScheduleEntry`,
+/// separate from `state_file_path`'s pointer file since schedules churn
+/// on their own cadence (added/canceled/fired) independent of ordinary
+/// session activity.
+pub fn schedules_path(session_dir: &std::path::Path) -> PathBuf {
+    session_dir.join("schedules.json")
+}
+
 /// A short, flat path for the private worker socket -- deliberately
 /// **not** nested under `session_dir` (`sessions/<id>/worker.sock`):
 /// Windows AF_UNIX's `sun_path` has a hard 107-usable-byte cap (rustils'

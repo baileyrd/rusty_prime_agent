@@ -138,6 +138,21 @@ daemon/worker split rather than requiring the Python control environment:
   (`agent_start`/`turn_start`/`message_*`/tool-execution events), which
   assumes a streaming model and tool-execution pipeline this project
   doesn't have -- see `cli::OutputMode`'s doc comment.
+- [x] **Scheduling** (`session schedule add|list|cancel`, parity with
+  `prime-agent schedule <list|add|cancel>`). A one-shot (`--at
+  TIME`) or recurring (`--every DURATION`) prompt the daemon itself
+  injects into a session later, with no client attached -- persisted
+  per-session (`schedule.rs`, `sessions/<id>/schedules.json`) so it
+  survives a daemon restart, fired by a background poll loop
+  (`daemon::SCHEDULE_POLL_INTERVAL`, 5s) that turns a due entry into an
+  ordinary internal `SessionPrompt`, indistinguishable from a
+  client-issued one from the worker's point of view. `--at`/`--every`
+  take a short duration string (`30s`/`5m`/`2h`/`1d`) or, for `--at`, a
+  raw Unix-epoch-milliseconds integer -- not a full RFC 3339/ISO 8601
+  parser, matching this project's narrow dependency floor (no `chrono`
+  pulled in for this). A recurring entry that's overdue by more than one
+  interval (e.g. the daemon was down a while) skips forward to the next
+  future fire time rather than firing a burst of catch-up prompts.
 
 ## Out of scope for this project's current shape
 
@@ -155,8 +170,9 @@ not attempted here, and not silently implied by anything in
 - **The Continual Harness** (`/refine`, durable supplemental
   prompts/memories/skill descriptions with rollback).
 - **Skills, extensions, prompt templates, themes, MCP integrations.**
-- **Scheduling, heartbeats, persistent goals, bounded autonomous mode**
-  (`prime-agent schedule`, `/heartbeat`, `--goal`, `--autonomous*`).
+- **Heartbeats, persistent goals, bounded autonomous mode** (`/heartbeat`,
+  `--goal`, `--autonomous*`). (Scheduling itself -- `prime-agent
+  schedule` -- is done; see the medium-effort section above.)
 - **The interactive TUI** and its editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`).
