@@ -67,48 +67,19 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         spawn_lock: Mutex::new(()),
     });
 
-    // Still here deliberately, not an oversight: these DBG lines (plus
-    // the throwaway-path probe bind right below) are what originally
-    // isolated the Windows AF_UNIX rebind bug this project hit --
-    // confirmed to be specific to reclaiming *this* socket path, not
-    // AF_UNIX binds in general, by the throwaway bind succeeding in the
-    // same process state. The fix landed upstream in `rustils`' own
-    // `unix_listen` (see `docs/decision-request-af-unix-stale-reclaim-
-    // race.md` in that repo, and this project's own ARCHITECTURE.md "IPC
-    // Model"), but this session had no native Windows execution
-    // available to confirm the fix actually resolves
-    // `tests/supervisor_restart_recovery.rs` on real hardware -- only a
-    // cross-compile check and a passing Linux run, where this bug never
-    // reproduced in the first place. Remove this block (and the
-    // throwaway bind) only once that's confirmed, not before -- see the
-    // decision-request doc's own "Open questions" for what a
-    // still-failing run after this fix would mean.
-    eprintln!("DBG: before recover_on_startup");
     supervisor.recover_on_startup().await;
-    eprintln!("DBG: after recover_on_startup, about to bind");
 
-    let throwaway = std::env::temp_dir().join(format!("rpa-throwaway-{}.sock", std::process::id()));
-    eprintln!("DBG: trying throwaway bind at {throwaway:?}");
-    match transport::Listener::bind_with_retry(
-        Context::Daemon,
-        throwaway.clone(),
-        Duration::from_secs(2),
-    )
-    .await
-    {
-        Ok(_) => eprintln!("DBG: throwaway bind SUCCEEDED"),
-        Err(e) => eprintln!("DBG: throwaway bind FAILED: {e:?}"),
-    }
-    // 20s, not 5s: CI evidence (a real windows-latest run of this
-    // project's own supervisor-restart test) showed the reclaim
-    // genuinely taking longer than 5s in the exact repro condition --
-    // rebinding right after force-killing a supervisor that had also
-    // made an outbound connection to a worker's private socket -- even
-    // with the upstream rustils fix landed (docs/decision-request-
-    // af-unix-stale-reclaim-race.md in that repo). `client::
+    // 20s, not a shorter window: rebinding right after force-killing a
+    // supervisor that had also made an outbound connection to a
+    // worker's private socket is a real Windows AF_UNIX teardown race
+    // -- confirmed via real windows-latest CI across several rounds of
+    // upstream rustils fixes and, ultimately, `transport::Listener::
+    // bind_with_retry`'s own `probe()`-based fallback (see that
+    // function's doc comment and docs/decision-request-af-unix-stale-
+    // reclaim-race.md in the rustils repo for the full trace). `client::
     // DAEMON_READY_TIMEOUT` is kept strictly larger than this so the
-    // CLI doesn't give up on `wait_ready` before the supervisor's own
-    // retry loop here has had its full budget.
+    // CLI doesn't give up on `wait_ready` before this retry loop has
+    // had its full budget.
     let mut listener = match transport::Listener::bind_with_retry(
         Context::Daemon,
         paths::daemon_socket_path(&state_root),
@@ -116,14 +87,8 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
     )
     .await
     {
-        Ok(l) => {
-            eprintln!("DBG: bind succeeded");
-            l
-        }
-        Err(e) => {
-            eprintln!("DBG: bind failed: {e:?}");
-            return Err(e);
-        }
+        Ok(l) => l,
+        Err(e) => return Err(e),
     };
     loop {
         let conn = listener.accept(Context::Daemon).await?;
