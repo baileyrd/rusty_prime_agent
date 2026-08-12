@@ -230,9 +230,17 @@ pub async fn spawn(
     if let Some(name) = &name {
         cmd.arg("--name").arg(name);
     }
+    // stderr goes to a log file, same reasoning as `client::daemon_start`'s
+    // identical redirect: a worker that panics or exits before binding
+    // its private socket would otherwise fail completely silently.
+    let session_dir = paths::session_dir(state_root, session_id);
+    paths::ensure_dir(Context::Worker, &session_dir)?;
+    let log_path = paths::worker_log_path(&session_dir);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| HarnessError::io(Context::Worker, Some(log_path), e))?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log_file));
     procutil::prepare_detached(&mut cmd);
 
     let mut child = cmd

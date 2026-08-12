@@ -60,6 +60,24 @@ pub fn daemon_pid_path(state: &std::path::Path) -> PathBuf {
     state.join("daemon.pid")
 }
 
+/// Where the supervisor's own stderr is redirected to (`client::
+/// daemon_start`'s spawn -- a detached process has nothing else to send
+/// it to). An ordinary file path, not a socket, so it carries none of
+/// `worker_socket_path`'s length constraint. A plain crash/panic is the
+/// only thing this project's own recovery paths can't already explain
+/// from `session list`/`daemon status` alone, so this exists purely as a
+/// "why won't it come up" diagnostic -- `tests/common::daemon_start`
+/// reads it back on a failed startup.
+pub fn daemon_log_path(state: &std::path::Path) -> PathBuf {
+    state.join("daemon.log")
+}
+
+/// The worker counterpart of [`daemon_log_path`] -- nested under the
+/// readable `session_dir`, same as `transcript_path`/`state_file_path`.
+pub fn worker_log_path(session_dir: &std::path::Path) -> PathBuf {
+    session_dir.join("worker.log")
+}
+
 pub fn sessions_dir(state: &std::path::Path) -> PathBuf {
     state.join("sessions")
 }
@@ -86,6 +104,7 @@ pub fn state_file_path(session_dir: &std::path::Path) -> PathBuf {
 /// name -- caught by this project's own `tests/session_lifecycle.rs`
 /// failing with `ErrorKind::InvalidInput` ("AF_UNIX path exceeds
 /// sun_path's 107-byte usable capacity") before this function existed.
+///
 /// A flat `<state_root>/sock/<16-hex-char-hash-of-session-id>.sock`
 /// stays short (~22 bytes past `state_root`) regardless of how long
 /// `state_root` or the session id happens to be, and is still a pure,

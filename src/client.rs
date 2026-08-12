@@ -29,11 +29,21 @@ pub async fn daemon_start(state_root: &Path, exe_path: &Path) -> Result<()> {
     use rusty_tokio::process::{Command, Stdio};
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Daemon, None, e))?;
 
+    // stderr goes to a log file, not `Stdio::null()`: a detached process
+    // has no one to hand a live stderr stream to, but a supervisor that
+    // panics or exits before ever binding its socket would otherwise
+    // fail completely silently -- the only symptom being `wait_ready`'s
+    // own generic timeout below, with zero clue why. `tests/common::
+    // daemon_start` reads this back on a failed startup.
+    let log_path = paths::daemon_log_path(state_root);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| HarnessError::io(Context::Daemon, Some(log_path), e))?;
+
     let mut cmd = Command::new(exe_path);
     cmd.current_dir(&cwd).arg("__supervisor-main");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log_file));
     procutil::prepare_detached(&mut cmd);
 
     let child = cmd

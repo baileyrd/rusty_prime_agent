@@ -97,7 +97,20 @@ pub fn assert_success(label: &str, output: &std::process::Output) {
 
 pub fn daemon_start(state_dir: &Path) {
     let out = run(state_dir, &["daemon", "start"]);
-    assert_success("daemon start", &out);
+    if !out.status.success() {
+        // `daemon.log` is the supervisor's own stderr (`client::
+        // daemon_start`'s redirect, not this CLI process's) -- read it
+        // back so a failed startup doesn't just say "timed out" with no
+        // clue why the supervisor never got far enough to answer.
+        let log = std::fs::read_to_string(state_dir.join("daemon.log"))
+            .unwrap_or_else(|e| format!("<could not read daemon.log: {e}>"));
+        panic!(
+            "daemon start failed (status {:?}):\nstdout: {}\nstderr: {}\ndaemon.log:\n{log}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 }
 
 pub fn daemon_status(state_dir: &Path) -> String {
