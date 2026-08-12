@@ -40,14 +40,29 @@ fn crashed_worker_is_recovered_with_full_transcript_replay() {
     // An ordinary client request -- not a special "recover" command --
     // is what triggers recovery.
     let ack = common::session_prompt(state_dir.path(), &session_id, "turn after the crash");
-    assert!(ack.contains("echo: turn after the crash"), "post-recovery prompt should still work, got: {ack}");
+    assert!(
+        ack.contains("echo: turn after the crash"),
+        "post-recovery prompt should still work, got: {ack}"
+    );
 
     let pid_after = common::worker_pid(state_dir.path(), &session_id);
-    assert_ne!(pid_before, pid_after, "recovery must spawn a genuinely new worker process");
+    assert_ne!(
+        pid_before, pid_after,
+        "recovery must spawn a genuinely new worker process"
+    );
 
-    let lines = common::attach_lines(state_dir.path(), &session_id, 6, Duration::from_secs(5));
+    // 7, not 6: "attached to ..." + the snapshot header + 4 replayed
+    // transcript entries (before- and after-crash, one user/assistant
+    // pair each) already fill 6 lines on their own -- the recovery
+    // marker (sent after the snapshot; see `session::AgentSession::
+    // take_pending_recovery_marker`'s doc comment for why it can't be
+    // delivered any earlier) is the 7th.
+    let lines = common::attach_lines(state_dir.path(), &session_id, 7, Duration::from_secs(5));
     let joined = lines.join("\n");
-    assert!(joined.contains("recovered"), "attach stream should surface the visible recovery marker, got: {joined}");
+    assert!(
+        joined.contains("recovered"),
+        "attach stream should surface the visible recovery marker, got: {joined}"
+    );
     assert!(
         joined.contains("user: turn before the crash"),
         "recovery must full-replay pre-crash transcript entries, got: {joined}"
@@ -56,10 +71,16 @@ fn crashed_worker_is_recovered_with_full_transcript_replay() {
         joined.contains("user: turn after the crash"),
         "post-recovery turns must also be present, got: {joined}"
     );
-    assert!(joined.contains("generation=2"), "a recovered worker is generation 2 for this session, got: {joined}");
+    assert!(
+        joined.contains("generation=2"),
+        "a recovered worker is generation 2 for this session, got: {joined}"
+    );
 
     let status = common::session_status(state_dir.path(), &session_id);
-    assert_eq!(status, "active", "recovered session should read back as active, not crashed, in state.json");
+    assert_eq!(
+        status, "active",
+        "recovered session should read back as active, not crashed, in state.json"
+    );
 
     common::daemon_shutdown(state_dir.path());
 }
@@ -88,8 +109,14 @@ fn crashed_worker_is_recovered_on_attach_alone() {
 
     let lines = common::attach_lines(state_dir.path(), &session_id, 6, Duration::from_secs(5));
     let joined = lines.join("\n");
-    assert!(joined.contains("attached to"), "attach should still succeed against a crashed session, got: {joined}");
-    assert!(joined.contains("recovered"), "attach itself should trigger and surface recovery, got: {joined}");
+    assert!(
+        joined.contains("attached to"),
+        "attach should still succeed against a crashed session, got: {joined}"
+    );
+    assert!(
+        joined.contains("recovered"),
+        "attach itself should trigger and surface recovery, got: {joined}"
+    );
     assert!(
         joined.contains("user: only turn before the crash"),
         "pre-crash transcript must survive recovery triggered by attach, got: {joined}"

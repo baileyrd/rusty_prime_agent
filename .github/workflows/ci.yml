@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+      # The real point of running this on windows-latest/macos-latest at
+      # all: tests/supervisor_restart_recovery.rs and
+      # tests/worker_crash_recovery.rs force-kill real child processes
+      # and rebind real AF_UNIX sockets -- exactly the surface a
+      # cross-compile check (which is all this crate's own dependencies,
+      # rusty_tokio/rustils, get verified with locally) can't exercise.
+      # See ARCHITECTURE.md's "Recovery model" and
+      # docs/decision-request-af-unix-stale-reclaim-race.md in
+      # baileyrd/rustils for the specific Windows AF_UNIX bug this
+      # matrix leg exists to keep caught.
+      - name: test
+        run: cargo test

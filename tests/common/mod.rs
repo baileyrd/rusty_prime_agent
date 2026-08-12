@@ -6,6 +6,16 @@
 //! the actual CLI + real daemon/worker OS processes + real Unix sockets
 //! is what the brief's "session recovery" and "worker crash handling"
 //! coverage actually needs to be evidence of.
+//!
+//! `mod common;` is included separately by each test binary
+//! (`session_lifecycle.rs`/`supervisor_restart_recovery.rs`/
+//! `worker_crash_recovery.rs`), and no single one of them calls every
+//! helper here -- `cargo clippy --all-targets` sees each test binary as
+//! its own crate, so whichever helpers that particular binary doesn't
+//! reach get flagged `dead_code` individually. Allowed at the module
+//! level rather than per-function: this file's whole purpose is being a
+//! shared toolbox, not every tool in it being used by every caller.
+#![allow(dead_code)]
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -87,7 +97,20 @@ pub fn assert_success(label: &str, output: &std::process::Output) {
 
 pub fn daemon_start(state_dir: &Path) {
     let out = run(state_dir, &["daemon", "start"]);
-    assert_success("daemon start", &out);
+    if !out.status.success() {
+        // `daemon.log` is the supervisor's own stderr (`client::
+        // daemon_start`'s redirect, not this CLI process's) -- read it
+        // back so a failed startup doesn't just say "timed out" with no
+        // clue why the supervisor never got far enough to answer.
+        let log = std::fs::read_to_string(state_dir.join("daemon.log"))
+            .unwrap_or_else(|e| format!("<could not read daemon.log: {e}>"));
+        panic!(
+            "daemon start failed (status {:?}):\nstdout: {}\nstderr: {}\ndaemon.log:\n{log}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 }
 
 pub fn daemon_status(state_dir: &Path) -> String {
@@ -141,14 +164,26 @@ fn parse_field(text: &str, key: &str) -> Option<u32> {
 /// test can target a worker for a simulated crash without needing an
 /// internal API.
 pub fn worker_pid(state_dir: &Path, session_id: &str) -> u32 {
-    let path = state_dir.join("sessions").join(session_id).join("state.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let path = state_dir
+        .join("sessions")
+        .join(session_id)
+        .join("state.json");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).expect("state.json is valid JSON");
-    value["worker_pid"].as_u64().expect("state.json has worker_pid") as u32
+    value["worker_pid"]
+        .as_u64()
+        .expect("state.json has worker_pid") as u32
 }
 
 pub fn session_status(state_dir: &Path, session_id: &str) -> String {
-    let text = std::fs::read_to_string(state_dir.join("sessions").join(session_id).join("state.json")).expect("read state.json");
+    let text = std::fs::read_to_string(
+        state_dir
+            .join("sessions")
+            .join(session_id)
+            .join("state.json"),
+    )
+    .expect("read state.json");
     let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
     value["status"].as_str().expect("status field").to_string()
 }
@@ -171,11 +206,18 @@ pub fn force_kill(pid: u32) {
     // checked before use and closed on every path that opened one.
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        assert!(!handle.is_null(), "OpenProcess({pid}) for force_kill failed: {:?}", std::io::Error::last_os_error());
+        assert!(
+            !handle.is_null(),
+            "OpenProcess({pid}) for force_kill failed: {:?}",
+            std::io::Error::last_os_error()
+        );
         let ok = TerminateProcess(handle, 1);
         let err = std::io::Error::last_os_error();
         CloseHandle(handle);
-        assert!(ok != 0, "TerminateProcess({pid}) for force_kill failed: {err:?}");
+        assert!(
+            ok != 0,
+            "TerminateProcess({pid}) for force_kill failed: {err:?}"
+        );
     }
 }
 
@@ -193,7 +235,12 @@ pub fn force_kill(pid: u32) {
 /// (or until `timeout` elapses), then kills the attach process. Used
 /// instead of `run` because attach is a long-lived stream, not a
 /// one-shot command.
-pub fn attach_lines(state_dir: &Path, session_id: &str, max_lines: usize, timeout: Duration) -> Vec<String> {
+pub fn attach_lines(
+    state_dir: &Path,
+    session_id: &str,
+    max_lines: usize,
+    timeout: Duration,
+) -> Vec<String> {
     let mut child = Command::new(bin())
         .args(["session", "attach", session_id])
         .env("RUSTY_PRIME_AGENT_HOME", state_dir)

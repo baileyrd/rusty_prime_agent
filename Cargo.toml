@@ -20,7 +20,15 @@ path = "src/main.rs"
 # project no longer depends on `rustils` directly at all: rusty_tokio
 # already sits on it internally for exactly the primitives this project
 # would otherwise have wrapped by hand.
-rusty_tokio = { path = "../rusty_tokio" }
+#
+# Pinned git dep, not a path dep: a `path = "../rusty_tokio"` dependency
+# only resolves against a sibling checkout that exists in this
+# developer's own working copy, which CI's fresh clone of this repo alone
+# doesn't have -- the same reasoning `rusty_tokio`'s own `rusty_std`
+# dependency documents for itself. Bump the rev deliberately (matching
+# `rusty_tokio`'s own convention for its `rustils` pin); never track a
+# branch.
+rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "727b76994567f3f9b087997ec04c07138cf2c983" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

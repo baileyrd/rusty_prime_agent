@@ -37,7 +37,8 @@ pub fn prepare_detached(cmd: &mut rusty_tokio::process::Command) {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
-        cmd.as_std_mut().creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        cmd.as_std_mut()
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
     #[cfg(unix)]
     {
@@ -100,7 +101,9 @@ pub fn is_alive(pid: u32) -> io::Result<bool> {
                 // "No such process" -> false; any other failure (e.g.
                 // access denied on a pid owned by another user) still
                 // means the pid exists.
-                return Ok(io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER));
+                return Ok(
+                    io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER)
+                );
             }
             let mut exit_code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut exit_code);

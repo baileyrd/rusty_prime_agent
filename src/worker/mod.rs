@@ -68,20 +68,41 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     let session = match args.mode {
         WorkerMode::New => {
-            AgentSession::create(&args.state_root, args.session_id.clone(), args.name.clone(), provider, tool_runtime).await?
+            AgentSession::create(
+                &args.state_root,
+                args.session_id.clone(),
+                args.name.clone(),
+                provider,
+                tool_runtime,
+            )
+            .await?
         }
-        WorkerMode::Resume => AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime).await?,
+        WorkerMode::Resume => {
+            AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime)
+                .await?
+        }
         WorkerMode::Recover => {
-            let session = AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime).await?;
-            session.emit_recovery_marker("worker recovered after a crash; transcript restored from disk");
+            let mut session =
+                AgentSession::recover(&args.state_root, &args.session_id, provider, tool_runtime)
+                    .await?;
+            session.emit_recovery_marker(
+                "worker recovered after a crash; transcript restored from disk",
+            );
             session
         }
     };
     let session = Arc::new(Mutex::new(session));
 
     let socket_path = paths::worker_socket_path(&args.state_root, &args.session_id);
-    paths::ensure_dir(Context::Worker, socket_path.parent().expect("socket path has a parent"))?;
-    let mut listener = transport::Listener::bind_with_retry(Context::Worker, socket_path, Duration::from_secs(5)).await?;
+    paths::ensure_dir(
+        Context::Worker,
+        socket_path.parent().expect("socket path has a parent"),
+    )?;
+    // 20s, not 5s -- see `daemon::run`'s identical bump for `daemon.sock`
+    // and its own doc comment for the CI evidence behind the number.
+    let mut listener =
+        transport::Listener::bind_with_retry(Context::Worker, socket_path, Duration::from_secs(20))
+            .await?;
 
     loop {
         let conn = listener.accept(Context::Worker).await?;
@@ -100,7 +121,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
 }
 
-async fn handle_private_connection(session: Arc<Mutex<AgentSession>>, mut conn: LineStream) -> Result<()> {
+async fn handle_private_connection(
+    session: Arc<Mutex<AgentSession>>,
+    mut conn: LineStream,
+) -> Result<()> {
     let request = match conn.read_request(Context::Worker).await? {
         Some(r) => r,
         None => return Ok(()),
@@ -108,13 +132,24 @@ async fn handle_private_connection(session: Arc<Mutex<AgentSession>>, mut conn: 
     match request {
         Request::Ping => conn.write_response(Context::Worker, &Response::Pong).await,
         Request::SessionAttach { .. } => {
-            let (session_id, snapshot, mut events) = {
-                let guard = session.lock().await;
-                (guard.state.session_id.clone(), guard.snapshot_event(), guard.subscribe())
+            let (session_id, snapshot, pending_marker, mut events) = {
+                let mut guard = session.lock().await;
+                (
+                    guard.state.session_id.clone(),
+                    guard.snapshot_event(),
+                    guard.take_pending_recovery_marker(),
+                    guard.subscribe(),
+                )
             };
-            conn.write_response(Context::Worker, &Response::SessionAttachStarted { session_id })
-                .await?;
+            conn.write_response(
+                Context::Worker,
+                &Response::SessionAttachStarted { session_id },
+            )
+            .await?;
             conn.write_event(Context::Worker, &snapshot).await?;
+            if let Some(marker) = pending_marker {
+                conn.write_event(Context::Worker, &marker).await?;
+            }
             loop {
                 match events.recv().await {
                     Ok(event) => {
@@ -138,11 +173,13 @@ async fn handle_private_connection(session: Arc<Mutex<AgentSession>>, mut conn: 
         }
         Request::SessionPrompt { text, .. } => {
             let entry = session.lock().await.prompt(text).await?;
-            conn.write_response(Context::Worker, &Response::SessionPromptAck { entry }).await
+            conn.write_response(Context::Worker, &Response::SessionPromptAck { entry })
+                .await
         }
         Request::WorkerShutdown => {
             session.lock().await.mark_stopped().await?;
-            conn.write_response(Context::Worker, &Response::WorkerShutdownAck).await?;
+            conn.write_response(Context::Worker, &Response::WorkerShutdownAck)
+                .await?;
             // Blunt but honest: nothing else in this process needs a
             // graceful drain (no other in-flight state to flush -- the
             // transcript/state writes above already fsync'd via
@@ -172,7 +209,13 @@ async fn handle_private_connection(session: Arc<Mutex<AgentSession>>, mut conn: 
 /// single-pid kill (`procutil`'s test-only counterpart in
 /// `tests/common`) is already the right shape for "simulate this one
 /// process crashing".
-pub async fn spawn(exe_path: &Path, state_root: &Path, session_id: &str, mode: WorkerMode, name: Option<String>) -> Result<u32> {
+pub async fn spawn(
+    exe_path: &Path,
+    state_root: &Path,
+    session_id: &str,
+    mode: WorkerMode,
+    name: Option<String>,
+) -> Result<u32> {
     use rusty_tokio::process::{Command, Stdio};
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -189,20 +232,43 @@ pub async fn spawn(exe_path: &Path, state_root: &Path, session_id: &str, mode: W
     if let Some(name) = &name {
         cmd.arg("--name").arg(name);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // stderr goes to a log file, same reasoning as `client::daemon_start`'s
+    // identical redirect: a worker that panics or exits before binding
+    // its private socket would otherwise fail completely silently.
+    let session_dir = paths::session_dir(state_root, session_id);
+    paths::ensure_dir(Context::Worker, &session_dir)?;
+    let log_path = paths::worker_log_path(&session_dir);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| HarnessError::io(Context::Worker, Some(log_path), e))?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file));
     procutil::prepare_detached(&mut cmd);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| HarnessError::io(Context::Worker, Some(exe_path.to_owned()), e))?;
     let pid = child.id();
-    // The worker outlives this handle by design (`prepare_detached`);
-    // nothing in this process ever calls `wait()`/`kill()` on it -- the
-    // OS process keeps running detached (dropping without waiting just
-    // orphans it, `kill_on_drop` defaults to `false`), and its pid is
-    // what `state.json` (written by the worker itself moments after
-    // this) records as the recovery pointer.
-    drop(child);
+    // The worker outlives this *process* by design (`prepare_detached`'s
+    // `setsid`/`DETACHED_PROCESS`), but on Unix `setsid` alone does not
+    // reparent the child away from this supervisor the way a full
+    // double-fork daemonization would -- the kernel still considers the
+    // worker this process's child until something here calls `wait` on
+    // it, so a worker that dies while the supervisor is still running
+    // becomes a zombie under it, not silently reaped. That zombie still
+    // answers `kill(pid, 0)` successfully (POSIX: a zombie pid is very
+    // much still "alive" for that check), which would make
+    // `catalog::effective_status`'s crash detection never fire --
+    // `tests/worker_crash_recovery.rs`'s own repro. So the `Child` is
+    // handed to a fire-and-forget reaper task instead of dropped: it
+    // does nothing but wait, has no effect on "detached" (that's
+    // `setsid`'s doing, not whether anything here calls `wait`), and if
+    // the *supervisor* is the one that dies first, the worker is simply
+    // reparented to init, which reaps it the ordinary way -- this task
+    // only ever matters for the worker-dies-first ordering.
+    rusty_tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(pid)
 }
 

@@ -13,7 +13,11 @@ use crate::procutil;
 use crate::protocol::{Request, Response, SessionEvent, SessionStatus};
 use crate::transport;
 
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Kept strictly larger than `daemon::run`'s own internal
+/// `bind_with_retry` budget for `daemon.sock` (20s -- see that call
+/// site's doc comment) so this CLI doesn't give up on the supervisor
+/// before its own retry loop has had its full chance.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `harness daemon start`: idempotent. If a supervisor is already
 /// reachable, reports that and returns; otherwise spawns one detached
@@ -29,9 +33,21 @@ pub async fn daemon_start(state_root: &Path, exe_path: &Path) -> Result<()> {
     use rusty_tokio::process::{Command, Stdio};
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Daemon, None, e))?;
 
+    // stderr goes to a log file, not `Stdio::null()`: a detached process
+    // has no one to hand a live stderr stream to, but a supervisor that
+    // panics or exits before ever binding its socket would otherwise
+    // fail completely silently -- the only symptom being `wait_ready`'s
+    // own generic timeout below, with zero clue why. `tests/common::
+    // daemon_start` reads this back on a failed startup.
+    let log_path = paths::daemon_log_path(state_root);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| HarnessError::io(Context::Daemon, Some(log_path), e))?;
+
     let mut cmd = Command::new(exe_path);
     cmd.current_dir(&cwd).arg("__supervisor-main");
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file));
     procutil::prepare_detached(&mut cmd);
 
     let child = cmd
@@ -41,7 +57,10 @@ pub async fn daemon_start(state_root: &Path, exe_path: &Path) -> Result<()> {
     drop(child); // detached: the supervisor outlives this CLI invocation.
 
     transport::wait_ready(Context::Daemon, socket_path.clone(), DAEMON_READY_TIMEOUT).await?;
-    println!("daemon started (pid {pid}, socket {})", socket_path.display());
+    println!(
+        "daemon started (pid {pid}, socket {})",
+        socket_path.display()
+    );
     Ok(())
 }
 
@@ -49,14 +68,25 @@ async fn connect(state_root: &Path) -> Result<transport::LineStream> {
     let socket_path = paths::daemon_socket_path(state_root);
     transport::connect(Context::Daemon, socket_path)
         .await
-        .map_err(|_| HarnessError::conflict(Context::Daemon, "daemon is not running; run `harness daemon start` first"))
+        .map_err(|_| {
+            HarnessError::conflict(
+                Context::Daemon,
+                "daemon is not running; run `harness daemon start` first",
+            )
+        })
 }
 
 pub async fn daemon_status(state_root: &Path) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::DaemonStatus).await?;
+    conn.write_request(Context::Daemon, &Request::DaemonStatus)
+        .await?;
     match read_response(&mut conn).await? {
-        Response::DaemonStatus { protocol_version, pid, generation, sessions_active } => {
+        Response::DaemonStatus {
+            protocol_version,
+            pid,
+            generation,
+            sessions_active,
+        } => {
             println!("daemon: protocol_version={protocol_version} pid={pid} generation={generation} sessions_active={sessions_active}");
             Ok(())
         }
@@ -66,7 +96,8 @@ pub async fn daemon_status(state_root: &Path) -> Result<()> {
 
 pub async fn daemon_shutdown(state_root: &Path) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::DaemonShutdown).await?;
+    conn.write_request(Context::Daemon, &Request::DaemonShutdown)
+        .await?;
     match read_response(&mut conn).await? {
         Response::DaemonShutdownAck => {
             println!("daemon shut down");
@@ -78,7 +109,8 @@ pub async fn daemon_shutdown(state_root: &Path) -> Result<()> {
 
 pub async fn session_new(state_root: &Path, name: Option<String>) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name }).await?;
+    conn.write_request(Context::Daemon, &Request::SessionNew { name })
+        .await?;
     match read_response(&mut conn).await? {
         Response::SessionNew { session_id } => {
             println!("{session_id}");
@@ -90,7 +122,8 @@ pub async fn session_new(state_root: &Path, name: Option<String>) -> Result<()> 
 
 pub async fn session_list(state_root: &Path) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionList).await?;
+    conn.write_request(Context::Daemon, &Request::SessionList)
+        .await?;
     match read_response(&mut conn).await? {
         Response::SessionList { sessions } => {
             if sessions.is_empty() {
@@ -116,7 +149,8 @@ pub async fn session_list(state_root: &Path) -> Result<()> {
 
 pub async fn session_attach(state_root: &Path, session_id: String) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionAttach { session_id }).await?;
+    conn.write_request(Context::Daemon, &Request::SessionAttach { session_id })
+        .await?;
     match read_response(&mut conn).await? {
         Response::SessionAttachStarted { session_id } => {
             println!("attached to {session_id}");
@@ -126,7 +160,10 @@ pub async fn session_attach(state_root: &Path, session_id: String) -> Result<()>
     loop {
         match conn.read_event(Context::Daemon).await? {
             Some(SessionEvent::Snapshot { state, transcript }) => {
-                println!("-- snapshot: generation={} last_sequence={} --", state.generation, state.last_sequence);
+                println!(
+                    "-- snapshot: generation={} last_sequence={} --",
+                    state.generation, state.last_sequence
+                );
                 for entry in transcript {
                     print_entry(&entry);
                 }
@@ -156,8 +193,11 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
 
 pub async fn session_prompt(state_root: &Path, session_id: String, text: String) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionPrompt { session_id, text })
-        .await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionPrompt { session_id, text },
+    )
+    .await?;
     match read_response(&mut conn).await? {
         Response::SessionPromptAck { entry } => {
             print_entry(&entry);
@@ -177,10 +217,18 @@ pub async fn session_prompt(state_root: &Path, session_id: String, text: String)
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn read_response(conn: &mut transport::LineStream) -> Result<Response> {
-    let response = rusty_tokio::time::timeout(RESPONSE_TIMEOUT, conn.read_response(Context::Daemon))
-        .await
-        .map_err(|_| HarnessError::conflict(Context::Daemon, "daemon did not respond in time"))??
-        .ok_or_else(|| HarnessError::protocol(Context::Daemon, "daemon closed the connection without responding"))?;
+    let response =
+        rusty_tokio::time::timeout(RESPONSE_TIMEOUT, conn.read_response(Context::Daemon))
+            .await
+            .map_err(|_| {
+                HarnessError::conflict(Context::Daemon, "daemon did not respond in time")
+            })??
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Daemon,
+                    "daemon closed the connection without responding",
+                )
+            })?;
     if let Response::Error { message, conflict } = &response {
         return Err(if *conflict {
             HarnessError::conflict(Context::Daemon, message.clone())
@@ -192,5 +240,8 @@ async fn read_response(conn: &mut transport::LineStream) -> Result<Response> {
 }
 
 fn unexpected_response(response: Response) -> HarnessError {
-    HarnessError::protocol(Context::Daemon, format!("unexpected response: {response:?}"))
+    HarnessError::protocol(
+        Context::Daemon,
+        format!("unexpected response: {response:?}"),
+    )
 }

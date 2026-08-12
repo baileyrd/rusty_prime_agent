@@ -23,28 +23,69 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Binds and starts listening at `path`, retrying on `AddrInUse`
-    /// for up to `timeout`. Stale leftover socket file reclaim (a
-    /// listener that died without unlinking it) is handled underneath
-    /// by `rusty_tokio`/`rustils` via a probe `connect()` -- see
-    /// `rusty_tokio::io::UnixListener::bind`'s own doc -- but that probe
-    /// can itself transiently see a listen backlog as still "live" for
-    /// a brief window right after its owning process was force-killed,
-    /// before the OS finishes tearing it down (the same race
-    /// [`probe`]'s own doc comment describes on the client-connect
-    /// side). Observed in this project's own
-    /// `tests/supervisor_restart_recovery.rs`: a supervisor started
-    /// immediately after force-killing the previous one could fail to
-    /// reclaim its predecessor's still-warm socket file on the first
-    /// try. A short retry window is the fix -- the file reliably reads
-    /// as stale a moment later, once the OS has actually finished
-    /// releasing it.
-    pub async fn bind_with_retry(context: Context, path: PathBuf, timeout: Duration) -> Result<Self> {
+    /// Binds and starts listening at `path`, retrying on `AddrInUse` for
+    /// up to `timeout`.
+    ///
+    /// Stale leftover socket file reclaim (a listener that died without
+    /// unlinking it) is *supposed* to be handled underneath by
+    /// `rusty_tokio`/`rustils` via a probe `connect()` -- see
+    /// `rusty_tokio::io::UnixListener::bind`'s own doc. On Windows it
+    /// isn't reliable enough to depend on alone: real `windows-latest`
+    /// CI running this project's own `tests/supervisor_restart_recovery.rs`
+    /// found that rustils' own stale-vs-live probe can see `WSAENOBUFS`
+    /// ("No buffer space available") instead of the expected
+    /// `WSAECONNREFUSED` in exactly the race this function's own retry
+    /// loop exists for -- and, per real evidence gathered across several
+    /// rounds of upstream fixes and diagnostics (see
+    /// `docs/decision-request-af-unix-stale-reclaim-race.md` in the
+    /// `rustils` repo), that code does not reliably clear within any
+    /// bounded retry window this project can afford to wait out: it was
+    /// observed persisting for a full 20 continuous seconds, identically
+    /// on every one of dozens of fresh probe attempts, in this project's
+    /// own real supervisor-restart scenario (which involves a fuller,
+    /// more realistic connection history than the isolated rustils-level
+    /// regression test that first diagnosed and fixed the underlying
+    /// `os error 0` bug -- that fix is real and confirmed on real
+    /// hardware, it just isn't the whole story for this project's own,
+    /// more complex case).
+    ///
+    /// So this project no longer trusts `rustils`' internal
+    /// stale-vs-live classification alone: on any `AddrInUse` bind
+    /// failure, it authoritatively checks liveness itself via
+    /// [`probe`] (a real connect + `Ping`/`Pong` round trip, not just
+    /// "did `connect()` return without erroring" -- see that function's
+    /// own doc comment for why a bare successful `connect()` isn't
+    /// sufficient evidence either), and force-removes the socket file
+    /// if nothing answers. `probe`'s own "not alive" verdict doesn't
+    /// depend on which specific OS error a failed `connect()` produced
+    /// -- any failure to complete a real `Ping`/`Pong` round trip within
+    /// its budget counts, which is exactly the property that lets this
+    /// sidestep the `WSAENOBUFS`-vs-`WSAECONNREFUSED` classification
+    /// problem entirely rather than trying to enumerate every anomalous
+    /// code Windows might report.
+    pub async fn bind_with_retry(
+        context: Context,
+        path: PathBuf,
+        timeout: Duration,
+    ) -> Result<Self> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match UnixListener::bind(&path) {
                 Ok(inner) => return Ok(Listener { inner }),
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    if !probe(context, path.clone()).await {
+                        // Best-effort: if the remove itself fails (e.g.
+                        // a genuinely live listener answered in the
+                        // instant between the probe and this call --
+                        // vanishingly unlikely, but not impossible),
+                        // the next loop iteration's own bind attempt is
+                        // still the authority on whether the path is
+                        // actually free, not this removal's own result.
+                        let _ = std::fs::remove_file(&path);
+                    }
                     rusty_tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(HarnessError::io(context, Some(path), e)),
@@ -54,7 +95,11 @@ impl Listener {
 
     /// Block until one connection arrives.
     pub async fn accept(&mut self, context: Context) -> Result<LineStream> {
-        let (stream, _peer) = self.inner.accept().await.map_err(|e| HarnessError::io(context, None, e))?;
+        let (stream, _peer) = self
+            .inner
+            .accept()
+            .await
+            .map_err(|e| HarnessError::io(context, None, e))?;
         Ok(LineStream::new(stream))
     }
 }
@@ -77,7 +122,10 @@ pub struct LineStream {
 
 impl LineStream {
     fn new(stream: UnixStream) -> Self {
-        LineStream { stream, buf: Vec::new() }
+        LineStream {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     /// Reads one `\n`-terminated line (the trailing `\n`, and a `\r`
@@ -139,7 +187,8 @@ impl LineStream {
     where
         T: serde::Serialize,
     {
-        let line = serde_json::to_string(value).map_err(|e| HarnessError::json(context, None, e))?;
+        let line =
+            serde_json::to_string(value).map_err(|e| HarnessError::json(context, None, e))?;
         self.write_line(context, line).await
     }
 
@@ -199,11 +248,20 @@ pub async fn probe(context: Context, path: PathBuf) -> bool {
         conn.write_request(context, &Request::Ping).await?;
         match conn.read_response(context).await? {
             Some(Response::Pong) => Ok(()),
-            Some(other) => Err(HarnessError::protocol(context, format!("expected Pong, got {other:?}"))),
-            None => Err(HarnessError::protocol(context, "connection closed before Pong")),
+            Some(other) => Err(HarnessError::protocol(
+                context,
+                format!("expected Pong, got {other:?}"),
+            )),
+            None => Err(HarnessError::protocol(
+                context,
+                "connection closed before Pong",
+            )),
         }
     };
-    matches!(rusty_tokio::time::timeout(PROBE_TIMEOUT, attempt).await, Ok(Ok(())))
+    matches!(
+        rusty_tokio::time::timeout(PROBE_TIMEOUT, attempt).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Polls [`probe`] until it succeeds or `overall_timeout` elapses.
@@ -217,7 +275,10 @@ pub async fn wait_ready(context: Context, path: PathBuf, overall_timeout: Durati
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(HarnessError::conflict(context, format!("{} did not become ready in time", path.display())));
+            return Err(HarnessError::conflict(
+                context,
+                format!("{} did not become ready in time", path.display()),
+            ));
         }
         rusty_tokio::time::sleep(Duration::from_millis(25)).await;
     }

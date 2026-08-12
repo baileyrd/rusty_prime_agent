@@ -83,7 +83,11 @@ fn harden_inherited_stdio() {
                 // stream, or not currently redirected) -- calling it
                 // unconditionally and ignoring the result is simpler
                 // than special-casing those values, and no less safe.
-                windows_sys::Win32::Foundation::SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    handle,
+                    HANDLE_FLAG_INHERIT,
+                    0,
+                );
             }
         }
     }
@@ -116,19 +120,35 @@ fn exit_code(err: &HarnessError) -> i32 {
 async fn run(args: &[String]) -> Result<()> {
     let command = cli::parse(args)?;
     let state_root = paths::state_dir()?;
-    let exe_path = std::env::current_exe().map_err(|e| HarnessError::io(error::Context::Cli, None, e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| HarnessError::io(error::Context::Cli, None, e))?;
 
     match command {
         cli::Command::DaemonStart => client::daemon_start(&state_root, &exe_path).await,
         cli::Command::DaemonStatus => client::daemon_status(&state_root).await,
         cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root).await,
         cli::Command::SessionNew { name } => client::session_new(&state_root, name).await,
-        cli::Command::SessionAttach { session_id } => client::session_attach(&state_root, session_id).await,
+        cli::Command::SessionAttach { session_id } => {
+            client::session_attach(&state_root, session_id).await
+        }
         cli::Command::SessionList => client::session_list(&state_root).await,
-        cli::Command::SessionPrompt { session_id, text } => client::session_prompt(&state_root, session_id, text).await,
+        cli::Command::SessionPrompt { session_id, text } => {
+            client::session_prompt(&state_root, session_id, text).await
+        }
         cli::Command::SupervisorMain => daemon::run(state_root, exe_path).await,
-        cli::Command::WorkerMain { session_id, state_root, mode, name } => {
-            worker::run(worker::WorkerArgs { session_id, state_root, mode, name }).await
+        cli::Command::WorkerMain {
+            session_id,
+            state_root,
+            mode,
+            name,
+        } => {
+            worker::run(worker::WorkerArgs {
+                session_id,
+                state_root,
+                mode,
+                name,
+            })
+            .await
         }
     }
 }

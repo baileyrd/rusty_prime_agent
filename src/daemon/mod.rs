@@ -23,8 +23,11 @@ use crate::transport::{self, LineStream};
 use crate::worker::{self, WorkerMode};
 
 /// How long `session new` / a recovery respawn will wait for the new
-/// worker's private socket to become connectable before giving up.
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// worker's private socket to become connectable before giving up. Kept
+/// larger than `worker::spawn`'s own internal `bind_with_retry` budget
+/// (20s -- see that call site's doc comment) for the same reason
+/// `client::DAEMON_READY_TIMEOUT` is kept larger than the supervisor's.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Recorded in `daemon.pid` across restarts so a replacement supervisor
 /// (Required Behavior's crash-recovery path) has a generation number to
@@ -64,19 +67,28 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         spawn_lock: Mutex::new(()),
     });
 
-    eprintln!("DBG: before recover_on_startup");
     supervisor.recover_on_startup().await;
-    eprintln!("DBG: after recover_on_startup, about to bind");
 
-    let throwaway = std::env::temp_dir().join(format!("rpa-throwaway-{}.sock", std::process::id()));
-    eprintln!("DBG: trying throwaway bind at {throwaway:?}");
-    match transport::Listener::bind_with_retry(Context::Daemon, throwaway.clone(), Duration::from_secs(2)).await {
-        Ok(_) => eprintln!("DBG: throwaway bind SUCCEEDED"),
-        Err(e) => eprintln!("DBG: throwaway bind FAILED: {e:?}"),
-    }
-    let mut listener = match transport::Listener::bind_with_retry(Context::Daemon, paths::daemon_socket_path(&state_root), Duration::from_secs(5)).await {
-        Ok(l) => { eprintln!("DBG: bind succeeded"); l }
-        Err(e) => { eprintln!("DBG: bind failed: {e:?}"); return Err(e); }
+    // 20s, not a shorter window: rebinding right after force-killing a
+    // supervisor that had also made an outbound connection to a
+    // worker's private socket is a real Windows AF_UNIX teardown race
+    // -- confirmed via real windows-latest CI across several rounds of
+    // upstream rustils fixes and, ultimately, `transport::Listener::
+    // bind_with_retry`'s own `probe()`-based fallback (see that
+    // function's doc comment and docs/decision-request-af-unix-stale-
+    // reclaim-race.md in the rustils repo for the full trace). `client::
+    // DAEMON_READY_TIMEOUT` is kept strictly larger than this so the
+    // CLI doesn't give up on `wait_ready` before this retry loop has
+    // had its full budget.
+    let mut listener = match transport::Listener::bind_with_retry(
+        Context::Daemon,
+        paths::daemon_socket_path(&state_root),
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => return Err(e),
     };
     loop {
         let conn = listener.accept(Context::Daemon).await?;
@@ -101,7 +113,8 @@ fn record_daemon_pid(state_root: &Path) -> Result<u64> {
         pid: std::process::id(),
         generation,
     };
-    let json = serde_json::to_string_pretty(&content).map_err(|e| HarnessError::json(Context::Daemon, Some(path.clone()), e))?;
+    let json = serde_json::to_string_pretty(&content)
+        .map_err(|e| HarnessError::json(Context::Daemon, Some(path.clone()), e))?;
     std::fs::write(&path, json).map_err(|e| HarnessError::io(Context::Daemon, Some(path), e))?;
     Ok(generation)
 }
@@ -119,9 +132,15 @@ impl Supervisor {
                 return;
             }
         };
-        for summary in summaries.into_iter().filter(|s| s.status == SessionStatus::Active) {
+        for summary in summaries
+            .into_iter()
+            .filter(|s| s.status == SessionStatus::Active)
+        {
             if let Err(err) = self.ensure_worker_running(&summary.session_id).await {
-                eprintln!("daemon: startup recovery of session {} failed: {err}", summary.session_id);
+                eprintln!(
+                    "daemon: startup recovery of session {} failed: {err}",
+                    summary.session_id
+                );
             }
         }
     }
@@ -147,7 +166,14 @@ impl Supervisor {
         } else {
             WorkerMode::Recover
         };
-        worker::spawn(&self.exe_path, &self.state_root, session_id, mode, state.name.clone()).await?;
+        worker::spawn(
+            &self.exe_path,
+            &self.state_root,
+            session_id,
+            mode,
+            state.name.clone(),
+        )
+        .await?;
         worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await?;
         Ok(socket_path)
     }
@@ -163,13 +189,19 @@ impl Supervisor {
             Request::DaemonShutdown => self.handle_daemon_shutdown(&mut conn).await,
             Request::SessionNew { name } => self.handle_session_new(&mut conn, name).await,
             Request::SessionList => self.handle_session_list(&mut conn).await,
-            Request::SessionAttach { session_id } => self.handle_session_attach(&mut conn, session_id).await,
-            Request::SessionPrompt { session_id, text } => self.handle_session_prompt(&mut conn, session_id, text).await,
+            Request::SessionAttach { session_id } => {
+                self.handle_session_attach(&mut conn, session_id).await
+            }
+            Request::SessionPrompt { session_id, text } => {
+                self.handle_session_prompt(&mut conn, session_id, text)
+                    .await
+            }
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
                     &Response::Error {
-                        message: "WorkerShutdown is only valid on the private worker transport".into(),
+                        message: "WorkerShutdown is only valid on the private worker transport"
+                            .into(),
                         conflict: false,
                     },
                 )
@@ -197,14 +229,20 @@ impl Supervisor {
 
     async fn handle_daemon_shutdown(&self, conn: &mut LineStream) -> Result<()> {
         let sessions = catalog::scan(&self.state_root)?;
-        for summary in sessions.iter().filter(|s| s.status == SessionStatus::Active) {
+        for summary in sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Active)
+        {
             let socket_path = paths::worker_socket_path(&self.state_root, &summary.session_id);
             if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
-                let _ = private.write_request(Context::Worker, &Request::WorkerShutdown).await;
+                let _ = private
+                    .write_request(Context::Worker, &Request::WorkerShutdown)
+                    .await;
                 let _ = private.read_response(Context::Worker).await;
             }
         }
-        conn.write_response(Context::Daemon, &Response::DaemonShutdownAck).await?;
+        conn.write_response(Context::Daemon, &Response::DaemonShutdownAck)
+            .await?;
         let _ = std::fs::remove_file(paths::daemon_socket_path(&self.state_root));
         let _ = std::fs::remove_file(paths::daemon_pid_path(&self.state_root));
         // Same blunt-but-honest exit as the worker's own `WorkerShutdown`
@@ -220,7 +258,15 @@ impl Supervisor {
         let session_id = crate::session::new_session_id();
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
-        if let Err(err) = worker::spawn(&self.exe_path, &self.state_root, &session_id, WorkerMode::New, name).await {
+        if let Err(err) = worker::spawn(
+            &self.exe_path,
+            &self.state_root,
+            &session_id,
+            WorkerMode::New,
+            name,
+        )
+        .await
+        {
             return conn
                 .write_response(
                     Context::Daemon,
@@ -243,12 +289,14 @@ impl Supervisor {
                 )
                 .await;
         }
-        conn.write_response(Context::Daemon, &Response::SessionNew { session_id }).await
+        conn.write_response(Context::Daemon, &Response::SessionNew { session_id })
+            .await
     }
 
     async fn handle_session_list(&self, conn: &mut LineStream) -> Result<()> {
         let sessions = catalog::scan(&self.state_root)?;
-        conn.write_response(Context::Daemon, &Response::SessionList { sessions }).await
+        conn.write_response(Context::Daemon, &Response::SessionList { sessions })
+            .await
     }
 
     /// Shared by `SessionAttach`/`SessionPrompt`: validate the session
@@ -257,7 +305,11 @@ impl Supervisor {
     /// [`Response::Error`] rather than a bug when it fails -- matching
     /// the reference protocol's own "structured errors for recoverable
     /// cases" contract.
-    async fn resolve_worker(&self, conn: &mut LineStream, session_id: &str) -> Result<Option<PathBuf>> {
+    async fn resolve_worker(
+        &self,
+        conn: &mut LineStream,
+        session_id: &str,
+    ) -> Result<Option<PathBuf>> {
         let session_dir = paths::session_dir(&self.state_root, session_id);
         if !paths::state_file_path(&session_dir).exists() {
             conn.write_response(
@@ -298,40 +350,47 @@ impl Supervisor {
         let response = private
             .read_response(Context::Worker)
             .await?
-            .ok_or_else(|| HarnessError::protocol(Context::Worker, "worker closed before responding to attach"))?;
+            .ok_or_else(|| {
+                HarnessError::protocol(Context::Worker, "worker closed before responding to attach")
+            })?;
         let started = matches!(response, Response::SessionAttachStarted { .. });
         conn.write_response(Context::Daemon, &response).await?;
         if !started {
             return Ok(());
         }
-        loop {
-            match private.read_event(Context::Worker).await? {
-                Some(event) => {
-                    let ended = matches!(event, SessionEvent::SessionEnded);
-                    conn.write_event(Context::Daemon, &event).await?;
-                    if ended {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(event) = private.read_event(Context::Worker).await? {
+            let ended = matches!(event, SessionEvent::SessionEnded);
+            conn.write_event(Context::Daemon, &event).await?;
+            if ended {
+                break;
             }
         }
         Ok(())
     }
 
-    async fn handle_session_prompt(&self, conn: &mut LineStream, session_id: String, text: String) -> Result<()> {
+    async fn handle_session_prompt(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        text: String,
+    ) -> Result<()> {
         let socket_path = match self.resolve_worker(conn, &session_id).await? {
             Some(p) => p,
             None => return Ok(()),
         };
         let mut private = transport::connect(Context::Worker, socket_path).await?;
         private
-            .write_request(Context::Worker, &Request::SessionPrompt { session_id, text })
+            .write_request(
+                Context::Worker,
+                &Request::SessionPrompt { session_id, text },
+            )
             .await?;
         let response = private
             .read_response(Context::Worker)
             .await?
-            .ok_or_else(|| HarnessError::protocol(Context::Worker, "worker closed before responding to prompt"))?;
+            .ok_or_else(|| {
+                HarnessError::protocol(Context::Worker, "worker closed before responding to prompt")
+            })?;
         conn.write_response(Context::Daemon, &response).await
     }
 }

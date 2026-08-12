@@ -72,6 +72,17 @@ pub struct AgentSession {
     /// to call it against.
     tool_runtime: Box<dyn ToolRuntime>,
     events: broadcast::Sender<SessionEvent>,
+    /// Set by [`emit_recovery_marker`](Self::emit_recovery_marker),
+    /// cleared by [`take_pending_recovery_marker`](Self::take_pending_recovery_marker).
+    /// A crash-recovered worker calls the former before its private
+    /// socket is even bound -- long before any client can possibly have
+    /// called [`subscribe`](Self::subscribe) yet -- so broadcasting the
+    /// marker at that point would reach zero receivers and be lost
+    /// (`broadcast::Sender::send`'s own contract: only receivers
+    /// subscribed *before* a send observe it, per `sync/broadcast.rs`).
+    /// Stashing it here instead lets the first attach after a recovery
+    /// deliver it deterministically, right after the snapshot.
+    pending_recovery_marker: Option<SessionEvent>,
 }
 
 impl AgentSession {
@@ -104,6 +115,7 @@ impl AgentSession {
             provider,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            pending_recovery_marker: None,
         };
         session.write_state().await?;
         Ok(session)
@@ -142,6 +154,7 @@ impl AgentSession {
             provider,
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            pending_recovery_marker: None,
         };
         session.write_state().await?;
         Ok(session)
@@ -158,17 +171,34 @@ impl AgentSession {
         }
     }
 
-    /// Append a visible marker after this session was recovered from a
-    /// crashed worker (daemon.md: "appends a visible recovery marker to
-    /// the transcript"). Not part of the transcript's `Role`-tagged
-    /// turns -- delivered only as a `SessionEvent`, not persisted as a
-    /// `TranscriptEntry`, since it documents a host-side fact about this
-    /// process's lifetime, not something either party said.
-    pub fn emit_recovery_marker(&self, message: impl Into<String>) {
-        let _ = self.events.send(SessionEvent::RecoveryMarker {
+    /// Mark this session as recovered from a crashed worker (daemon.md:
+    /// "appends a visible recovery marker to the transcript"). Not part
+    /// of the transcript's `Role`-tagged turns -- delivered only as a
+    /// `SessionEvent`, not persisted as a `TranscriptEntry`, since it
+    /// documents a host-side fact about this process's lifetime, not
+    /// something either party said.
+    ///
+    /// Stashed in `pending_recovery_marker` rather than broadcast
+    /// directly: this is called during worker startup, before the
+    /// private socket is even bound, so there is no way any client could
+    /// have subscribed yet -- broadcasting now would reach zero
+    /// receivers and be silently lost. `take_pending_recovery_marker`
+    /// delivers it deterministically to the first attach instead.
+    pub fn emit_recovery_marker(&mut self, message: impl Into<String>) {
+        self.pending_recovery_marker = Some(SessionEvent::RecoveryMarker {
             message: message.into(),
             at_ms: now_ms(),
         });
+    }
+
+    /// Takes the pending recovery marker, if any -- delivered once, to
+    /// whichever attach happens to be first after a crash recovery; a
+    /// second, concurrent or later attach to the same still-running
+    /// worker sees `None` here (`supervisor_restart_recovery.rs`'s own
+    /// live-adopt case never calls `emit_recovery_marker` at all, so this
+    /// is `None` there from the start, not merely consumed).
+    pub fn take_pending_recovery_marker(&mut self) -> Option<SessionEvent> {
+        self.pending_recovery_marker.take()
     }
 
     /// Append a user turn, ask the (fake) provider for a reply, append
@@ -195,7 +225,9 @@ impl AgentSession {
         // No receivers is the ordinary "nobody attached right now" case,
         // not an error -- the transcript write above is what actually
         // makes this turn durable.
-        let _ = self.events.send(SessionEvent::Turn { entry: entry.clone() });
+        let _ = self.events.send(SessionEvent::Turn {
+            entry: entry.clone(),
+        });
         Ok(entry)
     }
 
@@ -215,14 +247,16 @@ impl AgentSession {
 
 fn read_state(session_dir: &Path) -> Result<SessionState> {
     let path = paths::state_file_path(session_dir);
-    let text = std::fs::read_to_string(&path).map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
     serde_json::from_str(&text).map_err(|e| HarnessError::json(Context::Session, Some(path), e))
 }
 
 async fn write_state(session_dir: &Path, state: &SessionState) -> Result<()> {
     let path = paths::state_file_path(session_dir);
     let state = state.clone();
-    let json = serde_json::to_string_pretty(&state).map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
     let join = rusty_tokio::spawn_blocking(move || {
         // Write-to-temp-then-rename: a crash mid-write must never leave
         // `state.json` truncated/partial, since recovery reads it
@@ -243,7 +277,8 @@ fn read_transcript(session_dir: &Path) -> Result<Vec<TranscriptEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = std::fs::File::open(&path).map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
+    let file = std::fs::File::open(&path)
+        .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
     let reader = std::io::BufReader::new(file);
     let mut entries = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
@@ -267,7 +302,8 @@ fn read_transcript(session_dir: &Path) -> Result<Vec<TranscriptEntry>> {
 
 async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> Result<()> {
     let path = paths::transcript_path(session_dir);
-    let line = serde_json::to_string(entry).map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
+    let line = serde_json::to_string(entry)
+        .map_err(|e| HarnessError::json(Context::Session, Some(path.clone()), e))?;
     let join = rusty_tokio::spawn_blocking(move || {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -275,7 +311,8 @@ async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> 
             .open(&path)
             .map_err(|e| HarnessError::io(Context::Session, Some(path.clone()), e))?;
         writeln!(file, "{line}").map_err(|e| HarnessError::io(Context::Session, Some(path), e))?;
-        file.flush().map_err(|e| HarnessError::io(Context::Session, None, e))
+        file.flush()
+            .map_err(|e| HarnessError::io(Context::Session, None, e))
     })
     .await;
     join.map_err(|_| HarnessError::protocol(Context::Session, "transcript append task panicked"))?

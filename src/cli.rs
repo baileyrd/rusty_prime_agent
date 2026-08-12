@@ -19,10 +19,17 @@ pub enum Command {
     DaemonStart,
     DaemonStatus,
     DaemonShutdown,
-    SessionNew { name: Option<String> },
-    SessionAttach { session_id: String },
+    SessionNew {
+        name: Option<String>,
+    },
+    SessionAttach {
+        session_id: String,
+    },
     SessionList,
-    SessionPrompt { session_id: String, text: String },
+    SessionPrompt {
+        session_id: String,
+        text: String,
+    },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
     SupervisorMain,
@@ -38,7 +45,9 @@ pub enum Command {
 }
 
 fn usage(message: impl Into<String>) -> HarnessError {
-    HarnessError::Usage { message: message.into() }
+    HarnessError::Usage {
+        message: message.into(),
+    }
 }
 
 pub fn parse(args: &[String]) -> Result<Command> {
@@ -88,7 +97,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
     }
 }
 
-fn parse_named_flag<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<Option<String>> {
+fn parse_named_flag<'a>(
+    it: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<Option<String>> {
     // Only ever called with the whole remaining arg list, so a
     // not-found flag legitimately means "not given" -- collect into a
     // vec once to allow a simple scan without consuming positional args
@@ -112,10 +124,31 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut name = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--session-id" => session_id = Some(it.next().ok_or_else(|| usage("--session-id requires a value"))?.clone()),
-            "--state-root" => state_root = Some(PathBuf::from(it.next().ok_or_else(|| usage("--state-root requires a value"))?)),
-            "--mode" => mode = Some(WorkerMode::parse(it.next().ok_or_else(|| usage("--mode requires a value"))?)?),
-            "--name" => name = Some(it.next().ok_or_else(|| usage("--name requires a value"))?.clone()),
+            "--session-id" => {
+                session_id = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--session-id requires a value"))?
+                        .clone(),
+                )
+            }
+            "--state-root" => {
+                state_root = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| usage("--state-root requires a value"))?,
+                ))
+            }
+            "--mode" => {
+                mode = Some(WorkerMode::parse(
+                    it.next().ok_or_else(|| usage("--mode requires a value"))?,
+                )?)
+            }
+            "--name" => {
+                name = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--name requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }

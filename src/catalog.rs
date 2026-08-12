@@ -26,7 +26,8 @@ use crate::protocol::{SessionState, SessionStatus, SessionSummary};
 /// (which needs the raw `worker_pid` to forward a request).
 pub fn read_session_state(context: Context, session_dir: &Path) -> Result<SessionState> {
     let path = paths::state_file_path(session_dir);
-    let text = std::fs::read_to_string(&path).map_err(|e| HarnessError::io(context, Some(path.clone()), e))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| HarnessError::io(context, Some(path.clone()), e))?;
     serde_json::from_str(&text).map_err(|e| HarnessError::json(context, Some(path), e))
 }
 
@@ -51,7 +52,10 @@ pub fn scan(state_root: &Path) -> Result<Vec<SessionSummary>> {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("catalog: skipping unreadable entry in {}: {err}", sessions_dir.display());
+                eprintln!(
+                    "catalog: skipping unreadable entry in {}: {err}",
+                    sessions_dir.display()
+                );
                 continue;
             }
         };
@@ -78,7 +82,7 @@ pub fn scan(state_root: &Path) -> Result<Vec<SessionSummary>> {
             updated_at_ms: state.updated_at_ms,
         });
     }
-    summaries.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
     Ok(summaries)
 }
 
@@ -92,7 +96,10 @@ fn effective_status(state: &SessionState) -> SessionStatus {
             Ok(true) => SessionStatus::Active,
             Ok(false) => SessionStatus::Crashed,
             Err(err) => {
-                eprintln!("catalog: is_alive({pid}) failed for session {}: {err}", state.session_id);
+                eprintln!(
+                    "catalog: is_alive({pid}) failed for session {}: {err}",
+                    state.session_id
+                );
                 SessionStatus::Crashed
             }
         },
