@@ -529,11 +529,81 @@ daemon/worker split rather than requiring the Python control environment:
   Explicitly still out of scope: interrupt/cancel (needs `control`),
   kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
   `execute_result`'s `data` only ever reads `text/plain` here), and
-  multi-kernel pooling beyond one kernel per session. Real `prime-agent`
-  "skills" (importable Python packages, `packages/coding-agent/docs/
-  skills.md`) and `/heartbeat`/`rlm_heartbeat`'s TUI/RLM-function trigger
-  surfaces stay out of scope below for their own, separate reasons -- see
-  those entries.
+  multi-kernel pooling beyond one kernel per session. `/heartbeat`/
+  `rlm_heartbeat`'s TUI/RLM-function trigger surfaces stay out of scope
+  below for their own, separate reasons -- see that entry. Real
+  `prime-agent` "skills" (importable Python packages,
+  `packages/coding-agent/docs/skills.md`) turned out to be tractable on
+  top of this same kernel boundary -- see the next entry.
+- [x] **Skills packaging** (real, importable Python packages for
+  `session new --runtime ipython`), parity with `prime-agent skills.md`.
+  Every prior revision of this file bundled this in with "extensions,
+  themes" as an undefined, out-of-scope surface -- that held only while
+  the underlying code-execution boundary (the entry above) was still a
+  stub; once it was real, this became tractable within this project's
+  existing shape, the same story as MCP integration and the tool-calling
+  loop before it. Prompt templates already cover `skills.md`'s
+  plain-text half (`prompt_template.rs`'s own doc comment says so); this
+  closes the Python-package half.
+
+  A skill is a directory under a new `paths::global_skills_dir`
+  (`<state_dir>/skills/`): a `SKILL.md` (`description` frontmatter,
+  model-facing) alongside a real Python package (`__init__.py`, plus
+  whatever else the package needs). `SKILL.md`'s frontmatter is parsed
+  by a small shared `frontmatter.rs`, factored out of
+  `prompt_template.rs::parse` rather than duplicated (both modules only
+  ever read a couple of flat string keys, so one hand-rolled `---\nkey:
+  value\n---\n<body>` parser serves both). `skills::discover` never
+  inspects the Python files themselves -- a broken `__init__.py`
+  surfaces as an ordinary `ImportError` the model sees and can recover
+  from when it actually tries `import <name>`, the same "let the callee
+  reject malformed input" philosophy `tools::execute` already
+  established, not something worth validating twice.
+
+  Global tier only, deliberately, unlike `prompt_template::discover`'s
+  global-plus-project-local pair: skill *loading* has to run inside the
+  worker process (it needs a live kernel connection, via
+  `tool_runtime::ToolRuntime::execute`), which runs with the daemon's
+  own cwd, not the session-creation caller's -- unlike
+  `prompt_template::discover`, whose callers are always client-side,
+  where the real cwd is available. A correct project-local tier would
+  need the CLI's cwd threaded through `Request::SessionNew`/`WorkerArgs`
+  on every worker respawn (`thinking`'s "always supplied" pattern, not
+  `goal`'s "New-only" one) -- real, but separate scope, not attempted
+  here rather than silently half-done.
+
+  `worker::run` installs skills once, right after `tool_runtime.start()`
+  succeeds and before session construction: when `--runtime ipython` and
+  at least one skill is discovered, one `execute_request`
+  (`sys.path.insert(0, <skills dir>)`) puts every installed skill's
+  parent directory on the kernel's own `sys.path`, so `import <name>`
+  resolves for the rest of that kernel's life -- zero skills installed
+  means zero extra round trips. `session::enabled_tool_defs` appends
+  each skill's name and description to the `execute_python` tool's own
+  description (recomputed every `prompt` call, so a skill installed or
+  removed between prompts is picked up without a session restart),
+  telling the model what it can `import` without a human having to say
+  so. `harness skill list` (parity with `prompt-template list`'s own
+  shape: pure local scan, no daemon) reports what's installed.
+
+  Real end-to-end coverage lives as an `#[ignore]`d test in
+  `ipython_runtime.rs`'s own test module, alongside the RLM entry's real-
+  kernel test: a genuine two-file Python package on disk, `sys.path`-
+  inserted and `import`ed inside a real kernel, its function actually
+  called and its return value checked -- proof the mechanism works
+  independent of whether a real model ever decides to `import` anything
+  on its own (the same small-model tool-call reliability caveat this
+  project's test suite already documents elsewhere). CI-safe coverage
+  (`tests/skills.rs`) proves discovery/listing/CLI wiring without a real
+  kernel.
+
+  Explicitly still out of scope: the project-local tier above, a `skill
+  install`/packaging-and-distribution command (drop-a-directory-in stays
+  manual, same as prompt templates always have), skill versioning or
+  dependency management, and skill-provided *tools* of their own -- a
+  skill is code the model imports and calls itself inside
+  `execute_python`, not a second tool-generation surface alongside
+  `--tools read|mcp`.
 
 ## Out of scope for this project's current shape
 
@@ -542,16 +612,12 @@ require a genuinely new subsystem (a Python control environment) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
-- **Skills, extensions, themes.** (Prompt templates -- the plain-text,
-  non-Python half of `prime-agent skills.md`'s surface -- are done, and
-  the underlying code-execution boundary those real "skills" would need
-  is now real too (`tool_runtime::ToolRuntime` backed by
-  `IpythonKernelRuntime`, see the medium-effort section above) -- but
-  actual "skills" packaging (`prime-agent`'s "importable Python packages",
-  a module/manifest/distribution system on top of that boundary) is a
-  separate, larger surface this project hasn't built. MCP integrations
-  turned out to be a separate thing entirely from any of this -- see the
-  medium-effort section above, now done.)
+- **Extensions, themes.** Named in this bullet's original heading
+  alongside "skills" (now done, see the medium-effort section above) with
+  no further elaboration anywhere in this project's own docs or
+  `prime-agent`'s docs this project has read -- left here rather than
+  silently dropped, since scoping an undefined surface isn't this
+  document's job to invent.
 - **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
   triggers for the same "re-enter a session periodically" mechanism
   `prime-agent schedule`/`session schedule` already covers server-side

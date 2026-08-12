@@ -713,6 +713,27 @@ pub async fn prompt_template_list(state_root: &Path, mode: OutputMode) -> Result
     Ok(())
 }
 
+/// `harness skill list` -- lists every skill `skills::discover` finds
+/// (`<state-dir>/skills/*/SKILL.md`), with its description. Global-only,
+/// so no `cwd` needed -- see `skills.rs`'s own doc comment for why. A
+/// pure local directory scan, same as `prompt_template_list`, no daemon
+/// connection.
+pub async fn skill_list(state_root: &Path, mode: OutputMode) -> Result<()> {
+    let skills = crate::skills::discover(state_root)?;
+    match mode {
+        OutputMode::Json => print_json(&skills),
+        OutputMode::Text => {
+            if skills.is_empty() {
+                println!("no skills");
+            }
+            for s in &skills {
+                println!("{}\t{}", s.name, s.description.as_deref().unwrap_or(""));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `harness prompt-template render <name> [args...]` -- expands the
 /// named template and prints it, without sending it anywhere. Also a
 /// pure local operation, no daemon connection.

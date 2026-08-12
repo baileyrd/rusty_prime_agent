@@ -78,39 +78,16 @@ fn read_dir(dir: &Path) -> Result<Vec<PromptTemplate>> {
     Ok(out)
 }
 
-/// `---\nkey: value\n...\n---\n<body>` frontmatter, hand-rolled rather
-/// than a YAML dependency -- only two keys (`description`,
-/// `argument-hint`) are ever read, so a full YAML parser buys nothing
-/// here (this project's dependency floor is deliberately narrow, see
-/// `ARCHITECTURE.md`). A file with no leading `---` block is entirely
-/// body, no frontmatter.
+/// Only two keys (`description`, `argument-hint`) are ever read out of
+/// `crate::frontmatter::parse`'s full field map -- see that module's own
+/// doc comment for the frontmatter shape itself.
 fn parse(name: String, content: &str) -> PromptTemplate {
-    let mut description = None;
-    let mut argument_hint = None;
-    let mut body = content;
-
-    if let Some(rest) = content.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            let frontmatter = &rest[..end];
-            body = &rest[end + "\n---\n".len()..];
-            for line in frontmatter.lines() {
-                if let Some((key, value)) = line.split_once(':') {
-                    let value = value.trim().to_string();
-                    match key.trim() {
-                        "description" => description = Some(value),
-                        "argument-hint" => argument_hint = Some(value),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
+    let (mut fields, body) = crate::frontmatter::parse(content);
     PromptTemplate {
         name,
-        description,
-        argument_hint,
-        body: body.trim().to_string(),
+        description: fields.remove("description"),
+        argument_hint: fields.remove("argument-hint"),
+        body: body.to_string(),
     }
 }
 
