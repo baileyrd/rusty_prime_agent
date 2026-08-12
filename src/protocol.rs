@@ -40,6 +40,16 @@ pub enum Request {
         /// Optional human-readable label; the session id itself is always
         /// generated server-side.
         name: Option<String>,
+        /// Parity with `prime-agent --model provider/id`: a
+        /// `"provider/model"` string (e.g. `"ollama/qwen2.5:0.5b"`,
+        /// `"anthropic/claude-sonnet-5"`) selecting a real backend routed
+        /// through `rusty_provider`'s `rp-server` (see
+        /// `provider::RustyProviderModel`/`rp_server`). `None` keeps
+        /// `EchoProvider`, still the default. Fixed for this session's
+        /// whole lifetime once set -- recorded in `SessionState::model`
+        /// so a respawned worker (resume/recover) reconstructs the same
+        /// backend without the caller having to repeat it.
+        model: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -191,6 +201,11 @@ pub struct SessionState {
     pub last_sequence: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// See `Request::SessionNew::model`'s own doc comment. `#[serde(default)]`
+    /// so a `state.json` written before this field existed still parses
+    /// (as `None`, i.e. `EchoProvider`) rather than failing recovery.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,4 +224,7 @@ pub struct SessionSummary {
     pub worker_pid: Option<u32>,
     /// See `SessionState::generation`'s own doc comment.
     pub generation: u64,
+    /// See `Request::SessionNew::model`'s own doc comment. `None` means
+    /// this session uses `EchoProvider`.
+    pub model: Option<String>,
 }

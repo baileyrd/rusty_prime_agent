@@ -1,4 +1,4 @@
-//! Real end-to-end coverage for `provider::OllamaProvider`/`rp_server`
+//! Real end-to-end coverage for `provider::RustyProviderModel`/`rp_server`
 //! (parity with `prime-agent --provider`/`--model`, see `PARITY.md`'s
 //! "real `ModelProvider` backend" entry).
 //!
@@ -22,17 +22,21 @@ mod common;
 fn ollama_provider_answers_a_real_prompt_end_to_end() {
     let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
         .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
-    // Safe despite being process-wide env mutation: this file has a
-    // single test function, so there's no other test in this binary to
-    // race with -- see this file's own module doc comment for why
-    // `--test-threads=1` is part of the documented invocation anyway.
-    std::env::set_var("RUSTY_PRIME_AGENT_PROVIDER", "ollama");
-    std::env::set_var("RUSTY_PRIME_AGENT_MODEL", &model);
 
     let state_dir = common::TempDir::new("ollama-e2e");
     common::daemon_start(state_dir.path());
 
-    let session_id = common::session_new(state_dir.path(), None);
+    // Exercises the explicit `session new --model` CLI flag directly,
+    // not just the RUSTY_PRIME_AGENT_MODEL env-var fallback -- proves
+    // the per-session flag path this increment actually added, not just
+    // the daemon-side default-resolution path.
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains(&format!("model={model}")),
+        "session list should show the session's real model, got: {listing}"
+    );
+
     let ack = common::session_prompt(state_dir.path(), &session_id, "Say hello.");
     // Not an exact-string match: a 0.5B model doesn't reliably follow a
     // literal "reply with exactly X" instruction (observed replying
@@ -41,13 +45,13 @@ fn ollama_provider_answers_a_real_prompt_end_to_end() {
     // the plumbing this test actually exists to prove. What matters here
     // is that a real model answered at all: `entry.text` is never empty
     // and never starts with `EchoProvider`'s own "echo: " prefix, which
-    // is exactly the property that distinguishes "OllamaProvider is
+    // is exactly the property that distinguishes "RustyProviderModel is
     // wired up and a real completion came back" from "silently still
     // running EchoProvider" or "got an empty/error response".
     assert!(
         !ack.contains("] assistant: echo:"),
-        "reply looks like EchoProvider's output, not a real model's -- is \
-         RUSTY_PRIME_AGENT_PROVIDER=ollama actually wired up? got: {ack}"
+        "reply looks like EchoProvider's output, not a real model's -- did \
+         session new --model actually wire up a real backend? got: {ack}"
     );
     assert!(
         ack.contains("] assistant: ") && !ack.trim_end().ends_with("assistant:"),

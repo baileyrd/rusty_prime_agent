@@ -33,9 +33,9 @@ current shape.
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
 | `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock}`, `provider.{json,log}`) |
-| `provider` | `ModelProvider` trait + `EchoProvider` (the default); `OllamaProvider`, a real backend opt-in via `RUSTY_PRIME_AGENT_PROVIDER=ollama` -- see `PARITY.md` |
+| `provider` | `ModelProvider` trait + `EchoProvider` (the default); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md` |
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers |
-| `http_client` | Minimal hand-rolled HTTP/1.1 client `OllamaProvider`/`rp_server` use to talk to `rp-server` |
+| `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server` use to talk to `rp-server` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
@@ -52,7 +52,7 @@ rusty_prime_agent (this project)
 ```
 
 **`rusty_provider`'s `rp-server` is a spawned process, not a `Cargo.toml`
-dependency.** `RUSTY_PRIME_AGENT_PROVIDER=ollama`'s `OllamaProvider`
+dependency.** `session new --model provider/model`'s `RustyProviderModel`
 (`PARITY.md`) talks to it purely over HTTP (`http_client.rs`) after the
 supervisor spawns it (`rp_server.rs`) -- it is never linked into this
 binary, since it's built on real `tokio` rather than `rusty_tokio`, and

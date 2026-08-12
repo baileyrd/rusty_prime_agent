@@ -50,6 +50,9 @@ pub enum Command {
     DaemonShutdown,
     SessionNew {
         name: Option<String>,
+        /// Parity with `prime-agent --model provider/id`; see
+        /// `Request::SessionNew::model`'s own doc comment.
+        model: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -66,23 +69,26 @@ pub enum Command {
         session_id: String,
         name: Option<String>,
     },
-    /// `harness -p <text...>`/`harness --print <text...>` -- parity with
-    /// `prime-agent -p`. Unlike every other subcommand, does not require
-    /// `daemon start` first: see `client::print_once`'s doc comment.
+    /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
+    /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
+    /// subcommand, does not require `daemon start` first: see
+    /// `client::print_once`'s doc comment.
     Print {
         text: String,
+        model: Option<String>,
     },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
     SupervisorMain,
     /// `harness __worker-main --session-id ID --state-root PATH --mode
-    /// new|resume|recover [--name NAME]` -- spawned by the supervisor,
-    /// never invoked directly by a user.
+    /// new|resume|recover [--name NAME] [--model PROVIDER/MODEL]` --
+    /// spawned by the supervisor, never invoked directly by a user.
     WorkerMain {
         session_id: String,
         state_root: PathBuf,
         mode: WorkerMode,
         name: Option<String>,
+        model: Option<String>,
     },
 }
 
@@ -114,12 +120,28 @@ fn parse_command(args: &[String]) -> Result<Command> {
         args.first().map(String::as_str),
         Some("-p") | Some("--print")
     ) {
-        let text: Vec<String> = args[1..].to_vec();
-        if text.is_empty() {
+        let mut rest = &args[1..];
+        // `--model` is only recognized as a strict leading flag here
+        // (immediately after `-p`/`--print`), not scanned for throughout
+        // -- unlike `session new`, everything after this point is free
+        // prompt text, and text that happens to contain the substring
+        // `--model` must not be misread as the flag.
+        let model = if rest.first().map(String::as_str) == Some("--model") {
+            let value = rest
+                .get(1)
+                .cloned()
+                .ok_or_else(|| usage("--model requires a value"))?;
+            rest = &rest[2..];
+            Some(value)
+        } else {
+            None
+        };
+        if rest.is_empty() {
             return Err(usage("`-p`/`--print` requires prompt text"));
         }
         return Ok(Command::Print {
-            text: text.join(" "),
+            text: rest.join(" "),
+            model,
         });
     }
     let mut it = args.iter();
@@ -133,8 +155,10 @@ fn parse_command(args: &[String]) -> Result<Command> {
         },
         Some("session") => match it.next().map(String::as_str) {
             Some("new") => {
-                let name = parse_named_flag(&mut it, "--name")?;
-                Ok(Command::SessionNew { name })
+                let rest: Vec<&String> = it.collect();
+                let name = scan_named_flag(&rest, "--name")?;
+                let model = scan_named_flag(&rest, "--model")?;
+                Ok(Command::SessionNew { name, model })
             }
             Some("attach") => {
                 let session_id = it
@@ -191,20 +215,17 @@ fn parse_command(args: &[String]) -> Result<Command> {
     }
 }
 
-fn parse_named_flag<'a>(
-    it: &mut impl Iterator<Item = &'a String>,
-    flag: &str,
-) -> Result<Option<String>> {
-    // Only ever called with the whole remaining arg list, so a
-    // not-found flag legitimately means "not given" -- collect into a
-    // vec once to allow a simple scan without consuming positional args
-    // this same parse might still need.
-    let rest: Vec<&'a String> = it.collect();
+/// Scans `rest` (the whole remaining arg list, already materialized so
+/// this can be called once per flag without exhausting an iterator) for
+/// `flag <value>`. A not-found flag legitimately means "not given," not
+/// an error -- `session new`'s only caller has nothing else positional
+/// to worry about consuming by mistake.
+fn scan_named_flag(rest: &[&String], flag: &str) -> Result<Option<String>> {
     for (i, arg) in rest.iter().enumerate() {
         if arg.as_str() == flag {
             return rest
                 .get(i + 1)
-                .map(|s| Some((*s).clone()))
+                .map(|s| Some((*s).to_string()))
                 .ok_or_else(|| usage(format!("{flag} requires a value")));
         }
     }
@@ -216,6 +237,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut state_root = None;
     let mut mode = None;
     let mut name = None;
+    let mut model = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -243,6 +265,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--model" => {
+                model = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--model requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -251,5 +280,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         state_root: state_root.ok_or_else(|| usage("__worker-main requires --state-root"))?,
         mode: mode.ok_or_else(|| usage("__worker-main requires --mode"))?,
         name,
+        model,
     })
 }

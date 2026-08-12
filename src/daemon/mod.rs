@@ -67,18 +67,6 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         spawn_lock: Mutex::new(()),
     });
 
-    // Gated on RUSTY_PRIME_AGENT_PROVIDER=ollama (EchoProvider stays the
-    // default): a singleton per state root, exactly like the supervisor
-    // itself -- see `rp_server::ensure_running`'s own doc comment for why
-    // this lives here rather than in each worker. Failing loud (not
-    // falling back to EchoProvider) on a startup failure matches this
-    // project's own boundary-validation philosophy: a caller that
-    // explicitly opted into the real backend should hear about it
-    // immediately if it can't come up, not silently get echoed prompts.
-    if provider_is_ollama() {
-        crate::rp_server::ensure_running(&state_root).await?;
-    }
-
     supervisor.recover_on_startup().await;
 
     // 20s, not a shorter window: rebinding right after force-killing a
@@ -111,14 +99,6 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
             }
         });
     }
-}
-
-/// Shared, in spirit, with `worker::provider_is_ollama` -- not literally
-/// (different modules, same one-line env check), since sharing it would
-/// mean introducing a dependency between two modules that otherwise have
-/// no reason to know about each other.
-fn provider_is_ollama() -> bool {
-    std::env::var("RUSTY_PRIME_AGENT_PROVIDER").as_deref() == Ok("ollama")
 }
 
 fn record_daemon_pid(state_root: &Path) -> Result<u64> {
@@ -186,12 +166,20 @@ impl Supervisor {
         } else {
             WorkerMode::Recover
         };
+        // Same sidecar this session used before, not whatever this
+        // supervisor generation's own environment happens to say --
+        // `state.model` is the persisted source of truth (see
+        // `WorkerArgs::model`'s own doc comment).
+        if state.model.is_some() {
+            crate::rp_server::ensure_running(&self.state_root).await?;
+        }
         worker::spawn(
             &self.exe_path,
             &self.state_root,
             session_id,
             mode,
             state.name.clone(),
+            state.model.clone(),
         )
         .await?;
         worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await?;
@@ -207,7 +195,9 @@ impl Supervisor {
             Request::Ping => conn.write_response(Context::Daemon, &Response::Pong).await,
             Request::DaemonStatus => self.handle_daemon_status(&mut conn).await,
             Request::DaemonShutdown => self.handle_daemon_shutdown(&mut conn).await,
-            Request::SessionNew { name } => self.handle_session_new(&mut conn, name).await,
+            Request::SessionNew { name, model } => {
+                self.handle_session_new(&mut conn, name, model).await
+            }
             Request::SessionList => self.handle_session_list(&mut conn).await,
             Request::SessionAttach { session_id } => {
                 self.handle_session_attach(&mut conn, session_id).await
@@ -285,16 +275,42 @@ impl Supervisor {
         std::process::exit(0);
     }
 
-    async fn handle_session_new(&self, conn: &mut LineStream, name: Option<String>) -> Result<()> {
+    async fn handle_session_new(
+        &self,
+        conn: &mut LineStream,
+        name: Option<String>,
+        model: Option<String>,
+    ) -> Result<()> {
+        // An explicit `--model` always wins; RUSTY_PRIME_AGENT_MODEL is
+        // only a fallback default for callers that don't pass one (e.g.
+        // scripting against a daemon started with a fixed default
+        // model). Resolved server-side, not by the CLI, so it's the
+        // daemon's own environment that decides, not whichever
+        // environment happened to invoke `session new`.
+        let model = model.or_else(|| std::env::var("RUSTY_PRIME_AGENT_MODEL").ok());
         let session_id = crate::session::new_session_id();
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
+        if model.is_some() {
+            if let Err(err) = crate::rp_server::ensure_running(&self.state_root).await {
+                return conn
+                    .write_response(
+                        Context::Daemon,
+                        &Response::Error {
+                            message: format!("failed to start rp-server sidecar: {err}"),
+                            conflict: false,
+                        },
+                    )
+                    .await;
+            }
+        }
         if let Err(err) = worker::spawn(
             &self.exe_path,
             &self.state_root,
             &session_id,
             WorkerMode::New,
             name,
+            model,
         )
         .await
         {

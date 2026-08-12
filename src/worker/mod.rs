@@ -58,49 +58,49 @@ pub struct WorkerArgs {
     pub state_root: PathBuf,
     pub mode: WorkerMode,
     pub name: Option<String>,
+    /// See `Request::SessionNew::model`'s own doc comment. Always
+    /// supplied by the daemon at spawn time -- for `New` it's whatever
+    /// the client's request asked for, for `Resume`/`Recover` it's
+    /// `state.model.clone()` read back from `state.json` (`daemon::
+    /// Supervisor::ensure_worker_running`), never re-resolved from this
+    /// process's own environment. That keeps a session's backend fixed
+    /// for its whole lifetime even if the daemon's own environment
+    /// changes across a restart.
+    pub model: Option<String>,
 }
 
-/// `RUSTY_PRIME_AGENT_PROVIDER=ollama` (unset/anything else stays
-/// `EchoProvider`). See `daemon::run`'s identical one-line check for why
-/// this isn't shared between the two modules.
-fn provider_is_ollama() -> bool {
-    std::env::var("RUSTY_PRIME_AGENT_PROVIDER").as_deref() == Ok("ollama")
-}
-
-/// Builds this worker's `ModelProvider`. The `rp-server` sidecar is
-/// started by the supervisor at daemon startup, not by this worker (see
-/// `rp_server`'s own doc comment) -- by the time any worker is spawned,
-/// the supervisor's own startup has already completed, so
-/// `rp_server::read_port` finding nothing recorded means the daemon
-/// wasn't started with the same `RUSTY_PRIME_AGENT_PROVIDER=ollama`, a
-/// misconfiguration worth failing loudly on rather than silently falling
-/// back to `EchoProvider`.
-fn build_provider(state_root: &Path) -> Result<Box<dyn crate::provider::ModelProvider>> {
-    if !provider_is_ollama() {
+/// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
+/// case) is `EchoProvider`, no `rp_server` involvement at all. Otherwise,
+/// the `rp-server` sidecar was already started by the supervisor before
+/// this worker was ever spawned (`daemon::Supervisor::ensure_worker_running`
+/// calls `rp_server::ensure_running` first whenever a session's `model`
+/// is `Some`) -- `rp_server::read_port` finding nothing recorded here
+/// would mean that invariant broke, worth failing loudly on rather than
+/// silently falling back to `EchoProvider`.
+fn build_provider(
+    state_root: &Path,
+    model: Option<String>,
+) -> Result<Box<dyn crate::provider::ModelProvider>> {
+    let Some(model) = model else {
         return Ok(Box::new(EchoProvider));
-    }
+    };
     let port = crate::rp_server::read_port(state_root).ok_or_else(|| {
         HarnessError::conflict(
             Context::Provider,
-            "RUSTY_PRIME_AGENT_PROVIDER=ollama but no rp-server sidecar is recorded -- \
-             was `daemon start` run with that same env var set?",
+            "session has a model set but no rp-server sidecar is recorded -- \
+             this is a bug in daemon::Supervisor's spawn ordering",
         )
     })?;
-    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL").map_err(|_| {
-        HarnessError::conflict(
-            Context::Provider,
-            "RUSTY_PRIME_AGENT_PROVIDER=ollama requires RUSTY_PRIME_AGENT_MODEL to be set \
-             (e.g. \"ollama/qwen2.5:0.5b\")",
-        )
-    })?;
-    Ok(Box::new(crate::provider::OllamaProvider::new(port, model)))
+    Ok(Box::new(crate::provider::RustyProviderModel::new(
+        port, model,
+    )))
 }
 
 /// The worker process entrypoint (`harness __worker-main`).
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut tool_runtime = Box::new(NoopToolRuntime);
     tool_runtime.start().await?;
-    let provider = build_provider(&args.state_root)?;
+    let provider = build_provider(&args.state_root, args.model.clone())?;
 
     let session = match args.mode {
         WorkerMode::New => {
@@ -108,6 +108,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 &args.state_root,
                 args.session_id.clone(),
                 args.name.clone(),
+                args.model.clone(),
                 provider,
                 tool_runtime,
             )
@@ -256,6 +257,7 @@ pub async fn spawn(
     session_id: &str,
     mode: WorkerMode,
     name: Option<String>,
+    model: Option<String>,
 ) -> Result<u32> {
     use rusty_tokio::process::{Command, Stdio};
 
@@ -272,6 +274,9 @@ pub async fn spawn(
         .arg(mode.as_arg());
     if let Some(name) = &name {
         cmd.arg("--name").arg(name);
+    }
+    if let Some(model) = &model {
+        cmd.arg("--model").arg(model);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

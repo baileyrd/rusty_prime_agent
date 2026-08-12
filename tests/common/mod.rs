@@ -130,10 +130,21 @@ pub fn daemon_shutdown(state_dir: &Path) {
 }
 
 pub fn session_new(state_dir: &Path, name: Option<&str>) -> String {
+    session_new_with_model(state_dir, name, None)
+}
+
+/// Parity with `prime-agent --model provider/id`. `model` is a
+/// `"provider/model"` string routed through the `rp-server` sidecar
+/// (see `rp_server`'s own doc comment) -- `None` keeps `EchoProvider`.
+pub fn session_new_with_model(state_dir: &Path, name: Option<&str>, model: Option<&str>) -> String {
     let mut args = vec!["session", "new"];
     if let Some(n) = name {
         args.push("--name");
         args.push(n);
+    }
+    if let Some(m) = model {
+        args.push("--model");
+        args.push(m);
     }
     let out = run(state_dir, &args);
     assert_success("session new", &out);

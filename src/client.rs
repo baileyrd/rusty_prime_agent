@@ -121,12 +121,13 @@ pub async fn print_once(
     state_root: &Path,
     exe_path: &Path,
     text: String,
+    model: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
     ensure_daemon_started(state_root, exe_path).await?;
 
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name: None })
+    conn.write_request(Context::Daemon, &Request::SessionNew { name: None, model })
         .await?;
     let session_id = match read_response(&mut conn).await? {
         Response::SessionNew { session_id } => session_id,
@@ -208,9 +209,14 @@ pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> 
     }
 }
 
-pub async fn session_new(state_root: &Path, name: Option<String>, mode: OutputMode) -> Result<()> {
+pub async fn session_new(
+    state_root: &Path,
+    name: Option<String>,
+    model: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name })
+    conn.write_request(Context::Daemon, &Request::SessionNew { name, model })
         .await?;
     match read_response(&mut conn).await? {
         response @ Response::SessionNew { .. } => {
@@ -252,14 +258,16 @@ pub async fn session_list(state_root: &Path, mode: OutputMode) -> Result<()> {
                     .worker_pid
                     .map(|pid| pid.to_string())
                     .unwrap_or_else(|| "-".to_string());
+                let model = s.model.as_deref().unwrap_or("echo");
                 println!(
-                    "{}\t{}\t{}\tturns={}\tgeneration={}\tworker_pid={}\tupdated_at_ms={}",
+                    "{}\t{}\t{}\tturns={}\tgeneration={}\tworker_pid={}\tmodel={}\tupdated_at_ms={}",
                     s.session_id,
                     status,
                     name,
                     s.last_sequence,
                     s.generation,
                     worker_pid,
+                    model,
                     s.updated_at_ms
                 );
             }

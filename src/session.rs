@@ -92,6 +92,7 @@ impl AgentSession {
         state_root: &Path,
         session_id: String,
         name: Option<String>,
+        model: Option<String>,
         provider: Box<dyn ModelProvider>,
         tool_runtime: Box<dyn ToolRuntime>,
     ) -> Result<Self> {
@@ -107,6 +108,7 @@ impl AgentSession {
             last_sequence: 0,
             created_at_ms: now,
             updated_at_ms: now,
+            model,
         };
         let session = AgentSession {
             state,

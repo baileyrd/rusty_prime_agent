@@ -82,6 +82,7 @@ pub fn scan(state_root: &Path) -> Result<Vec<SessionSummary>> {
             updated_at_ms: state.updated_at_ms,
             worker_pid: state.worker_pid,
             generation: state.generation,
+            model: state.model,
         });
     }
     summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
