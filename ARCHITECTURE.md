@@ -4,9 +4,17 @@ Phase 1 skeleton for a cross-platform, daemon-backed agent harness:
 `daemon start` launches a supervisor that owns a public Unix-domain (or
 Windows `AF_UNIX`) socket, `session new`/`session prompt`/`session attach`
 spawn and talk to per-session worker processes over private sockets of
-their own, and both crash-recovery paths (supervisor restart, worker
-crash) rebuild in-memory state from disk rather than trusting anything a
-still-running process remembers.
+their own, `session stop` gracefully tears one of them back down, and
+both crash-recovery paths (supervisor restart, worker crash) rebuild
+in-memory state from disk rather than trusting anything a still-running
+process remembers.
+
+This project deliberately mirrors one slice of
+[`PrimeIntellect-ai/prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent)'s
+daemon/worker operational architecture without attempting to reimplement
+that project itself -- see `PARITY.md` for what's mirrored, what's a
+tractable near-term increment, and what's out of scope for this project's
+current shape.
 
 ## Module map
 

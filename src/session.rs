@@ -235,6 +235,18 @@ impl AgentSession {
         write_state(&self.session_dir, &self.state).await
     }
 
+    /// Parity with `prime-agent rename <agent> <name>`. Goes through the
+    /// worker (rather than the daemon rewriting `state.json` directly)
+    /// for the same reason `prompt`/`mark_stopped` do: this process is
+    /// `state`'s one owner while it's running, and its own periodic
+    /// `write_state` calls (e.g. after the next `prompt`) would silently
+    /// clobber a rename applied out from under it.
+    pub async fn rename(&mut self, name: Option<String>) -> Result<()> {
+        self.state.name = name;
+        self.state.updated_at_ms = now_ms();
+        self.write_state().await
+    }
+
     pub async fn mark_stopped(&mut self) -> Result<()> {
         self.state.status = SessionStatus::Stopped;
         self.state.updated_at_ms = now_ms();

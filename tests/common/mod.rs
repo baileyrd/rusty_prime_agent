@@ -176,6 +176,12 @@ pub fn worker_pid(state_dir: &Path, session_id: &str) -> u32 {
         .expect("state.json has worker_pid") as u32
 }
 
+pub fn session_stop(state_dir: &Path, session_id: &str) -> String {
+    let out = run(state_dir, &["session", "stop", session_id]);
+    assert_success("session stop", &out);
+    stdout_string(&out)
+}
+
 pub fn session_status(state_dir: &Path, session_id: &str) -> String {
     let text = std::fs::read_to_string(
         state_dir
@@ -241,13 +247,31 @@ pub fn attach_lines(
     max_lines: usize,
     timeout: Duration,
 ) -> Vec<String> {
+    attach_lines_with_args(
+        state_dir,
+        &["session", "attach", session_id],
+        max_lines,
+        timeout,
+    )
+}
+
+/// As [`attach_lines`], but with the full argv under the caller's
+/// control -- used by the `--mode json` test to prefix the global
+/// `--mode json` flag ahead of `session attach`, which `attach_lines`
+/// itself has no way to express.
+pub fn attach_lines_with_args(
+    state_dir: &Path,
+    args: &[&str],
+    max_lines: usize,
+    timeout: Duration,
+) -> Vec<String> {
     let mut child = Command::new(bin())
-        .args(["session", "attach", session_id])
+        .args(args)
         .env("RUSTY_PRIME_AGENT_HOME", state_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn `session attach`");
+        .expect("spawn harness");
     let stdout = child.stdout.take().expect("piped stdout");
 
     let (tx, rx) = std::sync::mpsc::channel();

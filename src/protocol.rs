@@ -53,8 +53,27 @@ pub enum Request {
         session_id: String,
         text: String,
     },
+    /// Parity with `prime-agent stop <agent>`: gracefully shut down one
+    /// session's worker without touching any other session or the
+    /// daemon itself. Idempotent -- stopping a session that is already
+    /// `Stopped` or `Crashed` (no live worker to shut down) still
+    /// succeeds, since the end state ("no worker running for this
+    /// session") already holds.
+    SessionStop {
+        session_id: String,
+    },
+    /// Parity with `prime-agent rename <agent> <name>`. Valid on both
+    /// transports: the public request is forwarded to the owning
+    /// worker's private connection unchanged, the same way
+    /// `SessionPrompt` is -- `name: None` clears a session's display
+    /// name back to unnamed.
+    SessionRename {
+        session_id: String,
+        name: Option<String>,
+    },
     /// Private transport only: supervisor -> worker, asking it to persist
-    /// its final state and exit cleanly (used by `daemon shutdown`).
+    /// its final state and exit cleanly (used by `daemon shutdown` and
+    /// `SessionStop`).
     WorkerShutdown,
 }
 
@@ -90,6 +109,16 @@ pub enum Response {
     /// terminal [`Response::Error`].
     SessionAttachStarted {
         session_id: String,
+    },
+    /// `already_stopped` is true when there was no live worker to shut
+    /// down in the first place (already `Stopped`/`Crashed`) -- still a
+    /// success, but lets the CLI print an accurate message instead of
+    /// implying a worker was just torn down.
+    SessionStopAck {
+        already_stopped: bool,
+    },
+    SessionRenameAck {
+        name: Option<String>,
     },
     WorkerShutdownAck,
 }
@@ -171,4 +200,13 @@ pub struct SessionSummary {
     pub status: SessionStatus,
     pub last_sequence: u64,
     pub updated_at_ms: u64,
+    /// The recorded worker pid, as last written by whichever worker
+    /// process currently (or most recently) owned this session --
+    /// `None` only for a session whose `state.json` predates this field
+    /// (never true for a session created by this project's own `session
+    /// new`, which always records one). Parity with `prime-agent
+    /// agents`/`list`, which surface each agent's worker process.
+    pub worker_pid: Option<u32>,
+    /// See `SessionState::generation`'s own doc comment.
+    pub generation: u64,
 }

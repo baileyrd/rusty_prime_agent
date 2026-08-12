@@ -118,22 +118,32 @@ fn exit_code(err: &HarnessError) -> i32 {
 }
 
 async fn run(args: &[String]) -> Result<()> {
-    let command = cli::parse(args)?;
+    let (output_mode, command) = cli::parse(args)?;
     let state_root = paths::state_dir()?;
     let exe_path =
         std::env::current_exe().map_err(|e| HarnessError::io(error::Context::Cli, None, e))?;
 
     match command {
-        cli::Command::DaemonStart => client::daemon_start(&state_root, &exe_path).await,
-        cli::Command::DaemonStatus => client::daemon_status(&state_root).await,
-        cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root).await,
-        cli::Command::SessionNew { name } => client::session_new(&state_root, name).await,
-        cli::Command::SessionAttach { session_id } => {
-            client::session_attach(&state_root, session_id).await
+        cli::Command::DaemonStart => {
+            client::daemon_start(&state_root, &exe_path, output_mode).await
         }
-        cli::Command::SessionList => client::session_list(&state_root).await,
+        cli::Command::DaemonStatus => client::daemon_status(&state_root, output_mode).await,
+        cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root, output_mode).await,
+        cli::Command::SessionNew { name } => {
+            client::session_new(&state_root, name, output_mode).await
+        }
+        cli::Command::SessionAttach { session_id } => {
+            client::session_attach(&state_root, session_id, output_mode).await
+        }
+        cli::Command::SessionList => client::session_list(&state_root, output_mode).await,
         cli::Command::SessionPrompt { session_id, text } => {
-            client::session_prompt(&state_root, session_id, text).await
+            client::session_prompt(&state_root, session_id, text, output_mode).await
+        }
+        cli::Command::SessionStop { session_id } => {
+            client::session_stop(&state_root, session_id, output_mode).await
+        }
+        cli::Command::SessionRename { session_id, name } => {
+            client::session_rename(&state_root, session_id, name, output_mode).await
         }
         cli::Command::SupervisorMain => daemon::run(state_root, exe_path).await,
         cli::Command::WorkerMain {

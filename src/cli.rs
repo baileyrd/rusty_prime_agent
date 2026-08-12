@@ -1,9 +1,11 @@
 //! Argument parsing and dispatch for the public CLI surface (Required
-//! Behavior: `daemon start/status/shutdown`, `session new/attach/list`)
-//! plus the two hidden entrypoints this binary spawns itself as
-//! (`__supervisor-main`, `__worker-main`).
+//! Behavior: `daemon start/status/shutdown`, `session new/attach/list`,
+//! plus `session stop`/`session rename` -- parity with `prime-agent stop
+//! <agent>`/`rename <agent> <name>`, see `PARITY.md`) plus the two hidden
+//! entrypoints this binary spawns itself as (`__supervisor-main`,
+//! `__worker-main`).
 //!
-//! Hand-rolled, not `clap`: the surface is eight fixed subcommands with
+//! Hand-rolled, not `clap`: the surface is ten fixed subcommands with
 //! at most two positional/flag arguments each -- a dependency buys
 //! nothing here that fifty lines of matching doesn't already give
 //! directly, and this project's dependency floor (`platform`,
@@ -14,6 +16,33 @@ use std::path::PathBuf;
 
 use crate::error::{HarnessError, Result};
 use crate::worker::WorkerMode;
+
+/// Parity with `prime-agent --mode json`: a leading, global `--mode
+/// json|text` flag (before the subcommand) switches every public
+/// subcommand's rendering from this project's own human-readable text to
+/// raw `Response`/`SessionEvent` JSON lines -- see `client.rs`'s own doc
+/// comment for why this reuses the wire types directly rather than
+/// modeling `prime-agent`'s much richer `AgentSessionEvent` vocabulary
+/// (`packages/coding-agent/docs/json.md` in that repo), which assumes a
+/// streaming model/tool-execution pipeline this project doesn't have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    #[default]
+    Text,
+    Json,
+}
+
+impl OutputMode {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "text" => Ok(OutputMode::Text),
+            "json" => Ok(OutputMode::Json),
+            other => Err(usage(format!(
+                "unknown --mode value `{other}`, expected `text` or `json`"
+            ))),
+        }
+    }
+}
 
 pub enum Command {
     DaemonStart,
@@ -29,6 +58,13 @@ pub enum Command {
     SessionPrompt {
         session_id: String,
         text: String,
+    },
+    SessionStop {
+        session_id: String,
+    },
+    SessionRename {
+        session_id: String,
+        name: Option<String>,
     },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
@@ -50,7 +86,24 @@ fn usage(message: impl Into<String>) -> HarnessError {
     }
 }
 
-pub fn parse(args: &[String]) -> Result<Command> {
+/// Splits off a leading `--mode json|text`, if present, then parses the
+/// remaining args as an ordinary subcommand. `--mode` is recognized only
+/// in this leading position -- `__worker-main`'s own `--mode
+/// new|resume|recover` flag (a different flag, spelled the same,
+/// consumed by [`parse_worker_main`] instead) always appears after that
+/// hidden subcommand's own name, so the two can never collide.
+pub fn parse(args: &[String]) -> Result<(OutputMode, Command)> {
+    if args.first().map(String::as_str) == Some("--mode") {
+        let value = args
+            .get(1)
+            .ok_or_else(|| usage("--mode requires a value"))?;
+        let output_mode = OutputMode::parse(value)?;
+        return Ok((output_mode, parse_command(&args[2..])?));
+    }
+    Ok((OutputMode::default(), parse_command(args)?))
+}
+
+fn parse_command(args: &[String]) -> Result<Command> {
     let mut it = args.iter();
     let first = it.next().map(String::as_str);
     match first {
@@ -87,7 +140,30 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     text: text.join(" "),
                 })
             }
-            other => Err(usage(format!("expected `session new|attach|list|prompt`, got {other:?}"))),
+            Some("stop") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session stop` requires a session id"))?;
+                Ok(Command::SessionStop { session_id })
+            }
+            Some("rename") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session rename` requires a session id"))?;
+                let name = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session rename` requires a new name"))?;
+                Ok(Command::SessionRename {
+                    session_id,
+                    name: Some(name),
+                })
+            }
+            other => Err(usage(format!(
+                "expected `session new|attach|list|prompt|stop|rename`, got {other:?}"
+            ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
