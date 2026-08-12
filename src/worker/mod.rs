@@ -176,6 +176,11 @@ async fn handle_private_connection(
             conn.write_response(Context::Worker, &Response::SessionPromptAck { entry })
                 .await
         }
+        Request::SessionRename { name, .. } => {
+            session.lock().await.rename(name.clone()).await?;
+            conn.write_response(Context::Worker, &Response::SessionRenameAck { name })
+                .await
+        }
         Request::WorkerShutdown => {
             session.lock().await.mark_stopped().await?;
             conn.write_response(Context::Worker, &Response::WorkerShutdownAck)

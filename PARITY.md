@@ -50,9 +50,11 @@ environment:
   whole daemon (`daemon shutdown` already did this for every session at
   once; there was no single-session equivalent). Idempotent against an
   already-stopped or already-crashed session.
-- [ ] **`session rename <id> <name>`** -- parity with `prime-agent rename
-  <agent> <name>`. Needs a new request/response pair and a `state.json`
-  field update; no new process-lifecycle logic.
+- [x] **`session rename <id> <name>`** -- parity with `prime-agent rename
+  <agent> <name>`. Routed through the owning worker (like `session
+  prompt`), not written to `state.json` directly by the daemon, since the
+  running worker is `state`'s one owner and would otherwise clobber a
+  direct write on its next periodic `write_state`.
 - [ ] **Richer `session list`/`daemon status` output** -- `prime-agent`'s
   `agents`/`list [--all]` surface worker pid, generation, and idle/running
   state per agent; this project's `SessionSummary` currently omits

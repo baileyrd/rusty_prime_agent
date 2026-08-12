@@ -199,6 +199,10 @@ impl Supervisor {
             Request::SessionStop { session_id } => {
                 self.handle_session_stop(&mut conn, session_id).await
             }
+            Request::SessionRename { session_id, name } => {
+                self.handle_session_rename(&mut conn, session_id, name)
+                    .await
+            }
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -442,6 +446,32 @@ impl Supervisor {
             .await?
             .ok_or_else(|| {
                 HarnessError::protocol(Context::Worker, "worker closed before responding to prompt")
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_session_rename(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        name: Option<String>,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::SessionRename { session_id, name },
+            )
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(Context::Worker, "worker closed before responding to rename")
             })?;
         conn.write_response(Context::Daemon, &response).await
     }

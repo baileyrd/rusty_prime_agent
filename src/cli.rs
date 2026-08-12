@@ -1,10 +1,11 @@
 //! Argument parsing and dispatch for the public CLI surface (Required
 //! Behavior: `daemon start/status/shutdown`, `session new/attach/list`,
-//! plus `session stop` -- parity with `prime-agent stop <agent>`, see
-//! `PARITY.md`) plus the two hidden entrypoints this binary spawns itself
-//! as (`__supervisor-main`, `__worker-main`).
+//! plus `session stop`/`session rename` -- parity with `prime-agent stop
+//! <agent>`/`rename <agent> <name>`, see `PARITY.md`) plus the two hidden
+//! entrypoints this binary spawns itself as (`__supervisor-main`,
+//! `__worker-main`).
 //!
-//! Hand-rolled, not `clap`: the surface is nine fixed subcommands with
+//! Hand-rolled, not `clap`: the surface is ten fixed subcommands with
 //! at most two positional/flag arguments each -- a dependency buys
 //! nothing here that fifty lines of matching doesn't already give
 //! directly, and this project's dependency floor (`platform`,
@@ -33,6 +34,10 @@ pub enum Command {
     },
     SessionStop {
         session_id: String,
+    },
+    SessionRename {
+        session_id: String,
+        name: Option<String>,
     },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
@@ -98,8 +103,22 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     .ok_or_else(|| usage("`session stop` requires a session id"))?;
                 Ok(Command::SessionStop { session_id })
             }
+            Some("rename") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session rename` requires a session id"))?;
+                let name = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session rename` requires a new name"))?;
+                Ok(Command::SessionRename {
+                    session_id,
+                    name: Some(name),
+                })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename`, got {other:?}"
             ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),

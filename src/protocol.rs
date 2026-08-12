@@ -62,6 +62,15 @@ pub enum Request {
     SessionStop {
         session_id: String,
     },
+    /// Parity with `prime-agent rename <agent> <name>`. Valid on both
+    /// transports: the public request is forwarded to the owning
+    /// worker's private connection unchanged, the same way
+    /// `SessionPrompt` is -- `name: None` clears a session's display
+    /// name back to unnamed.
+    SessionRename {
+        session_id: String,
+        name: Option<String>,
+    },
     /// Private transport only: supervisor -> worker, asking it to persist
     /// its final state and exit cleanly (used by `daemon shutdown` and
     /// `SessionStop`).
@@ -107,6 +116,9 @@ pub enum Response {
     /// implying a worker was just torn down.
     SessionStopAck {
         already_stopped: bool,
+    },
+    SessionRenameAck {
+        name: Option<String>,
     },
     WorkerShutdownAck,
 }

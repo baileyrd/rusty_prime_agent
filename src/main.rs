@@ -138,6 +138,9 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionStop { session_id } => {
             client::session_stop(&state_root, session_id).await
         }
+        cli::Command::SessionRename { session_id, name } => {
+            client::session_rename(&state_root, session_id, name).await
+        }
         cli::Command::SupervisorMain => daemon::run(state_root, exe_path).await,
         cli::Command::WorkerMain {
             session_id,

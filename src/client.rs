@@ -224,6 +224,26 @@ pub async fn session_stop(state_root: &Path, session_id: String) -> Result<()> {
     }
 }
 
+pub async fn session_rename(
+    state_root: &Path,
+    session_id: String,
+    name: Option<String>,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionRename { session_id, name },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionRenameAck { name } => {
+            println!("renamed to {}", name.as_deref().unwrap_or("-"));
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
 /// Response reads get a bounded timeout: a `connect()` that completed
 /// but whose peer is gone (e.g. a client racing a supervisor that was
 /// just force-killed -- the OS can briefly still complete a connect

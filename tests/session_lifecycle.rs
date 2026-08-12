@@ -154,6 +154,51 @@ fn session_stop_shuts_down_one_worker_without_touching_others() {
 }
 
 #[test]
+fn session_rename_updates_the_listed_name_and_survives_a_respawn() {
+    // Parity with `prime-agent rename <agent> <name>`.
+    let state_dir = common::TempDir::new("session-rename");
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new(state_dir.path(), Some("original-name"));
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("original-name"),
+        "session list should show the initial name, got: {listing}"
+    );
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "rename", &session_id, "renamed"],
+    );
+    common::assert_success("session rename", &out);
+    assert!(
+        common::stdout_string(&out).contains("renamed to renamed"),
+        "rename should echo the new name, got: {}",
+        common::stdout_string(&out)
+    );
+
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("renamed") && !listing.contains("original-name"),
+        "session list should reflect the new name, got: {listing}"
+    );
+
+    // The rename must be durable, not just an in-memory change on the
+    // still-running worker: stop the session (tearing the worker down),
+    // then resume it via a prompt and confirm the name survived the
+    // respawn from `state.json`.
+    common::session_stop(state_dir.path(), &session_id);
+    common::session_prompt(state_dir.path(), &session_id, "after rename and respawn");
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("renamed"),
+        "renamed name should survive a worker stop/respawn, got: {listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn unknown_session_attach_reports_a_conflict_not_a_crash() {
     let state_dir = common::TempDir::new("unknown-session");
     common::daemon_start(state_dir.path());
