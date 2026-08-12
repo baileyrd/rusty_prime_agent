@@ -4,11 +4,18 @@
 //! so `AgentSession` has something to call that proves the prompt ->
 //! response -> transcript -> event-stream pipeline works end to end.
 //!
-//! [`OllamaProvider`] is the one exception, per `PARITY.md`'s "real
+//! [`RustyProviderModel`] is the one exception, per `PARITY.md`'s "real
 //! `ModelProvider` backend" entry: a genuine, network-calling backend,
-//! opt-in via `RUSTY_PRIME_AGENT_PROVIDER=ollama` (`EchoProvider` stays
-//! the default), routed through the `rp_server` sidecar rather than
-//! calling Ollama directly -- see that module's own doc comment for why.
+//! opt-in per session via `session new --model provider/id` / `-p
+//! --model provider/id` (parity with `prime-agent --model provider/id`;
+//! `EchoProvider` stays the default when no `--model` is given), routed
+//! through the `rp_server` sidecar rather than calling any provider's API
+//! directly -- see that module's own doc comment for why. Despite the
+//! name, not Ollama-specific: `model` is the same `"provider/model"`
+//! string `rusty_provider`'s router itself uses (`"ollama/qwen2.5:0.5b"`,
+//! `"anthropic/claude-sonnet-5"`, `"openai/gpt-4o-mini"`, ...) -- this
+//! type is a thin HTTP client for whichever provider that string names,
+//! not a provider itself.
 
 use crate::error::{Context, HarnessError, Result};
 use crate::http_client;
@@ -35,25 +42,23 @@ impl ModelProvider for EchoProvider {
     }
 }
 
-/// Calls a running `rp-server` sidecar's `POST /v1/chat/completions`
-/// (parity with `prime-agent --provider`/`--model`, scoped here to
-/// Ollama specifically -- see `rp_server`'s own doc comment for the
-/// sidecar-process boundary this crosses). `model` is the
-/// `"provider/model"` string `rp-server`'s router expects, e.g.
-/// `"ollama/qwen2.5:0.5b"`.
+/// Calls a running `rp-server` sidecar's `POST /v1/chat/completions` --
+/// see `rp_server`'s own doc comment for the sidecar-process boundary
+/// this crosses. `model` is the `"provider/model"` string `rp-server`'s
+/// router expects, e.g. `"ollama/qwen2.5:0.5b"`, `"anthropic/claude-sonnet-5"`.
 #[derive(Debug, Clone)]
-pub struct OllamaProvider {
+pub struct RustyProviderModel {
     port: u16,
     model: String,
 }
 
-impl OllamaProvider {
+impl RustyProviderModel {
     pub fn new(port: u16, model: String) -> Self {
-        OllamaProvider { port, model }
+        RustyProviderModel { port, model }
     }
 }
 
-impl ModelProvider for OllamaProvider {
+impl ModelProvider for RustyProviderModel {
     fn respond<'a>(&'a mut self, prompt: &'a str) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let body = serde_json::json!({

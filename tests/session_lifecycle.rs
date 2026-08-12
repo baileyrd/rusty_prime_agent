@@ -72,6 +72,12 @@ fn session_new_prompt_attach_list_round_trip() {
         listing.contains(&format!("worker_pid={worker_pid}")),
         "session list should show the live worker's pid ({worker_pid}), got: {listing}"
     );
+    // Parity with prime-agent --model: a session created without --model
+    // uses EchoProvider, surfaced explicitly rather than left blank.
+    assert!(
+        listing.contains("model=echo"),
+        "a session created without --model should list as model=echo, got: {listing}"
+    );
 
     let lines = common::attach_lines(state_dir.path(), &session_id, 4, Duration::from_secs(5));
     let joined = lines.join("\n");
@@ -290,6 +296,34 @@ fn print_mode_starts_a_daemon_and_prints_just_the_reply() {
     let out = common::run(state_dir.path(), &["--print", "second", "call"]);
     common::assert_success("--print", &out);
     assert_eq!(common::stdout_string(&out), "echo: second call");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn session_new_with_model_fails_loudly_when_rp_server_is_unavailable() {
+    // CI has no `rp-server` binary on PATH (see `tests/ollama_provider.rs`
+    // for the real, manually-run end-to-end coverage that does). This
+    // test is the other half: `--model` must fail loudly here, not
+    // silently fall back to EchoProvider -- a caller who explicitly
+    // asked for a real backend should hear about it immediately if it
+    // can't come up.
+    let state_dir = common::TempDir::new("model-no-sidecar");
+    common::daemon_start(state_dir.path());
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "new", "--model", "ollama/qwen2.5:0.5b"],
+    );
+    assert!(
+        !out.status.success(),
+        "session new --model should fail when rp-server isn't reachable"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rp-server"),
+        "failure should mention rp-server, not a vague error, got: {stderr}"
+    );
 
     common::daemon_shutdown(state_dir.path());
 }

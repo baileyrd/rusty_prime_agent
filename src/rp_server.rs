@@ -1,24 +1,41 @@
 //! Sidecar lifecycle for [`rusty_provider`](https://github.com/baileyrd/rusty_provider)'s
-//! `rp-server` -- the OpenAI-compatible provider router `provider::OllamaProvider`
-//! talks to over HTTP, per `PARITY.md`'s "real `ModelProvider` backend"
-//! entry. Not a library dependency: `rp-server` is `rusty_provider`'s own
-//! axum/tokio HTTP server binary, built on the real `tokio` rather than
-//! this project's `rusty_tokio` -- embedding it as a library would mean
-//! two async runtimes competing in one process. Spawning it as a
-//! separate, HTTP-addressable process keeps the boundary the same shape
-//! as every other external thing this project already treats as "a
-//! service to call," and mirrors `worker::spawn`'s own detached-process
-//! pattern.
+//! `rp-server` -- the OpenAI-compatible provider router
+//! `provider::RustyProviderModel` talks to over HTTP, per `PARITY.md`'s
+//! "real `ModelProvider` backend" entry. Not a library dependency:
+//! `rp-server` is `rusty_provider`'s own axum/tokio HTTP server binary,
+//! built on the real `tokio` rather than this project's `rusty_tokio` --
+//! embedding it as a library would mean two async runtimes competing in
+//! one process. Spawning it as a separate, HTTP-addressable process keeps
+//! the boundary the same shape as every other external thing this
+//! project already treats as "a service to call," and mirrors
+//! `worker::spawn`'s own detached-process pattern.
 //!
-//! Owned by the supervisor, not each worker: `daemon::run` calls
-//! [`ensure_running`] once at startup (gated on `RUSTY_PRIME_AGENT_PROVIDER
-//! =ollama`; `EchoProvider` stays the default), guarded implicitly by
-//! `daemon.sock`'s own bind-exclusivity the same way `Supervisor` itself
-//! is a singleton per state root -- no separate lock needed. Each worker
-//! process (spawned separately, after the supervisor's own startup
-//! completes) reads the resulting port back via [`read_port`] rather than
-//! spawning its own sidecar, so N sessions share one `rp-server` instead
-//! of one each.
+//! Owned by the supervisor, not each worker: `daemon::Supervisor` calls
+//! [`ensure_running`] lazily, the first time any `SessionNew` (or a
+//! recovery respawn) actually needs a real model (`EchoProvider` stays
+//! the default and never touches this module at all). Guarded implicitly
+//! by `daemon.sock`'s own bind-exclusivity the same way `Supervisor`
+//! itself is a singleton per state root -- no separate lock needed, and
+//! [`ensure_running`] is itself idempotent (adopts an already-healthy
+//! sidecar rather than double-spawning) for the ordinary case of several
+//! sessions in a row each needing a real model. Each worker process
+//! (spawned separately) reads the resulting port back via [`read_port`]
+//! rather than spawning its own sidecar, so N sessions share one
+//! `rp-server` instead of one each.
+//!
+//! [`write_config`] activates a `[providers.*]` block for every provider
+//! this process's own environment has a real API key for
+//! (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+//! `GROQ_API_KEY`), plus `[providers.ollama]` unconditionally (Ollama
+//! needs no real key) -- `rusty_tokio::process::Command` inherits this
+//! process's full environment by default, so whichever of those vars the
+//! daemon was started with reach `rp-server` without this module having
+//! to forward them one at a time. A session's own `--model
+//! provider/model` string picks which of these `rp-server`'s router
+//! actually dispatches to per request; a provider with no key configured
+//! simply isn't a valid choice (`rp-server` itself reports that, as a
+//! 4xx from the chat-completions call, not something this module
+//! pre-validates).
 
 use std::path::Path;
 use std::time::Duration;
@@ -75,19 +92,45 @@ fn pick_free_port() -> Result<u16> {
         .map_err(|e| HarnessError::io(Context::Provider, None, e))
 }
 
+/// `(provider name, base_url, api_key_env)` for every non-Ollama backend
+/// this module knows how to activate, gated on that env var actually
+/// being set in this process's own environment -- see this module's own
+/// doc comment for why that's sufficient to reach the spawned
+/// `rp-server` too.
+const OPTIONAL_PROVIDERS: &[(&str, &str, &str)] = &[
+    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+    (
+        "anthropic",
+        "https://api.anthropic.com",
+        "ANTHROPIC_API_KEY",
+    ),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com",
+        "GEMINI_API_KEY",
+    ),
+    ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+];
+
 fn write_config(state_root: &Path, port: u16) -> Result<()> {
     let path = paths::provider_config_path(state_root);
-    let toml = format!(
-        "[server]\n\
-         host = \"127.0.0.1\"\n\
-         port = {port}\n\
-         \n\
-         [providers.ollama]\n\
-         kind = \"openai\"\n\
-         base_url = \"{}\"\n\
-         api_key_env = \"OLLAMA_API_KEY\"\n",
+    let mut toml = format!("[server]\nhost = \"127.0.0.1\"\nport = {port}\n");
+    for (name, base_url, api_key_env) in OPTIONAL_PROVIDERS {
+        if std::env::var_os(api_key_env).is_none() {
+            continue;
+        }
+        toml.push_str(&format!(
+            "\n[providers.{name}]\nkind = \"openai\"\nbase_url = \"{base_url}\"\napi_key_env = \"{api_key_env}\"\n"
+        ));
+    }
+    // Ollama unconditionally: it needs no real key, and this project's
+    // own OllamaProvider-shaped testing (`tests/ollama_provider.rs`)
+    // depends on it always being available regardless of which other
+    // providers happen to be configured.
+    toml.push_str(&format!(
+        "\n[providers.ollama]\nkind = \"openai\"\nbase_url = \"{}\"\napi_key_env = \"OLLAMA_API_KEY\"\n",
         ollama_base_url()
-    );
+    ));
     std::fs::write(&path, toml).map_err(|e| HarnessError::io(Context::Provider, Some(path), e))
 }
 
@@ -166,9 +209,9 @@ async fn wait_for_health(port: u16, timeout: Duration) -> Result<()> {
 
 /// Reads back the port [`ensure_running`] recorded, for a worker process
 /// (which never calls `ensure_running` itself -- see this module's own
-/// doc comment) constructing its own `OllamaProvider`. `None` if no
+/// doc comment) constructing its own `RustyProviderModel`. `None` if no
 /// sidecar has been started for this state root (the ordinary case when
-/// `RUSTY_PRIME_AGENT_PROVIDER` isn't `ollama`).
+/// no session has ever set a `model`).
 pub fn read_port(state_root: &Path) -> Option<u16> {
     read_state(state_root).map(|s| s.port)
 }

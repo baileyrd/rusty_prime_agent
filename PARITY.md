@@ -107,11 +107,28 @@ daemon/worker split rather than requiring the Python control environment:
   too tight for real (even small, CPU-only) model inference (~29s
   observed) -- `SessionPrompt`'s own response wait now uses a separate,
   much larger `PROMPT_RESPONSE_TIMEOUT` (120s) than every other request.
-  Environment variables: `RUSTY_PRIME_AGENT_PROVIDER` (`ollama`, unset
-  otherwise), `RUSTY_PRIME_AGENT_MODEL` (required in `ollama` mode, e.g.
-  `ollama/qwen2.5:0.5b`), `RUSTY_PRIME_AGENT_RP_SERVER_BIN` (default
-  `rp-server`, i.e. on `PATH`), `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL`
-  (default `http://127.0.0.1:11434/v1`).
+- [x] **Multi-provider selection, `session new --model provider/model` /
+  `-p --model provider/model`** -- parity with `prime-agent --model
+  provider/id`. Originally shipped as a single global
+  `RUSTY_PRIME_AGENT_PROVIDER=ollama` on/off switch; generalized to a
+  per-session `--model` flag once it was clear the same `rp-server`
+  sidecar already routes to whichever backend the `"provider/model"`
+  string names (`rp_server::write_config` now activates a
+  `[providers.*]` block for every provider this process has a real key
+  for -- `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/
+  `GROQ_API_KEY` -- plus `[providers.ollama]` unconditionally). `model`
+  is recorded in `SessionState` so a resume/recover respawn reconstructs
+  the same backend rather than re-resolving it from whatever the daemon's
+  current environment happens to say. `RUSTY_PRIME_AGENT_MODEL` remains
+  as a server-side default for callers that don't pass `--model`
+  explicitly. `provider::RustyProviderModel` (renamed from
+  `OllamaProvider`, since it addresses any configured backend, not just
+  Ollama) is the one `ModelProvider` impl this covers.
+  Environment variables: `RUSTY_PRIME_AGENT_MODEL` (default `--model`,
+  optional), `RUSTY_PRIME_AGENT_RP_SERVER_BIN` (default `rp-server`, i.e.
+  on `PATH`), `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL` (default
+  `http://127.0.0.1:11434/v1`), plus each provider's own real
+  `*_API_KEY` to activate it.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -143,7 +160,10 @@ not attempted here, and not silently implied by anything in
 - **The interactive TUI** and its editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`).
-- **Multi-provider auth, model catalog, thinking-level controls.**
+- **Model catalog listing, thinking-level controls.** (Multi-provider
+  *selection* itself -- `--model provider/model` -- is done; see the
+  medium-effort section above. `prime-agent model list`'s catalog browse
+  and `--thinking <level>` are not.)
 
 ## Process
 
