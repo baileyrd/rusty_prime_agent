@@ -50,6 +50,11 @@ pub enum Request {
         /// so a respawned worker (resume/recover) reconstructs the same
         /// backend without the caller having to repeat it.
         model: Option<String>,
+        /// Parity with `prime-agent --goal`: seeds this session's
+        /// persistent goal at creation time. `None` means no goal yet --
+        /// `Request::GoalUpdate`'s `Set` action is how a goal gets added
+        /// to (or replaced on) an already-existing session.
+        goal: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -100,6 +105,23 @@ pub enum Request {
     ScheduleCancel {
         session_id: String,
         schedule_id: String,
+    },
+    /// Parity with `prime-agent --goal`/`/goal`: mutates a session's
+    /// persistent goal. Valid on both transports, forwarded to the
+    /// owning worker unchanged, the same way `SessionRename` is -- a
+    /// goal is part of a session's mutable state, and the worker is that
+    /// state's one owner while it's running (see `SessionRename`'s own
+    /// doc comment for why a direct daemon-side write would race).
+    GoalUpdate {
+        session_id: String,
+        action: GoalAction,
+    },
+    /// Parity with `/goal`'s status display. Read-only, so answered
+    /// directly from the persisted `state.json` rather than round-
+    /// tripping through the worker -- the same reasoning `SessionList`
+    /// itself already uses.
+    GoalShow {
+        session_id: String,
     },
     /// Private transport only: supervisor -> worker, asking it to persist
     /// its final state and exit cleanly (used by `daemon shutdown` and
@@ -176,7 +198,53 @@ pub enum Response {
     ScheduleCancelAck {
         found: bool,
     },
+    GoalUpdateAck {
+        goal: Option<GoalState>,
+    },
+    GoalShow {
+        goal: Option<GoalState>,
+    },
     WorkerShutdownAck,
+}
+
+/// Parity with `prime-agent --goal`/`/goal`. `Clear` removes the goal
+/// entirely (back to `None`); `Pause`/`Resume`/`Complete` are no-ops
+/// (structurally valid, but leave the goal untouched) when there is no
+/// current goal to transition -- see `session::AgentSession::update_goal`'s
+/// own doc comment for why that's a deliberate choice, not an oversight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GoalAction {
+    /// Replaces any existing goal with a fresh `Active` one.
+    Set {
+        text: String,
+    },
+    Pause,
+    Resume,
+    Complete,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Completed,
+}
+
+/// A session's persistent goal (`SessionState::goal`) -- parity with
+/// `prime-agent`'s "keeps an objective and its progress active across
+/// turns until it is completed, paused, or cleared." Bounded-mode
+/// autonomous continuation itself (`--autonomous*`) is a separate,
+/// out-of-scope concern (`PARITY.md`) -- this type is just the durable
+/// state a future continuation policy would read, not that policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalState {
+    pub text: String,
+    pub status: GoalStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
 }
 
 /// One line of the attach event stream, after `SessionAttachStarted`.
@@ -252,6 +320,10 @@ pub struct SessionState {
     /// (as `None`, i.e. `EchoProvider`) rather than failing recovery.
     #[serde(default)]
     pub model: Option<String>,
+    /// See `GoalState`'s own doc comment. `#[serde(default)]` for the
+    /// same pre-existing-`state.json` reason `model` has it.
+    #[serde(default)]
+    pub goal: Option<GoalState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +345,8 @@ pub struct SessionSummary {
     /// See `Request::SessionNew::model`'s own doc comment. `None` means
     /// this session uses `EchoProvider`.
     pub model: Option<String>,
+    /// See `GoalState`'s own doc comment.
+    pub goal: Option<GoalState>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s

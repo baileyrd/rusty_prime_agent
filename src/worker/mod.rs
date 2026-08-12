@@ -67,6 +67,13 @@ pub struct WorkerArgs {
     /// for its whole lifetime even if the daemon's own environment
     /// changes across a restart.
     pub model: Option<String>,
+    /// Parity with `prime-agent --goal`: only meaningful for
+    /// `WorkerMode::New` (a fresh session seeding its own goal at
+    /// creation) -- `daemon::Supervisor::ensure_worker_running` never
+    /// supplies one for `Resume`/`Recover`, since a session's goal by
+    /// then already lives in its own persisted `state.json`, the same
+    /// way `name`/`model` do.
+    pub goal: Option<String>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -109,6 +116,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 args.session_id.clone(),
                 args.name.clone(),
                 args.model.clone(),
+                args.goal.clone(),
                 provider,
                 tool_runtime,
             )
@@ -218,6 +226,11 @@ async fn handle_private_connection(
             conn.write_response(Context::Worker, &Response::SessionRenameAck { name })
                 .await
         }
+        Request::GoalUpdate { action, .. } => {
+            let goal = session.lock().await.update_goal(action).await?;
+            conn.write_response(Context::Worker, &Response::GoalUpdateAck { goal })
+                .await
+        }
         Request::WorkerShutdown => {
             session.lock().await.mark_stopped().await?;
             conn.write_response(Context::Worker, &Response::WorkerShutdownAck)
@@ -258,6 +271,7 @@ pub async fn spawn(
     mode: WorkerMode,
     name: Option<String>,
     model: Option<String>,
+    goal: Option<String>,
 ) -> Result<u32> {
     use rusty_tokio::process::{Command, Stdio};
 
@@ -277,6 +291,9 @@ pub async fn spawn(
     }
     if let Some(model) = &model {
         cmd.arg("--model").arg(model);
+    }
+    if let Some(goal) = &goal {
+        cmd.arg("--goal").arg(goal);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

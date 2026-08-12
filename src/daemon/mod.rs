@@ -202,6 +202,10 @@ impl Supervisor {
             mode,
             state.name.clone(),
             state.model.clone(),
+            // Never re-seeded on revival -- a session's goal already
+            // lives in its own persisted `state.json` by the time it's
+            // resumed/recovered, the same as `name`/`model`.
+            None,
         )
         .await?;
         worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await?;
@@ -217,8 +221,8 @@ impl Supervisor {
             Request::Ping => conn.write_response(Context::Daemon, &Response::Pong).await,
             Request::DaemonStatus => self.handle_daemon_status(&mut conn).await,
             Request::DaemonShutdown => self.handle_daemon_shutdown(&mut conn).await,
-            Request::SessionNew { name, model } => {
-                self.handle_session_new(&mut conn, name, model).await
+            Request::SessionNew { name, model, goal } => {
+                self.handle_session_new(&mut conn, name, model, goal).await
             }
             Request::SessionList => self.handle_session_list(&mut conn).await,
             Request::SessionAttach { session_id } => {
@@ -253,6 +257,10 @@ impl Supervisor {
                 self.handle_schedule_cancel(&mut conn, session_id, schedule_id)
                     .await
             }
+            Request::GoalUpdate { session_id, action } => {
+                self.handle_goal_update(&mut conn, session_id, action).await
+            }
+            Request::GoalShow { session_id } => self.handle_goal_show(&mut conn, session_id).await,
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -320,6 +328,7 @@ impl Supervisor {
         conn: &mut LineStream,
         name: Option<String>,
         model: Option<String>,
+        goal: Option<String>,
     ) -> Result<()> {
         // An explicit `--model` always wins; RUSTY_PRIME_AGENT_MODEL is
         // only a fallback default for callers that don't pass one (e.g.
@@ -351,6 +360,7 @@ impl Supervisor {
             WorkerMode::New,
             name,
             model,
+            goal,
         )
         .await
         {
@@ -683,6 +693,50 @@ impl Supervisor {
                 HarnessError::protocol(Context::Worker, "worker closed before responding to rename")
             })?;
         conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_goal_update(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        action: crate::protocol::GoalAction,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(Context::Worker, &Request::GoalUpdate { session_id, action })
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to goal update",
+                )
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_goal_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        conn.write_response(Context::Daemon, &Response::GoalShow { goal: state.goal })
+            .await
     }
 }
 

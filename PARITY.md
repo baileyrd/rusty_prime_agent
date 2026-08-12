@@ -153,6 +153,21 @@ daemon/worker split rather than requiring the Python control environment:
   pulled in for this). A recurring entry that's overdue by more than one
   interval (e.g. the daemon was down a while) skips forward to the next
   future fire time rather than firing a burst of catch-up prompts.
+- [x] **Persistent goals** (`session new --goal <text>`, `session goal
+  (set <text...>|show|pause|resume|complete|clear) <id>`, parity with
+  `prime-agent --goal`/`/goal`). A durable `GoalState { text, status:
+  Active|Paused|Completed, created_at_ms, updated_at_ms }` on
+  `SessionState.goal`, mutated through the worker the same way `session
+  rename` is (never written directly by the daemon, to avoid racing the
+  worker's own `state.json` writes) except for the read-only `goal show`,
+  which the daemon answers directly from disk like other catalog-style
+  reads. `pause`/`resume`/`complete` are deliberate no-ops (not errors)
+  when there is no current goal to transition; `set` always replaces
+  whatever was there, `Active`, even over a `Completed` one. This is
+  purely the durable state a future bounded-autonomous-continuation
+  policy would read -- it does not itself make the agent act on the goal;
+  see "Heartbeats, bounded autonomous mode" below for that remaining
+  piece.
 
 ## Out of scope for this project's current shape
 
@@ -170,9 +185,10 @@ not attempted here, and not silently implied by anything in
 - **The Continual Harness** (`/refine`, durable supplemental
   prompts/memories/skill descriptions with rollback).
 - **Skills, extensions, prompt templates, themes, MCP integrations.**
-- **Heartbeats, persistent goals, bounded autonomous mode** (`/heartbeat`,
-  `--goal`, `--autonomous*`). (Scheduling itself -- `prime-agent
-  schedule` -- is done; see the medium-effort section above.)
+- **Heartbeats, bounded autonomous mode** (`/heartbeat`, `--autonomous*`).
+  (Scheduling itself -- `prime-agent schedule` -- and persistent goals --
+  `prime-agent --goal`/`/goal` -- are both done; see the medium-effort
+  section above.)
 - **The interactive TUI** and its editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`).
