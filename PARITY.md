@@ -55,11 +55,12 @@ environment:
   prompt`), not written to `state.json` directly by the daemon, since the
   running worker is `state`'s one owner and would otherwise clobber a
   direct write on its next periodic `write_state`.
-- [ ] **Richer `session list`/`daemon status` output** -- `prime-agent`'s
-  `agents`/`list [--all]` surface worker pid, generation, and idle/running
-  state per agent; this project's `SessionSummary` currently omits
-  `worker_pid` and `generation` from the wire type even though
-  `SessionState` already has both.
+- [x] **Richer `session list` output** -- `prime-agent`'s `agents`/`list
+  [--all]` surface worker pid and generation per agent; `SessionSummary`
+  now carries both (it already had `status`, which doubles as the
+  idle/running/crashed signal `--all` shows). `daemon status`'s own
+  `sessions_active` count was left as-is -- it's a daemon-wide aggregate,
+  not a per-session listing, so there was nothing to enrich there.
 - [ ] **`--print`/`-p` one-shot mode** -- `prime-agent -p "..."` prints a
   response and exits instead of entering the (nonexistent, for this
   project) interactive TUI. This project's CLI is already one-shot for

@@ -61,6 +61,17 @@ fn session_new_prompt_attach_list_round_trip() {
         listing.contains("integration-test"),
         "listed session should show its name, got: {listing}"
     );
+    // Parity with prime-agent's `agents`/`list` surface, which shows
+    // each agent's worker process and generation.
+    assert!(
+        listing.contains("generation=1"),
+        "a freshly created session's worker is generation 1, got: {listing}"
+    );
+    let worker_pid = common::worker_pid(state_dir.path(), &session_id);
+    assert!(
+        listing.contains(&format!("worker_pid={worker_pid}")),
+        "session list should show the live worker's pid ({worker_pid}), got: {listing}"
+    );
 
     let lines = common::attach_lines(state_dir.path(), &session_id, 4, Duration::from_secs(5));
     let joined = lines.join("\n");

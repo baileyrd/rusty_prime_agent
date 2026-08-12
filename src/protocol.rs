@@ -200,4 +200,13 @@ pub struct SessionSummary {
     pub status: SessionStatus,
     pub last_sequence: u64,
     pub updated_at_ms: u64,
+    /// The recorded worker pid, as last written by whichever worker
+    /// process currently (or most recently) owned this session --
+    /// `None` only for a session whose `state.json` predates this field
+    /// (never true for a session created by this project's own `session
+    /// new`, which always records one). Parity with `prime-agent
+    /// agents`/`list`, which surface each agent's worker process.
+    pub worker_pid: Option<u32>,
+    /// See `SessionState::generation`'s own doc comment.
+    pub generation: u64,
 }

@@ -136,9 +136,19 @@ pub async fn session_list(state_root: &Path) -> Result<()> {
                     SessionStatus::Crashed => "crashed",
                 };
                 let name = s.name.as_deref().unwrap_or("-");
+                let worker_pid = s
+                    .worker_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{}\t{}\t{}\tturns={}\tupdated_at_ms={}",
-                    s.session_id, status, name, s.last_sequence, s.updated_at_ms
+                    "{}\t{}\t{}\tturns={}\tgeneration={}\tworker_pid={}\tupdated_at_ms={}",
+                    s.session_id,
+                    status,
+                    name,
+                    s.last_sequence,
+                    s.generation,
+                    worker_pid,
+                    s.updated_at_ms
                 );
             }
             Ok(())
