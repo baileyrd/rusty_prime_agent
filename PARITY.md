@@ -218,8 +218,8 @@ daemon/worker split rather than requiring the Python control environment:
   memories, skill descriptions, and reusable subagent specifications as
   durable state that Prime Agent can refine through small,
   evidence-backed updates"). Subagent specifications are left out --
-  they're tied to recursive subagents, a separate out-of-scope concern
-  below -- so this covers prompts/memories/skill descriptions only.
+  they're tied to recursive subagents, a separate item below -- so this
+  covers prompts/memories/skill descriptions only.
   `HarnessState { notes, history }` on `SessionState.harness`, mutated
   through the worker like `goal`/`schedule`; every successful `Add` or
   `Rollback` appends the resulting `notes` to `history` as a fresh
@@ -236,20 +236,47 @@ daemon/worker split rather than requiring the Python control environment:
   call that skips the transcript, and adding one for this alone wasn't
   worth it, so the "evidence" behind a refinement stays inline and
   auditable instead of happening invisibly.
+- [x] **Recursive subagents** (`session spawn <parent-id> [--model
+  PROVIDER/MODEL] [--name NAME] <task text...>`, `session children
+  <id>`, `session message <from-id> <to-id> <text...>`, bounded,
+  non-Python parity with `prime-agent`'s `rlm(...)`/`receiver_role=
+  "parent"/"child"`, `packages/coding-agent/docs/rlm.md`). The
+  underlying mechanism `rlm(...)` actually uses -- "the TypeScript host
+  creates a normal child `AgentSession` with an independent context and
+  session directory" -- is exactly `session new` plus a recorded
+  `parent_id`, already fully within reach; only the Python/IPython
+  invocation surface (`rlm(...)` called from kernel code) is out of
+  scope. `session spawn` creates the child (inheriting the parent's
+  `model` unless `--model` overrides it, parity with "the child
+  inherits the parent model... unless the call requests another") and
+  enqueues the task text as a near-immediate one-shot schedule rather
+  than a blocking `SessionPrompt` -- parity with `rlm(...)` "returns
+  immediately after task admission... never waits for or returns the
+  child's answer", reusing the daemon's existing background
+  schedule-firing loop as the async dispatch this project already has
+  instead of inventing a new one. `session message` is the analog of
+  `agent_message.send`: only a session's own parent or one of its own
+  children is a valid target, validated client-side against `session
+  list`'s `parent_id` field (this project's whole trust model is a
+  single local caller, so this doesn't need server-side enforcement of
+  its own) and delivered as an ordinary, visible `SessionPrompt`.
+  Skills/tools/retry-policy inheritance (the rest of that same
+  `rlm(...)` sentence) don't apply here -- this project's tool runtime
+  is `NoopToolRuntime` and it has no retry-policy concept to inherit.
 
 ## Out of scope for this project's current shape
 
 Architecturally significant `prime-agent` capabilities that would each
-require a genuinely new subsystem (a Python control environment,
-cross-agent messaging) -- not attempted here, and not silently implied
-by anything in `ARCHITECTURE.md`'s "Known gaps" section:
+require a genuinely new subsystem (a Python control environment) -- not
+attempted here, and not silently implied by anything in
+`ARCHITECTURE.md`'s "Known gaps" section:
 
 - **The RLM programming model** (persistent IPython kernel,
   `tool_runtime::ToolRuntime`'s one deliberate open seam is exactly this
-  boundary, but Phase 1 backs it with `NoopToolRuntime` only).
-- **Recursive subagents** (`rlm(...)`, agent-to-agent messaging,
-  `receiver_role="parent"/"child"`; the reusable-subagent-specification
-  half of the Continual Harness below is the same boundary).
+  boundary, but Phase 1 backs it with `NoopToolRuntime` only; recursive
+  subagents' own Python invocation surface, `rlm(...)` itself, is the
+  same boundary -- see the medium-effort section above for the
+  session-level mechanism underneath it, which is done).
 - **Skills, extensions, themes, MCP integrations.** (Prompt templates --
   the plain-text, non-Python half of `prime-agent skills.md`'s surface --
   are done; see the medium-effort section above. Real "skills" stay out

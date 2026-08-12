@@ -84,6 +84,7 @@ pub fn scan(state_root: &Path) -> Result<Vec<SessionSummary>> {
             generation: state.generation,
             model: state.model,
             goal: state.goal,
+            parent_id: state.parent_id,
         });
     }
     summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));

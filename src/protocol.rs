@@ -55,6 +55,14 @@ pub enum Request {
         /// `Request::GoalUpdate`'s `Set` action is how a goal gets added
         /// to (or replaced on) an already-existing session.
         goal: Option<String>,
+        /// Parity with `prime-agent`'s recursive subagents (`rlm(...)`,
+        /// `receiver_role="parent"/"child"`): set only by `client::
+        /// session_spawn`'s own composition (`session spawn`), never by
+        /// an ordinary `session new` -- see that command's own doc
+        /// comment for why a plain top-level session has no parent to
+        /// name. Fixed for this session's whole lifetime, same as
+        /// `model`/`goal`.
+        parent_id: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -343,7 +351,14 @@ pub enum SessionEvent {
     /// the durable recovery baseline"), sent once, first: the full
     /// transcript replayed from disk plus the current session state.
     Snapshot {
-        state: SessionState,
+        // Boxed: `SessionState` (now carrying `goal`/`harness`/
+        // `parent_id` on top of its original fields) makes this variant
+        // more than 5x the size of `SessionEvent`'s next-largest one
+        // (`Turn`), which clippy's `large_enum_variant` flags -- every
+        // `SessionEvent` on the wire pays that difference whether it's a
+        // `Snapshot` or not, since an enum's stack size is its largest
+        // variant's.
+        state: Box<SessionState>,
         transcript: Vec<TranscriptEntry>,
     },
     /// One new transcript entry appended after the snapshot was taken.
@@ -416,6 +431,11 @@ pub struct SessionState {
     /// same pre-existing-`state.json` reason `model`/`goal` have it.
     #[serde(default)]
     pub harness: HarnessState,
+    /// See `Request::SessionNew::parent_id`'s own doc comment.
+    /// `#[serde(default)]` for the same pre-existing-`state.json` reason
+    /// `model`/`goal`/`harness` have it.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +459,11 @@ pub struct SessionSummary {
     pub model: Option<String>,
     /// See `GoalState`'s own doc comment.
     pub goal: Option<GoalState>,
+    /// See `Request::SessionNew::parent_id`'s own doc comment. `session
+    /// children <id>`/`session spawn`'s model-inheritance both read this
+    /// straight off `session list` rather than needing a dedicated
+    /// request.
+    pub parent_id: Option<String>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s
