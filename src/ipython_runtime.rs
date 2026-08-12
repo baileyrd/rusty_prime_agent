@@ -377,12 +377,11 @@ impl ToolRuntime for IpythonKernelRuntime {
                                 content.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
                             result = Some(format!("{ename}: {evalue}"));
                         }
-                        "status" => {
+                        "status"
                             if content.get("execution_state").and_then(|v| v.as_str())
-                                == Some("idle")
-                            {
-                                break;
-                            }
+                                == Some("idle") =>
+                        {
+                            break;
                         }
                         _ => {}
                     }
