@@ -275,6 +275,19 @@ daemon/worker split rather than requiring the Python control environment:
   out of scope below; this is the bare loop underneath all of that, the
   same "extract the tractable session-level mechanism, leave the rich
   surface out" move as `session spawn`/prompt templates above.
+- [x] **Model/provider catalog listing** (`harness model list`), the
+  provider tier of `prime-agent model list`'s catalog browse: which of
+  the known providers (`openai`/`anthropic`/`gemini`/`groq`/`ollama`,
+  the exact same set `rp_server::write_config` already activates
+  `[providers.*]` blocks for) this process's own environment actually
+  configures right now, read straight off the same env-var check
+  `write_config` itself uses (`rp_server::known_providers`) so this can
+  never drift from what a real `session new --model <name>/...` would
+  be able to reach. A pure environment-variable check -- no daemon
+  connection, no network call. Deliberately **not** a full per-model
+  catalog (real model IDs within each provider): that needs a live
+  query against each provider's own API, untestable in CI (no real API
+  keys there) and out of scope below.
 
 ## Out of scope for this project's current shape
 
@@ -308,10 +321,15 @@ attempted here, and not silently implied by anything in
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
   read-a-line/send-a-prompt loop underneath the TUI itself is done --
   `session repl`, see the medium-effort section above.)
-- **Model catalog listing, thinking-level controls.** (Multi-provider
-  *selection* itself -- `--model provider/model` -- is done; see the
-  medium-effort section above. `prime-agent model list`'s catalog browse
-  and `--thinking <level>` are not.)
+- **`--thinking <level>`, and per-model catalog entries within `harness
+  model list`.** (Multi-provider *selection* -- `--model provider/
+  model` -- and the provider tier of `prime-agent model list`'s catalog
+  browse -- `harness model list`, which providers are configured -- are
+  both done; see the medium-effort section above. Real per-model IDs
+  within each provider need a live query against that provider's own
+  API, and `--thinking <level>` needs `rp-server`'s actual wire contract
+  for it -- this session has no access to `rusty_provider`'s source to
+  verify either, so both stay unattempted rather than guessed at.)
 
 ## Process
 

@@ -598,6 +598,30 @@ async fn send_prompt(
     }
 }
 
+/// `harness model list` -- bounded parity with `prime-agent model
+/// list`'s catalog browse: which providers this process's own
+/// environment configures, not each one's actual per-model IDs (see
+/// `rp_server::known_providers`'s own doc comment for why). A pure
+/// environment-variable check, no daemon connection at all -- same
+/// reasoning as `prompt_template_list` below.
+pub async fn model_list(mode: OutputMode) -> Result<()> {
+    let providers = crate::rp_server::known_providers();
+    match mode {
+        OutputMode::Json => print_json(&providers),
+        OutputMode::Text => {
+            for p in &providers {
+                let status = if p.configured {
+                    "configured"
+                } else {
+                    "not configured"
+                };
+                println!("{}\t{status}", p.name);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `harness prompt-template list` -- a pure local directory scan, no
 /// daemon connection at all (unlike almost every other subcommand in
 /// this file).

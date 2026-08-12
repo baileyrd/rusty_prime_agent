@@ -112,6 +112,41 @@ const OPTIONAL_PROVIDERS: &[(&str, &str, &str)] = &[
     ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
 ];
 
+/// One entry of the provider catalog (`harness model list`) -- bounded
+/// parity with `prime-agent model list`'s catalog browse: which
+/// backends `write_config` would activate given this process's own
+/// environment, not each one's actual per-model IDs. Listing real model
+/// IDs needs a live query against each provider's own API (`GET /v1/
+/// models` or equivalent) -- untestable in CI (no real API keys there)
+/// and not attempted here, see `PARITY.md`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderInfo {
+    pub name: String,
+    pub configured: bool,
+}
+
+/// Every provider name `write_config` could ever activate, plus whether
+/// this process's own environment configures it right now -- exactly
+/// the same `OPTIONAL_PROVIDERS`/env-var check `write_config` itself
+/// uses, so this can never drift from what a real `session new --model
+/// <name>/...` would actually be able to reach. Ollama is always
+/// `configured: true`: it needs no real key (see `write_config`'s own
+/// doc comment).
+pub fn known_providers() -> Vec<ProviderInfo> {
+    let mut providers: Vec<ProviderInfo> = OPTIONAL_PROVIDERS
+        .iter()
+        .map(|(name, _base_url, api_key_env)| ProviderInfo {
+            name: name.to_string(),
+            configured: std::env::var_os(api_key_env).is_some(),
+        })
+        .collect();
+    providers.push(ProviderInfo {
+        name: "ollama".to_string(),
+        configured: true,
+    });
+    providers
+}
+
 fn write_config(state_root: &Path, port: u16) -> Result<()> {
     let path = paths::provider_config_path(state_root);
     let mut toml = format!("[server]\nhost = \"127.0.0.1\"\nport = {port}\n");

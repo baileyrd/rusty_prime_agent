@@ -222,6 +222,7 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRepl { session_id } => {
             client::session_repl(&state_root, session_id, output_mode).await
         }
+        cli::Command::ModelList => client::model_list(output_mode).await,
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }
