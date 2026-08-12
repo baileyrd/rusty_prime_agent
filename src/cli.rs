@@ -58,6 +58,9 @@ pub enum Command {
         /// Parity with `prime-agent --goal`; see
         /// `Request::SessionNew::goal`'s own doc comment.
         goal: Option<String>,
+        /// `--thinking low|medium|high`; see
+        /// `Request::SessionNew::thinking`'s own doc comment.
+        thinking: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -212,6 +215,7 @@ pub enum Command {
         model: Option<String>,
         goal: Option<String>,
         parent_id: Option<String>,
+        thinking: Option<String>,
     },
 }
 
@@ -282,7 +286,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 let name = scan_named_flag(&rest, "--name")?;
                 let model = scan_named_flag(&rest, "--model")?;
                 let goal = scan_named_flag(&rest, "--goal")?;
-                Ok(Command::SessionNew { name, model, goal })
+                let thinking = scan_named_flag(&rest, "--thinking")?
+                    .map(|v| parse_thinking_level(&v))
+                    .transpose()?;
+                Ok(Command::SessionNew {
+                    name,
+                    model,
+                    goal,
+                    thinking,
+                })
             }
             Some("attach") => {
                 let session_id = it
@@ -455,6 +467,19 @@ fn parse_command(args: &[String]) -> Result<Command> {
 /// `flag <value>`. A not-found flag legitimately means "not given," not
 /// an error -- `session new`'s only caller has nothing else positional
 /// to worry about consuming by mistake.
+/// `--thinking low|medium|high`: validated against `rp-server`'s own
+/// `ReasoningConfig.effort` vocabulary (OpenAI's `effort` convention) so a
+/// typo fails loudly at parse time instead of silently reaching
+/// `rp-server` as an unrecognized value.
+fn parse_thinking_level(value: &str) -> Result<String> {
+    match value {
+        "low" | "medium" | "high" => Ok(value.to_string()),
+        other => Err(usage(format!(
+            "unknown --thinking value `{other}`, expected `low`, `medium`, or `high`"
+        ))),
+    }
+}
+
 fn scan_named_flag(rest: &[&String], flag: &str) -> Result<Option<String>> {
     for (i, arg) in rest.iter().enumerate() {
         if arg.as_str() == flag {
@@ -732,6 +757,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut model = None;
     let mut goal = None;
     let mut parent_id = None;
+    let mut thinking = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -780,6 +806,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--thinking" => {
+                thinking = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--thinking requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -791,5 +824,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         model,
         goal,
         parent_id,
+        thinking,
     })
 }

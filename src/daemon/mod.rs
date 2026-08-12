@@ -209,6 +209,10 @@ impl Supervisor {
                 // `model`.
                 goal: None,
                 parent_id: None,
+                // `thinking` follows `model`'s "always supplied"
+                // treatment (see `WorkerArgs::thinking`'s doc comment) --
+                // re-read from persisted state, not re-seeded.
+                thinking: state.thinking.clone(),
             },
         )
         .await?;
@@ -230,8 +234,9 @@ impl Supervisor {
                 model,
                 goal,
                 parent_id,
+                thinking,
             } => {
-                self.handle_session_new(&mut conn, name, model, goal, parent_id)
+                self.handle_session_new(&mut conn, name, model, goal, parent_id, thinking)
                     .await
             }
             Request::SessionList => self.handle_session_list(&mut conn).await,
@@ -347,6 +352,7 @@ impl Supervisor {
         model: Option<String>,
         goal: Option<String>,
         parent_id: Option<String>,
+        thinking: Option<String>,
     ) -> Result<()> {
         // An explicit `--model` always wins; RUSTY_PRIME_AGENT_MODEL is
         // only a fallback default for callers that don't pass one (e.g.
@@ -395,6 +401,7 @@ impl Supervisor {
                 model,
                 goal,
                 parent_id,
+                thinking,
             },
         )
         .await

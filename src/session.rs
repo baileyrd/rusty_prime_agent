@@ -112,6 +112,7 @@ pub struct NewSessionMeta {
     pub model: Option<String>,
     pub goal: Option<String>,
     pub parent_id: Option<String>,
+    pub thinking: Option<String>,
 }
 
 impl AgentSession {
@@ -129,6 +130,7 @@ impl AgentSession {
             model,
             goal: goal_text,
             parent_id,
+            thinking,
         } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -156,6 +158,7 @@ impl AgentSession {
             goal,
             harness: HarnessState::default(),
             parent_id,
+            thinking,
         };
         let session = AgentSession {
             state,

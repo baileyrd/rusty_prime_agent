@@ -50,6 +50,9 @@ an unnamed session, prompts it once, and prints just the reply.
 By default every session uses a built-in echo provider (no model, no
 network). Point a session at a real model with `--model
 <provider>/<model>` (see [Model providers](#model-providers) below).
+Add `--thinking low|medium|high` to request a reasoning/thinking budget
+from that model (parity with `prime-agent --thinking <level>`; no effect
+without `--model`, since `EchoProvider` has no concept of it).
 
 ## Global flags
 
@@ -70,7 +73,7 @@ harness daemon shutdown              # gracefully stops every worker, then exits
 ### Sessions
 
 ```sh
-harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT]
+harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>
