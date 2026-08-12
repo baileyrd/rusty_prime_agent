@@ -12,40 +12,34 @@ fn goal_set_show_and_clear_round_trip() {
 
     let session_id = common::session_new(state_dir.path(), None);
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "show", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "show", &session_id]);
     common::assert_success("session goal show (none yet)", &out);
     assert_eq!(common::stdout_string(&out), "no goal");
 
     let out = common::run(
         state_dir.path(),
         &[
-            "session", "goal", "set", &session_id, "ship", "the", "thing",
+            "session",
+            "goal",
+            "set",
+            &session_id,
+            "ship",
+            "the",
+            "thing",
         ],
     );
     common::assert_success("session goal set", &out);
     assert_eq!(common::stdout_string(&out), "active\tship the thing");
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "show", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "show", &session_id]);
     common::assert_success("session goal show", &out);
     assert_eq!(common::stdout_string(&out), "active\tship the thing");
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "clear", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "clear", &session_id]);
     common::assert_success("session goal clear", &out);
     assert_eq!(common::stdout_string(&out), "no goal");
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "show", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "show", &session_id]);
     common::assert_success("session goal show (after clear)", &out);
     assert_eq!(common::stdout_string(&out), "no goal");
 
@@ -66,10 +60,7 @@ fn goal_pause_resume_and_complete_transition_status() {
     common::assert_success("session goal set", &out);
     assert_eq!(common::stdout_string(&out), "active\twrite tests");
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "pause", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "pause", &session_id]);
     common::assert_success("session goal pause", &out);
     assert_eq!(common::stdout_string(&out), "paused\twrite tests");
 
@@ -119,10 +110,7 @@ fn session_new_seeds_a_goal_via_flag() {
     let session_id = common::stdout_string(&out);
     assert!(!session_id.is_empty());
 
-    let out = common::run(
-        state_dir.path(),
-        &["session", "goal", "show", &session_id],
-    );
+    let out = common::run(state_dir.path(), &["session", "goal", "show", &session_id]);
     common::assert_success("session goal show", &out);
     assert_eq!(common::stdout_string(&out), "active\tseeded goal");
 
