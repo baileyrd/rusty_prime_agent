@@ -262,6 +262,39 @@ fn mode_json_emits_raw_response_and_event_lines() {
 }
 
 #[test]
+fn print_mode_starts_a_daemon_and_prints_just_the_reply() {
+    // Parity with `prime-agent -p`: unlike every other subcommand, this
+    // must work without a prior `daemon start` -- it starts one
+    // transparently -- and its output is just the reply text, no
+    // session id, no daemon-startup noise, no `[seq] role:` prefix.
+    let state_dir = common::TempDir::new("print-mode");
+
+    let out = common::run(state_dir.path(), &["-p", "hello", "from", "print", "mode"]);
+    common::assert_success("-p", &out);
+    assert_eq!(
+        common::stdout_string(&out),
+        "echo: hello from print mode",
+        "print mode should output only the reply text"
+    );
+
+    // The session it created is not ephemeral -- it stays listed, same
+    // as a `session new`-created one.
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("active"),
+        "the session print mode created should still be listed, got: {listing}"
+    );
+
+    // A daemon is now running (print mode started it); a second
+    // invocation must reuse it rather than erroring or double-spawning.
+    let out = common::run(state_dir.path(), &["--print", "second", "call"]);
+    common::assert_success("--print", &out);
+    assert_eq!(common::stdout_string(&out), "echo: second call");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn unknown_session_attach_reports_a_conflict_not_a_crash() {
     let state_dir = common::TempDir::new("unknown-session");
     common::daemon_start(state_dir.path());

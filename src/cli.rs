@@ -1,11 +1,11 @@
 //! Argument parsing and dispatch for the public CLI surface (Required
 //! Behavior: `daemon start/status/shutdown`, `session new/attach/list`,
-//! plus `session stop`/`session rename` -- parity with `prime-agent stop
-//! <agent>`/`rename <agent> <name>`, see `PARITY.md`) plus the two hidden
-//! entrypoints this binary spawns itself as (`__supervisor-main`,
-//! `__worker-main`).
+//! plus `session stop`/`session rename`/`-p`/`--print` -- parity with
+//! `prime-agent stop <agent>`/`rename <agent> <name>`/`-p`, see
+//! `PARITY.md`) plus the two hidden entrypoints this binary spawns itself
+//! as (`__supervisor-main`, `__worker-main`).
 //!
-//! Hand-rolled, not `clap`: the surface is ten fixed subcommands with
+//! Hand-rolled, not `clap`: the surface is eleven fixed subcommands with
 //! at most two positional/flag arguments each -- a dependency buys
 //! nothing here that fifty lines of matching doesn't already give
 //! directly, and this project's dependency floor (`platform`,
@@ -66,6 +66,12 @@ pub enum Command {
         session_id: String,
         name: Option<String>,
     },
+    /// `harness -p <text...>`/`harness --print <text...>` -- parity with
+    /// `prime-agent -p`. Unlike every other subcommand, does not require
+    /// `daemon start` first: see `client::print_once`'s doc comment.
+    Print {
+        text: String,
+    },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
     SupervisorMain,
@@ -104,6 +110,18 @@ pub fn parse(args: &[String]) -> Result<(OutputMode, Command)> {
 }
 
 fn parse_command(args: &[String]) -> Result<Command> {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-p") | Some("--print")
+    ) {
+        let text: Vec<String> = args[1..].to_vec();
+        if text.is_empty() {
+            return Err(usage("`-p`/`--print` requires prompt text"));
+        }
+        return Ok(Command::Print {
+            text: text.join(" "),
+        });
+    }
     let mut it = args.iter();
     let first = it.next().map(String::as_str);
     match first {
@@ -168,7 +186,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>` or `session <new|attach|list|prompt>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename>`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }

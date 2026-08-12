@@ -61,11 +61,13 @@ environment:
   idle/running/crashed signal `--all` shows). `daemon status`'s own
   `sessions_active` count was left as-is -- it's a daemon-wide aggregate,
   not a per-session listing, so there was nothing to enrich there.
-- [ ] **`--print`/`-p` one-shot mode** -- `prime-agent -p "..."` prints a
-  response and exits instead of entering the (nonexistent, for this
-  project) interactive TUI. This project's CLI is already one-shot for
-  everything except `session attach`, so this is mostly a naming/doc
-  question once `session prompt` semantics are confirmed equivalent.
+- [x] **`--print`/`-p` one-shot mode** -- `harness -p "..."` (parity with
+  `prime-agent -p`). Turned out to need one real behavior, not just a
+  naming alias: unlike every other subcommand, it transparently starts a
+  daemon if none is running (`client::ensure_daemon_started`, factored
+  out of `daemon_start`) and creates its own unnamed session, then prints
+  only the reply text -- no session id, no daemon-startup noise, no
+  `[seq] role:` prefix.
 
 ## Medium-effort, real gaps
 
