@@ -123,6 +123,23 @@ pub enum Request {
     GoalShow {
         session_id: String,
     },
+    /// Parity with `prime-agent`'s Continual Harness (`/refine`): mutates
+    /// a session's durable supplemental harness state (`HarnessState`).
+    /// Valid on both transports, forwarded to the owning worker
+    /// unchanged, same reasoning as `GoalUpdate`. `session_refine`
+    /// (client-side orchestration, see `client.rs`) is the one caller
+    /// that issues `Add` on its own behalf, on the model's proposal
+    /// rather than a user's -- there's no separate wire-level "refine"
+    /// request, since composing existing requests was enough.
+    HarnessUpdate {
+        session_id: String,
+        action: HarnessAction,
+    },
+    /// Read-only, answered directly from `state.json`, same reasoning as
+    /// `GoalShow`.
+    HarnessShow {
+        session_id: String,
+    },
     /// Private transport only: supervisor -> worker, asking it to persist
     /// its final state and exit cleanly (used by `daemon shutdown` and
     /// `SessionStop`).
@@ -204,6 +221,12 @@ pub enum Response {
     GoalShow {
         goal: Option<GoalState>,
     },
+    HarnessUpdateAck {
+        state: HarnessState,
+    },
+    HarnessShow {
+        state: HarnessState,
+    },
     WorkerShutdownAck,
 }
 
@@ -245,6 +268,71 @@ pub struct GoalState {
     pub status: GoalStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// Parity with `prime-agent`'s Continual Harness paper abstraction
+/// (`arxiv.org/abs/2605.09998`): "stores supplemental prompts, memories,
+/// skill descriptions, and reusable subagent specifications." Subagent
+/// specifications are left out -- they're tied to recursive subagents
+/// (`PARITY.md`), a separate out-of-scope concern -- so this covers the
+/// first three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessNoteKind {
+    Prompt,
+    Memory,
+    SkillDescription,
+}
+
+/// One entry of durable supplemental harness state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessNote {
+    pub id: String,
+    pub kind: HarnessNoteKind,
+    pub text: String,
+    pub added_at_ms: u64,
+}
+
+/// A recorded version of `HarnessState::notes` -- parity with
+/// `prime-agent`'s "recorded refinement history." Every successful
+/// `HarnessAction` (`Add` or `Rollback` alike) appends one of these, so
+/// `history.last()` always mirrors the current `notes` and a rollback
+/// itself becomes part of the auditable trail rather than erasing any of
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessSnapshot {
+    pub notes: Vec<HarnessNote>,
+    pub recorded_at_ms: u64,
+    /// A short human-readable description of what produced this
+    /// snapshot (e.g. `"add memory note"`, `"refine: <preview>"`,
+    /// `"rollback to history[2]"`) -- `session harness list`'s own
+    /// history display, not machine-parsed.
+    pub reason: String,
+}
+
+/// A session's durable Continual Harness state (`SessionState::harness`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessState {
+    #[serde(default)]
+    pub notes: Vec<HarnessNote>,
+    #[serde(default)]
+    pub history: Vec<HarnessSnapshot>,
+}
+
+/// Parity with `/refine`'s own two operations: applying a small update,
+/// and (since every update is recorded) reverting to an earlier one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HarnessAction {
+    Add {
+        kind: HarnessNoteKind,
+        text: String,
+    },
+    /// `index` into `HarnessState::history` (0-based, oldest first) --
+    /// restores `notes` to exactly that recorded version.
+    Rollback {
+        index: usize,
+    },
 }
 
 /// One line of the attach event stream, after `SessionAttachStarted`.
@@ -324,6 +412,10 @@ pub struct SessionState {
     /// same pre-existing-`state.json` reason `model` has it.
     #[serde(default)]
     pub goal: Option<GoalState>,
+    /// See `HarnessState`'s own doc comment. `#[serde(default)]` for the
+    /// same pre-existing-`state.json` reason `model`/`goal` have it.
+    #[serde(default)]
+    pub harness: HarnessState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

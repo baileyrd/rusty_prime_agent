@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use crate::error::{HarnessError, Result};
-use crate::protocol::{GoalAction, ScheduleKind};
+use crate::protocol::{GoalAction, HarnessAction, HarnessNoteKind, ScheduleKind};
 use crate::worker::WorkerMode;
 
 /// Parity with `prime-agent --mode json`: a leading, global `--mode
@@ -136,6 +136,25 @@ pub enum Command {
         session_id: String,
         name: String,
         args: Vec<String>,
+    },
+    /// `harness session harness (add <id> <prompt|memory|skill>
+    /// <text...>|list <id>|rollback <id> <index>)` -- parity with
+    /// `prime-agent`'s Continual Harness durable state
+    /// (`HarnessState`); `session refine <id>` (below) is the other,
+    /// model-driven way to reach `Add`.
+    HarnessUpdate {
+        session_id: String,
+        action: HarnessAction,
+    },
+    HarnessShow {
+        session_id: String,
+    },
+    /// `harness session refine <id>` -- parity with `prime-agent`'s
+    /// `/refine`: reviews the session's current trajectory and applies
+    /// one small, evidence-backed update to its harness state. See
+    /// `client::session_refine`'s own doc comment for exactly how.
+    SessionRefine {
+        session_id: String,
     },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
@@ -292,8 +311,16 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     args,
                 })
             }
+            Some("harness") => parse_harness(&mut it),
+            Some("refine") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session refine` requires a session id"))?;
+                Ok(Command::SessionRefine { session_id })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -313,7 +340,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine>`, `prompt-template <list|render>`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
@@ -466,6 +493,65 @@ fn parse_goal<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> 
         }
         other => Err(usage(format!(
             "expected `session goal set|show|pause|resume|complete|clear`, got {other:?}"
+        ))),
+    }
+}
+
+/// `session harness (add <id> <prompt|memory|skill> <text...>|list
+/// <id>|rollback <id> <index>)`.
+fn parse_harness<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> {
+    match it.next().map(String::as_str) {
+        Some("add") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session harness add` requires a session id"))?;
+            let kind = match it.next().map(String::as_str) {
+                Some("prompt") => HarnessNoteKind::Prompt,
+                Some("memory") => HarnessNoteKind::Memory,
+                Some("skill") => HarnessNoteKind::SkillDescription,
+                other => {
+                    return Err(usage(format!(
+                        "expected `session harness add <id> prompt|memory|skill <text...>`, got {other:?}"
+                    )))
+                }
+            };
+            let text: Vec<String> = it.cloned().collect();
+            if text.is_empty() {
+                return Err(usage("`session harness add` requires note text"));
+            }
+            Ok(Command::HarnessUpdate {
+                session_id,
+                action: HarnessAction::Add {
+                    kind,
+                    text: text.join(" "),
+                },
+            })
+        }
+        Some("list") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session harness list` requires a session id"))?;
+            Ok(Command::HarnessShow { session_id })
+        }
+        Some("rollback") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session harness rollback` requires a session id"))?;
+            let index: usize = it
+                .next()
+                .ok_or_else(|| usage("`session harness rollback` requires a history index"))?
+                .parse()
+                .map_err(|_| usage("history index must be a non-negative integer"))?;
+            Ok(Command::HarnessUpdate {
+                session_id,
+                action: HarnessAction::Rollback { index },
+            })
+        }
+        other => Err(usage(format!(
+            "expected `session harness add|list|rollback`, got {other:?}"
         ))),
     }
 }

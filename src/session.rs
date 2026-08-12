@@ -37,8 +37,8 @@ use rusty_tokio::sync::broadcast;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
-    GoalAction, GoalState, GoalStatus, Role, SessionEvent, SessionState, SessionStatus,
-    TranscriptEntry,
+    GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState,
+    Role, SessionEvent, SessionState, SessionStatus, TranscriptEntry,
 };
 use crate::provider::ModelProvider;
 use crate::tool_runtime::ToolRuntime;
@@ -54,6 +54,16 @@ pub fn new_session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("sess-{nanos:x}-{:x}", std::process::id())
+}
+
+/// Same shape/uniqueness reasoning as [`new_session_id`] -- a display
+/// id, not a security-sensitive one.
+fn new_harness_note_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("note-{nanos:x}")
 }
 
 /// Broadcast capacity: how many not-yet-delivered events a slow attached
@@ -124,6 +134,7 @@ impl AgentSession {
             updated_at_ms: now,
             model,
             goal,
+            harness: HarnessState::default(),
         };
         let session = AgentSession {
             state,
@@ -306,6 +317,56 @@ impl AgentSession {
         self.state.updated_at_ms = now;
         self.write_state().await?;
         Ok(self.state.goal.clone())
+    }
+
+    /// Parity with `prime-agent`'s Continual Harness (`/refine`). `Add`
+    /// appends one note; `Rollback` restores `notes` to an earlier
+    /// recorded version. Either way, the resulting `notes` gets appended
+    /// to `history` as a fresh entry -- `history.last()` always mirrors
+    /// `notes`, so a rollback becomes part of the auditable trail rather
+    /// than erasing anything from it (see `HarnessSnapshot`'s own doc
+    /// comment).
+    pub async fn update_harness(&mut self, action: HarnessAction) -> Result<HarnessState> {
+        let now = now_ms();
+        let reason = match action {
+            HarnessAction::Add { kind, text } => {
+                let preview: String = text.chars().take(40).collect();
+                self.state.harness.notes.push(HarnessNote {
+                    id: new_harness_note_id(),
+                    kind,
+                    text,
+                    added_at_ms: now,
+                });
+                format!("add {kind:?} note: {preview}")
+            }
+            HarnessAction::Rollback { index } => {
+                let snapshot = self
+                    .state
+                    .harness
+                    .history
+                    .get(index)
+                    .ok_or_else(|| {
+                        HarnessError::conflict(
+                            Context::Session,
+                            format!(
+                                "no history entry at index {index} ({} recorded)",
+                                self.state.harness.history.len()
+                            ),
+                        )
+                    })?
+                    .clone();
+                self.state.harness.notes = snapshot.notes;
+                format!("rollback to history[{index}]")
+            }
+        };
+        self.state.harness.history.push(HarnessSnapshot {
+            notes: self.state.harness.notes.clone(),
+            recorded_at_ms: now,
+            reason,
+        });
+        self.state.updated_at_ms = now;
+        self.write_state().await?;
+        Ok(self.state.harness.clone())
     }
 
     pub async fn mark_stopped(&mut self) -> Result<()> {

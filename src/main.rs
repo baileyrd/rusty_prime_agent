@@ -196,6 +196,15 @@ async fn run(args: &[String]) -> Result<()> {
         } => {
             client::session_prompt_template(&state_root, session_id, name, args, output_mode).await
         }
+        cli::Command::HarnessUpdate { session_id, action } => {
+            client::harness_update(&state_root, session_id, action, output_mode).await
+        }
+        cli::Command::HarnessShow { session_id } => {
+            client::harness_show(&state_root, session_id, output_mode).await
+        }
+        cli::Command::SessionRefine { session_id } => {
+            client::session_refine(&state_root, session_id, output_mode).await
+        }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }
