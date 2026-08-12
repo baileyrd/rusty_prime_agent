@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio"
 version = "0.2.0"
-source = "git+https://github.com/baileyrd/rusty_tokio?rev=727b76994567f3f9b087997ec04c07138cf2c983#727b76994567f3f9b087997ec04c07138cf2c983"
+source = "git+https://github.com/baileyrd/rusty_tokio?rev=01e455aea3d680e5b3a659de0dc8c367b5ad1182#01e455aea3d680e5b3a659de0dc8c367b5ad1182"
 dependencies = [
  "bytes",
  "crossbeam-deque",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio-macros"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rusty_tokio?rev=727b76994567f3f9b087997ec04c07138cf2c983#727b76994567f3f9b087997ec04c07138cf2c983"
+source = "git+https://github.com/baileyrd/rusty_tokio?rev=01e455aea3d680e5b3a659de0dc8c367b5ad1182#01e455aea3d680e5b3a659de0dc8c367b5ad1182"
 dependencies = [
  "proc-macro2",
  "quote",
