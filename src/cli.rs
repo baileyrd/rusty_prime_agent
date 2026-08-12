@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use crate::error::{HarnessError, Result};
+use crate::protocol::ScheduleKind;
 use crate::worker::WorkerMode;
 
 /// Parity with `prime-agent --mode json`: a leading, global `--mode
@@ -68,6 +69,24 @@ pub enum Command {
     SessionRename {
         session_id: String,
         name: Option<String>,
+    },
+    /// `harness session schedule add <id> (--at TIME|--every DURATION)
+    /// <text...>` -- parity with `prime-agent schedule add`.
+    ScheduleAdd {
+        session_id: String,
+        text: String,
+        kind: ScheduleKind,
+    },
+    /// `harness session schedule list <id>` -- parity with `prime-agent
+    /// schedule list`.
+    ScheduleList {
+        session_id: String,
+    },
+    /// `harness session schedule cancel <id> <schedule-id>` -- parity
+    /// with `prime-agent schedule cancel`.
+    ScheduleCancel {
+        session_id: String,
+        schedule_id: String,
     },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
@@ -203,8 +222,9 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     name: Some(name),
                 })
             }
+            Some("schedule") => parse_schedule(&mut it),
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule`, got {other:?}"
             ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
@@ -230,6 +250,134 @@ fn scan_named_flag(rest: &[&String], flag: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+/// `session schedule add <id> (--at TIME|--every DURATION) <text...>` /
+/// `session schedule list <id>` / `session schedule cancel <id>
+/// <schedule-id>`.
+fn parse_schedule<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> {
+    match it.next().map(String::as_str) {
+        Some("add") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session schedule add` requires a session id"))?;
+            let rest: Vec<&String> = it.collect();
+            let mut at = None;
+            let mut every = None;
+            let mut text_parts = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--at" => {
+                        at = Some(
+                            rest.get(i + 1)
+                                .ok_or_else(|| usage("--at requires a value"))?
+                                .to_string(),
+                        );
+                        i += 2;
+                    }
+                    "--every" => {
+                        every = Some(
+                            rest.get(i + 1)
+                                .ok_or_else(|| usage("--every requires a value"))?
+                                .to_string(),
+                        );
+                        i += 2;
+                    }
+                    other => {
+                        text_parts.push(other.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            let kind = match (at, every) {
+                (Some(a), None) => ScheduleKind::Once {
+                    at_ms: parse_at_ms(&a)?,
+                },
+                (None, Some(e)) => ScheduleKind::Every {
+                    interval_ms: parse_duration_ms(&e)?,
+                },
+                (Some(_), Some(_)) => {
+                    return Err(usage("`--at` and `--every` are mutually exclusive"))
+                }
+                (None, None) => {
+                    return Err(usage("`session schedule add` requires `--at` or `--every`"))
+                }
+            };
+            if text_parts.is_empty() {
+                return Err(usage("`session schedule add` requires prompt text"));
+            }
+            Ok(Command::ScheduleAdd {
+                session_id,
+                text: text_parts.join(" "),
+                kind,
+            })
+        }
+        Some("list") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session schedule list` requires a session id"))?;
+            Ok(Command::ScheduleList { session_id })
+        }
+        Some("cancel") => {
+            let session_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session schedule cancel` requires a session id"))?;
+            let schedule_id = it
+                .next()
+                .cloned()
+                .ok_or_else(|| usage("`session schedule cancel` requires a schedule id"))?;
+            Ok(Command::ScheduleCancel {
+                session_id,
+                schedule_id,
+            })
+        }
+        other => Err(usage(format!(
+            "expected `session schedule add|list|cancel`, got {other:?}"
+        ))),
+    }
+}
+
+/// A duration string like `30s`/`5m`/`2h`/`1d` (a number plus one of
+/// `s`/`m`/`h`/`d`) -- deliberately not a full ISO 8601 duration parser;
+/// this project doesn't pull in a dependency for `--every`'s narrow
+/// needs (parity with `prime-agent`'s own shorthand-friendly CLI
+/// conventions, not with ISO 8601 itself).
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: u64 = digits.parse().map_err(|_| {
+        usage(format!(
+            "invalid duration {s:?}, expected e.g. `30s`/`5m`/`2h`/`1d`"
+        ))
+    })?;
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => {
+            return Err(usage(format!(
+                "invalid duration {s:?}, expected e.g. `30s`/`5m`/`2h`/`1d`"
+            )))
+        }
+    };
+    Ok(n * multiplier)
+}
+
+/// `--at`'s value: either a raw Unix-epoch-milliseconds integer (an
+/// absolute time), or a duration string per [`parse_duration_ms`]
+/// (interpreted as "that far from now"). Not a full RFC 3339 timestamp
+/// parser for the same "no dependency for this" reasoning as
+/// `parse_duration_ms`.
+fn parse_at_ms(s: &str) -> Result<u64> {
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(ms);
+    }
+    let offset = parse_duration_ms(s)?;
+    Ok(crate::paths::now_ms() + offset)
 }
 
 fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> {

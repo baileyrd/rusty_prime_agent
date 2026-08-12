@@ -9,6 +9,7 @@ mod procutil;
 mod protocol;
 mod provider;
 mod rp_server;
+mod schedule;
 mod session;
 mod tool_runtime;
 mod transport;
@@ -147,6 +148,18 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRename { session_id, name } => {
             client::session_rename(&state_root, session_id, name, output_mode).await
         }
+        cli::Command::ScheduleAdd {
+            session_id,
+            text,
+            kind,
+        } => client::schedule_add(&state_root, session_id, text, kind, output_mode).await,
+        cli::Command::ScheduleList { session_id } => {
+            client::schedule_list(&state_root, session_id, output_mode).await
+        }
+        cli::Command::ScheduleCancel {
+            session_id,
+            schedule_id,
+        } => client::schedule_cancel(&state_root, session_id, schedule_id, output_mode).await,
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }

@@ -81,10 +81,43 @@ pub enum Request {
         session_id: String,
         name: Option<String>,
     },
+    /// Parity with `prime-agent schedule add`: registers a prompt the
+    /// daemon itself will inject into `session_id` later, without any
+    /// client attached -- see `schedule`'s own module doc comment for
+    /// the firing loop. Public transport only; the daemon fires a
+    /// schedule the same way it relays an ordinary client
+    /// `SessionPrompt`, not by sending this request to the worker.
+    ScheduleAdd {
+        session_id: String,
+        text: String,
+        kind: ScheduleKind,
+    },
+    /// Parity with `prime-agent schedule list`.
+    ScheduleList {
+        session_id: String,
+    },
+    /// Parity with `prime-agent schedule cancel`.
+    ScheduleCancel {
+        session_id: String,
+        schedule_id: String,
+    },
     /// Private transport only: supervisor -> worker, asking it to persist
     /// its final state and exit cleanly (used by `daemon shutdown` and
     /// `SessionStop`).
     WorkerShutdown,
+}
+
+/// When a [`ScheduleEntry`] fires. Parity with `prime-agent schedule
+/// add`'s one-shot-vs-recurring split (that command's own `--at`/
+/// `--every`-shaped options, simplified to the two cases this project's
+/// firing loop actually needs to distinguish).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleKind {
+    /// Fires once, at `at_ms`, then removes itself.
+    Once { at_ms: u64 },
+    /// Fires every `interval_ms`, indefinitely, until canceled.
+    Every { interval_ms: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +162,19 @@ pub enum Response {
     },
     SessionRenameAck {
         name: Option<String>,
+    },
+    ScheduleAdded {
+        schedule_id: String,
+    },
+    ScheduleList {
+        entries: Vec<ScheduleEntry>,
+    },
+    /// `found` is false when `schedule_id` didn't match anything for
+    /// that session -- still not an error (canceling something already
+    /// gone/fired achieves the caller's actual goal), just reported
+    /// accurately rather than claimed as a real cancellation.
+    ScheduleCancelAck {
+        found: bool,
     },
     WorkerShutdownAck,
 }
@@ -227,4 +273,19 @@ pub struct SessionSummary {
     /// See `Request::SessionNew::model`'s own doc comment. `None` means
     /// this session uses `EchoProvider`.
     pub model: Option<String>,
+}
+
+/// One registered schedule entry, persisted per-session (see `schedule`'s
+/// own module doc comment) and returned by `ScheduleList`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    pub schedule_id: String,
+    pub text: String,
+    pub kind: ScheduleKind,
+    /// When this entry is next due -- for `Once`, equal to `kind`'s own
+    /// `at_ms`; for `Every`, advances by `interval_ms` each time it
+    /// fires, skipping forward past `now` if the daemon was down for a
+    /// while rather than firing a burst of catch-up prompts.
+    pub next_fire_ms: u64,
+    pub created_at_ms: u64,
 }

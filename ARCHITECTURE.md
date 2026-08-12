@@ -32,10 +32,11 @@ current shape.
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
-| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock}`, `provider.{json,log}`) |
+| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,schedules.json}`, `provider.{json,log}`) |
 | `provider` | `ModelProvider` trait + `EchoProvider` (the default); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md` |
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server` use to talk to `rp-server` |
+| `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 

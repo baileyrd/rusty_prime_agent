@@ -29,6 +29,13 @@ use crate::worker::{self, WorkerMode};
 /// `client::DAEMON_READY_TIMEOUT` is kept larger than the supervisor's.
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the background schedule-firing loop wakes to check every
+/// session's `schedules.json` for due entries. Coarse enough not to spin
+/// (a real client interaction is what most sessions actually care about
+/// responding to promptly, not this), fine enough that a schedule fires
+/// within a few seconds of its due time rather than minutes.
+const SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Recorded in `daemon.pid` across restarts so a replacement supervisor
 /// (Required Behavior's crash-recovery path) has a generation number to
 /// hand out, mirroring the reference architecture's worker generations.
@@ -68,6 +75,21 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
     });
 
     supervisor.recover_on_startup().await;
+
+    // Parity with `prime-agent schedule`: a background task that polls
+    // every session's `schedules.json` and fires due entries as ordinary
+    // internal `SessionPrompt`s -- see `schedule`'s own module doc
+    // comment. Runs for the supervisor's whole lifetime, independent of
+    // whether any client is attached to anything.
+    {
+        let supervisor = supervisor.clone();
+        rusty_tokio::spawn(async move {
+            loop {
+                rusty_tokio::time::sleep(SCHEDULE_POLL_INTERVAL).await;
+                supervisor.fire_due_schedules().await;
+            }
+        });
+    }
 
     // 20s, not a shorter window: rebinding right after force-killing a
     // supervisor that had also made an outbound connection to a
@@ -213,6 +235,24 @@ impl Supervisor {
                 self.handle_session_rename(&mut conn, session_id, name)
                     .await
             }
+            Request::ScheduleAdd {
+                session_id,
+                text,
+                kind,
+            } => {
+                self.handle_schedule_add(&mut conn, session_id, text, kind)
+                    .await
+            }
+            Request::ScheduleList { session_id } => {
+                self.handle_schedule_list(&mut conn, session_id).await
+            }
+            Request::ScheduleCancel {
+                session_id,
+                schedule_id,
+            } => {
+                self.handle_schedule_cancel(&mut conn, session_id, schedule_id)
+                    .await
+            }
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -344,6 +384,135 @@ impl Supervisor {
         let sessions = catalog::scan(&self.state_root)?;
         conn.write_response(Context::Daemon, &Response::SessionList { sessions })
             .await
+    }
+
+    async fn handle_schedule_add(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        text: String,
+        kind: crate::protocol::ScheduleKind,
+    ) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let schedule_id = crate::schedule::add(&session_dir, text, kind)?;
+        conn.write_response(Context::Daemon, &Response::ScheduleAdded { schedule_id })
+            .await
+    }
+
+    async fn handle_schedule_list(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let entries = crate::schedule::read_all(&session_dir)?;
+        conn.write_response(Context::Daemon, &Response::ScheduleList { entries })
+            .await
+    }
+
+    async fn handle_schedule_cancel(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        schedule_id: String,
+    ) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let found = crate::schedule::cancel(&session_dir, &schedule_id)?;
+        conn.write_response(Context::Daemon, &Response::ScheduleCancelAck { found })
+            .await
+    }
+
+    /// The background firing loop's own entry point (`daemon::run`'s
+    /// spawned task) -- best-effort and non-fatal per session/entry, the
+    /// same reasoning as `recover_on_startup`: one session's schedule
+    /// misbehaving must not stop every other session's from firing.
+    async fn fire_due_schedules(&self) {
+        let summaries = match catalog::scan(&self.state_root) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("daemon: schedule scan failed: {err}");
+                return;
+            }
+        };
+        let now = paths::now_ms();
+        for summary in summaries {
+            let session_dir = paths::session_dir(&self.state_root, &summary.session_id);
+            let due = match crate::schedule::take_due(&session_dir, now) {
+                Ok(d) => d,
+                Err(err) => {
+                    eprintln!(
+                        "daemon: schedule check failed for session {}: {err}",
+                        summary.session_id
+                    );
+                    continue;
+                }
+            };
+            for (schedule_id, text) in due {
+                if let Err(err) = self.fire_one_schedule(&summary.session_id, text).await {
+                    eprintln!(
+                        "daemon: schedule {schedule_id} for session {} failed to fire: {err}",
+                        summary.session_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fires one due schedule entry as an ordinary internal
+    /// `SessionPrompt` -- reviving the worker first if needed, the same
+    /// as any client-issued prompt would. No `conn` to report a failure
+    /// to (nobody is attached), so `fire_due_schedules` just logs it.
+    async fn fire_one_schedule(&self, session_id: &str, text: String) -> Result<()> {
+        let socket_path = self.ensure_worker_running(session_id).await?;
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::SessionPrompt {
+                    session_id: session_id.to_string(),
+                    text,
+                },
+            )
+            .await?;
+        private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to scheduled prompt",
+                )
+            })?;
+        Ok(())
     }
 
     /// Shared by `SessionAttach`/`SessionPrompt`: validate the session

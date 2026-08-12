@@ -418,6 +418,105 @@ pub async fn session_rename(
     }
 }
 
+pub async fn schedule_add(
+    state_root: &Path,
+    session_id: String,
+    text: String,
+    kind: crate::protocol::ScheduleKind,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::ScheduleAdd {
+            session_id,
+            text,
+            kind,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::ScheduleAdded { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::ScheduleAdded { schedule_id }, OutputMode::Text) => {
+                    println!("{schedule_id}")
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+pub async fn schedule_list(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::ScheduleList { session_id })
+        .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::ScheduleList { .. } => {
+            if mode == OutputMode::Json {
+                print_json(&response);
+                return Ok(());
+            }
+            let Response::ScheduleList { entries } = response else {
+                unreachable!()
+            };
+            if entries.is_empty() {
+                println!("no schedules");
+            }
+            for e in entries {
+                let kind = match e.kind {
+                    crate::protocol::ScheduleKind::Once { at_ms } => format!("once@{at_ms}"),
+                    crate::protocol::ScheduleKind::Every { interval_ms } => {
+                        format!("every={interval_ms}ms")
+                    }
+                };
+                println!(
+                    "{}\t{}\tnext_fire_ms={}\t{}",
+                    e.schedule_id, kind, e.next_fire_ms, e.text
+                );
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+pub async fn schedule_cancel(
+    state_root: &Path,
+    session_id: String,
+    schedule_id: String,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::ScheduleCancel {
+            session_id,
+            schedule_id,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::ScheduleCancelAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::ScheduleCancelAck { found: true }, OutputMode::Text) => {
+                    println!("schedule canceled")
+                }
+                (Response::ScheduleCancelAck { found: false }, OutputMode::Text) => {
+                    println!("no such schedule")
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
 /// Response reads get a bounded timeout: a `connect()` that completed
 /// but whose peer is gone (e.g. a client racing a supervisor that was
 /// just force-killed -- the OS can briefly still complete a connect
