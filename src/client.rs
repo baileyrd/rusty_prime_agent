@@ -512,6 +512,55 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
     println!("[{}] {role}: {}", entry.sequence, entry.text);
 }
 
+/// `harness session repl <id>` -- a minimal, non-Python analog of
+/// `prime-agent`'s interactive TUI: reads lines from stdin, sends each
+/// as an ordinary `SessionPrompt`, and prints the reply, until stdin
+/// hits EOF or a line is exactly `/exit`/`/quit`. None of the TUI's own
+/// editor/message-queue features (file reference, image paste, steering
+/// vs. follow-up queuing, `/tree`/`/fork`/`/clone`/`/compact`/`/export`/
+/// `/share`) -- those stay out of scope, see `PARITY.md`. Replays the
+/// session's existing transcript first (reusing
+/// [`fetch_transcript_snapshot`]), so resuming a session in the REPL
+/// shows its prior turns the same way `session attach` would.
+///
+/// Reads stdin with a blocking `std::io::BufRead` loop rather than an
+/// async one -- there is nothing else for this one-shot CLI process to
+/// make progress on while waiting for the next line, the same reasoning
+/// every other blocking `std::fs` call in this crate already leans on.
+pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let transcript = fetch_transcript_snapshot(state_root, &session_id).await?;
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({
+            "type": "repl_snapshot",
+            "transcript": transcript,
+        })),
+        OutputMode::Text => {
+            for entry in &transcript {
+                print_entry(entry);
+            }
+        }
+    }
+
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| HarnessError::io(Context::Cli, None, e))?;
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text == "/exit" || text == "/quit" {
+            break;
+        }
+        let entry = send_prompt(state_root, &session_id, text.to_string()).await?;
+        match mode {
+            OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+            OutputMode::Text => print_entry(&entry),
+        }
+    }
+    Ok(())
+}
+
 pub async fn session_prompt(
     state_root: &Path,
     session_id: String,

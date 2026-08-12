@@ -263,6 +263,18 @@ daemon/worker split rather than requiring the Python control environment:
   Skills/tools/retry-policy inheritance (the rest of that same
   `rlm(...)` sentence) don't apply here -- this project's tool runtime
   is `NoopToolRuntime` and it has no retry-policy concept to inherit.
+- [x] **A minimal interactive REPL** (`session repl <id>`), bounded,
+  non-Python parity with `prime-agent`'s interactive TUI. Reads lines
+  from stdin, sends each as an ordinary `SessionPrompt`, prints the
+  reply, until stdin hits EOF or a line is exactly `/exit`/`/quit`;
+  replays the session's existing transcript first, so resuming a
+  session in the REPL shows its prior turns the same way `session
+  attach` would. None of the TUI's own editor/message-queue features
+  (file reference, image paste, steering vs. follow-up queuing,
+  `/tree`/`/fork`/`/clone`/`/compact`/`/export`/`/share`) -- those stay
+  out of scope below; this is the bare loop underneath all of that, the
+  same "extract the tractable session-level mechanism, leave the rich
+  surface out" move as `session spawn`/prompt templates above.
 
 ## Out of scope for this project's current shape
 
@@ -291,9 +303,11 @@ attempted here, and not silently implied by anything in
   both themselves out of scope below. (Scheduling, persistent goals, and
   bounded autonomous mode -- `prime-agent schedule`/`--goal`/`/goal`/
   `/autonomous` -- are all done; see the medium-effort section above.)
-- **The interactive TUI** and its editor/message-queue features (file
+- **The interactive TUI**'s rich editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
-  `/fork`, `/clone`, `/compact`, `/export`, `/share`).
+  `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
+  read-a-line/send-a-prompt loop underneath the TUI itself is done --
+  `session repl`, see the medium-effort section above.)
 - **Model catalog listing, thinking-level controls.** (Multi-provider
   *selection* itself -- `--model provider/model` -- is done; see the
   medium-effort section above. `prime-agent model list`'s catalog browse
