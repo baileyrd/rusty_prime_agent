@@ -2,16 +2,34 @@
 //! it first if needed), send one [`Request`], and render the
 //! [`Response`]/event stream to stdout. This is "a bare one-shot CLI
 //! over the same IPC boundary the future TUI will use" (Phase 1
-//! non-goal on TUI polish) -- no interactive rendering, just plain text.
+//! non-goal on TUI polish) -- no interactive rendering, just plain text
+//! by default, or raw JSON lines under [`OutputMode::Json`] (parity with
+//! `prime-agent --mode json`, see `cli::OutputMode`'s own doc comment for
+//! why this reuses `Response`/`SessionEvent` as the JSON vocabulary
+//! rather than `prime-agent`'s own richer event schema).
 
 use std::path::Path;
 use std::time::Duration;
 
+use crate::cli::OutputMode;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
 use crate::protocol::{Request, Response, SessionEvent, SessionStatus};
 use crate::transport;
+
+/// `Response`/`SessionEvent` are plain derived-`Serialize` data (strings,
+/// numbers, enums, nested structs) with no types that can fail to
+/// serialize (no maps with non-string keys, no `f32`/`f64` NaN/Infinity)
+/// -- a serialization error here would mean this project's own wire
+/// types changed shape incompatibly, a programmer error to surface loudly
+/// rather than a runtime condition to route through `Result`.
+fn print_json(value: &impl serde::Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string(value).expect("Response/SessionEvent are always serializable")
+    );
+}
 
 /// Kept strictly larger than `daemon::run`'s own internal
 /// `bind_with_retry` budget for `daemon.sock` (20s -- see that call
@@ -22,10 +40,16 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// `harness daemon start`: idempotent. If a supervisor is already
 /// reachable, reports that and returns; otherwise spawns one detached
 /// and waits for its socket to come up.
-pub async fn daemon_start(state_root: &Path, exe_path: &Path) -> Result<()> {
+pub async fn daemon_start(state_root: &Path, exe_path: &Path, mode: OutputMode) -> Result<()> {
     let socket_path = paths::daemon_socket_path(state_root);
     if transport::probe(Context::Daemon, socket_path.clone()).await {
-        println!("daemon already running ({})", socket_path.display());
+        match mode {
+            OutputMode::Json => print_json(&serde_json::json!({
+                "type": "daemon_already_running",
+                "socket": socket_path,
+            })),
+            OutputMode::Text => println!("daemon already running ({})", socket_path.display()),
+        }
         return Ok(());
     }
     paths::ensure_dir(Context::Daemon, state_root)?;
@@ -57,10 +81,17 @@ pub async fn daemon_start(state_root: &Path, exe_path: &Path) -> Result<()> {
     drop(child); // detached: the supervisor outlives this CLI invocation.
 
     transport::wait_ready(Context::Daemon, socket_path.clone(), DAEMON_READY_TIMEOUT).await?;
-    println!(
-        "daemon started (pid {pid}, socket {})",
-        socket_path.display()
-    );
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({
+            "type": "daemon_started",
+            "pid": pid,
+            "socket": socket_path,
+        })),
+        OutputMode::Text => println!(
+            "daemon started (pid {pid}, socket {})",
+            socket_path.display()
+        ),
+    }
     Ok(())
 }
 
@@ -76,56 +107,78 @@ async fn connect(state_root: &Path) -> Result<transport::LineStream> {
         })
 }
 
-pub async fn daemon_status(state_root: &Path) -> Result<()> {
+pub async fn daemon_status(state_root: &Path, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::DaemonStatus)
         .await?;
-    match read_response(&mut conn).await? {
-        Response::DaemonStatus {
-            protocol_version,
-            pid,
-            generation,
-            sessions_active,
-        } => {
+    let response = read_response(&mut conn).await?;
+    match (&response, mode) {
+        (Response::DaemonStatus { .. }, OutputMode::Json) => {
+            print_json(&response);
+            Ok(())
+        }
+        (
+            Response::DaemonStatus {
+                protocol_version,
+                pid,
+                generation,
+                sessions_active,
+            },
+            OutputMode::Text,
+        ) => {
             println!("daemon: protocol_version={protocol_version} pid={pid} generation={generation} sessions_active={sessions_active}");
             Ok(())
         }
-        other => Err(unexpected_response(other)),
+        _ => Err(unexpected_response(response)),
     }
 }
 
-pub async fn daemon_shutdown(state_root: &Path) -> Result<()> {
+pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::DaemonShutdown)
         .await?;
     match read_response(&mut conn).await? {
-        Response::DaemonShutdownAck => {
-            println!("daemon shut down");
+        response @ Response::DaemonShutdownAck => {
+            match mode {
+                OutputMode::Json => print_json(&response),
+                OutputMode::Text => println!("daemon shut down"),
+            }
             Ok(())
         }
         other => Err(unexpected_response(other)),
     }
 }
 
-pub async fn session_new(state_root: &Path, name: Option<String>) -> Result<()> {
+pub async fn session_new(state_root: &Path, name: Option<String>, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionNew { name })
         .await?;
     match read_response(&mut conn).await? {
-        Response::SessionNew { session_id } => {
-            println!("{session_id}");
+        response @ Response::SessionNew { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::SessionNew { session_id }, OutputMode::Text) => println!("{session_id}"),
+                _ => unreachable!(),
+            }
             Ok(())
         }
         other => Err(unexpected_response(other)),
     }
 }
 
-pub async fn session_list(state_root: &Path) -> Result<()> {
+pub async fn session_list(state_root: &Path, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionList)
         .await?;
     match read_response(&mut conn).await? {
-        Response::SessionList { sessions } => {
+        response @ Response::SessionList { .. } => {
+            if mode == OutputMode::Json {
+                print_json(&response);
+                return Ok(());
+            }
+            let Response::SessionList { sessions } = response else {
+                unreachable!()
+            };
             if sessions.is_empty() {
                 println!("no sessions");
             }
@@ -157,18 +210,31 @@ pub async fn session_list(state_root: &Path) -> Result<()> {
     }
 }
 
-pub async fn session_attach(state_root: &Path, session_id: String) -> Result<()> {
+pub async fn session_attach(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionAttach { session_id })
         .await?;
     match read_response(&mut conn).await? {
-        Response::SessionAttachStarted { session_id } => {
-            println!("attached to {session_id}");
-        }
+        response @ Response::SessionAttachStarted { .. } => match mode {
+            OutputMode::Json => print_json(&response),
+            OutputMode::Text => {
+                let Response::SessionAttachStarted { session_id } = response else {
+                    unreachable!()
+                };
+                println!("attached to {session_id}");
+            }
+        },
         other => return Err(unexpected_response(other)),
     }
     loop {
         match conn.read_event(Context::Daemon).await? {
+            Some(event) if mode == OutputMode::Json => {
+                let ended = matches!(event, SessionEvent::SessionEnded);
+                print_json(&event);
+                if ended {
+                    break;
+                }
+            }
             Some(SessionEvent::Snapshot { state, transcript }) => {
                 println!(
                     "-- snapshot: generation={} last_sequence={} --",
@@ -201,7 +267,12 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
     println!("[{}] {role}: {}", entry.sequence, entry.text);
 }
 
-pub async fn session_prompt(state_root: &Path, session_id: String, text: String) -> Result<()> {
+pub async fn session_prompt(
+    state_root: &Path,
+    session_id: String,
+    text: String,
+    mode: OutputMode,
+) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
@@ -209,24 +280,43 @@ pub async fn session_prompt(state_root: &Path, session_id: String, text: String)
     )
     .await?;
     match read_response(&mut conn).await? {
-        Response::SessionPromptAck { entry } => {
-            print_entry(&entry);
+        response @ Response::SessionPromptAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::SessionPromptAck { entry }, OutputMode::Text) => print_entry(entry),
+                _ => unreachable!(),
+            }
             Ok(())
         }
         other => Err(unexpected_response(other)),
     }
 }
 
-pub async fn session_stop(state_root: &Path, session_id: String) -> Result<()> {
+pub async fn session_stop(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionStop { session_id })
         .await?;
     match read_response(&mut conn).await? {
-        Response::SessionStopAck { already_stopped } => {
-            if already_stopped {
-                println!("session already stopped");
-            } else {
-                println!("session stopped");
+        response @ Response::SessionStopAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (
+                    Response::SessionStopAck {
+                        already_stopped: true,
+                    },
+                    OutputMode::Text,
+                ) => {
+                    println!("session already stopped")
+                }
+                (
+                    Response::SessionStopAck {
+                        already_stopped: false,
+                    },
+                    OutputMode::Text,
+                ) => {
+                    println!("session stopped")
+                }
+                _ => unreachable!(),
             }
             Ok(())
         }
@@ -238,6 +328,7 @@ pub async fn session_rename(
     state_root: &Path,
     session_id: String,
     name: Option<String>,
+    mode: OutputMode,
 ) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -246,8 +337,14 @@ pub async fn session_rename(
     )
     .await?;
     match read_response(&mut conn).await? {
-        Response::SessionRenameAck { name } => {
-            println!("renamed to {}", name.as_deref().unwrap_or("-"));
+        response @ Response::SessionRenameAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (Response::SessionRenameAck { name }, OutputMode::Text) => {
+                    println!("renamed to {}", name.as_deref().unwrap_or("-"))
+                }
+                _ => unreachable!(),
+            }
             Ok(())
         }
         other => Err(unexpected_response(other)),

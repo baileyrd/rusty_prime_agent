@@ -78,12 +78,15 @@ daemon/worker split rather than requiring the Python control environment:
   `--provider`/`--model`/`--api-key`. The `ModelProvider` trait boundary
   already exists for this; a real backend is an HTTP-calling
   implementation behind it, not an architecture change.
-- **`--mode json`** -- `prime-agent`'s JSON event-line output mode for
-  headless automation. This project's wire protocol is already
-  line-delimited JSON internally; a `--mode json` flag on `session
-  attach`/`session prompt` that echoes the raw `SessionEvent`/`Response`
-  JSON instead of the current human-readable rendering is a `client.rs`
-  change, not a protocol change.
+- [x] **`--mode json`** -- a leading global flag (`harness --mode json
+  session list`, parity with `prime-agent --mode json`) that switches
+  every public subcommand's rendering from this project's own
+  human-readable text to raw `Response`/`SessionEvent` JSON lines. Reuses
+  this project's own wire types as the JSON vocabulary rather than
+  modeling `prime-agent`'s much richer `AgentSessionEvent` schema
+  (`agent_start`/`turn_start`/`message_*`/tool-execution events), which
+  assumes a streaming model and tool-execution pipeline this project
+  doesn't have -- see `cli::OutputMode`'s doc comment.
 
 ## Out of scope for this project's current shape
 

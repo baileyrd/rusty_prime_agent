@@ -210,6 +210,58 @@ fn session_rename_updates_the_listed_name_and_survives_a_respawn() {
 }
 
 #[test]
+fn mode_json_emits_raw_response_and_event_lines() {
+    // Parity with `prime-agent --mode json`.
+    let state_dir = common::TempDir::new("mode-json");
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new(state_dir.path(), Some("json-mode-test"));
+    common::session_prompt(state_dir.path(), &session_id, "hello json");
+
+    let out = common::run(state_dir.path(), &["--mode", "json", "session", "list"]);
+    common::assert_success("session list --mode json", &out);
+    let stdout = common::stdout_string(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}, got: {stdout}"));
+    assert_eq!(
+        parsed["type"], "session_list",
+        "session list --mode json should emit the raw Response, got: {stdout}"
+    );
+    assert_eq!(
+        parsed["sessions"][0]["session_id"],
+        serde_json::Value::String(session_id.clone()),
+        "got: {stdout}"
+    );
+
+    let out = common::run(state_dir.path(), &["--mode", "json", "daemon", "status"]);
+    common::assert_success("daemon status --mode json", &out);
+    let stdout = common::stdout_string(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}, got: {stdout}"));
+    assert_eq!(parsed["type"], "daemon_status", "got: {stdout}");
+    assert_eq!(parsed["sessions_active"], 1, "got: {stdout}");
+
+    // Attach in JSON mode: every line, including the initial
+    // `SessionAttachStarted` response, should be a standalone JSON
+    // object -- not this project's own human-readable rendering.
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        Duration::from_secs(5),
+    );
+    assert_eq!(lines.len(), 2, "expected 2 JSON lines, got: {lines:?}");
+    let started: serde_json::Value = serde_json::from_str(&lines[0])
+        .unwrap_or_else(|e| panic!("line 0 not valid JSON: {e}, got: {}", lines[0]));
+    assert_eq!(started["type"], "session_attach_started", "got: {lines:?}");
+    let snapshot: serde_json::Value = serde_json::from_str(&lines[1])
+        .unwrap_or_else(|e| panic!("line 1 not valid JSON: {e}, got: {}", lines[1]));
+    assert_eq!(snapshot["kind"], "snapshot", "got: {lines:?}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn unknown_session_attach_reports_a_conflict_not_a_crash() {
     let state_dir = common::TempDir::new("unknown-session");
     common::daemon_start(state_dir.path());

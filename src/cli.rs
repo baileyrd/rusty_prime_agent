@@ -17,6 +17,33 @@ use std::path::PathBuf;
 use crate::error::{HarnessError, Result};
 use crate::worker::WorkerMode;
 
+/// Parity with `prime-agent --mode json`: a leading, global `--mode
+/// json|text` flag (before the subcommand) switches every public
+/// subcommand's rendering from this project's own human-readable text to
+/// raw `Response`/`SessionEvent` JSON lines -- see `client.rs`'s own doc
+/// comment for why this reuses the wire types directly rather than
+/// modeling `prime-agent`'s much richer `AgentSessionEvent` vocabulary
+/// (`packages/coding-agent/docs/json.md` in that repo), which assumes a
+/// streaming model/tool-execution pipeline this project doesn't have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    #[default]
+    Text,
+    Json,
+}
+
+impl OutputMode {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "text" => Ok(OutputMode::Text),
+            "json" => Ok(OutputMode::Json),
+            other => Err(usage(format!(
+                "unknown --mode value `{other}`, expected `text` or `json`"
+            ))),
+        }
+    }
+}
+
 pub enum Command {
     DaemonStart,
     DaemonStatus,
@@ -59,7 +86,24 @@ fn usage(message: impl Into<String>) -> HarnessError {
     }
 }
 
-pub fn parse(args: &[String]) -> Result<Command> {
+/// Splits off a leading `--mode json|text`, if present, then parses the
+/// remaining args as an ordinary subcommand. `--mode` is recognized only
+/// in this leading position -- `__worker-main`'s own `--mode
+/// new|resume|recover` flag (a different flag, spelled the same,
+/// consumed by [`parse_worker_main`] instead) always appears after that
+/// hidden subcommand's own name, so the two can never collide.
+pub fn parse(args: &[String]) -> Result<(OutputMode, Command)> {
+    if args.first().map(String::as_str) == Some("--mode") {
+        let value = args
+            .get(1)
+            .ok_or_else(|| usage("--mode requires a value"))?;
+        let output_mode = OutputMode::parse(value)?;
+        return Ok((output_mode, parse_command(&args[2..])?));
+    }
+    Ok((OutputMode::default(), parse_command(args)?))
+}
+
+fn parse_command(args: &[String]) -> Result<Command> {
     let mut it = args.iter();
     let first = it.next().map(String::as_str);
     match first {
