@@ -84,6 +84,13 @@ pub struct WorkerArgs {
     /// `RustyProviderModel` needs it for every subsequent request, not
     /// just at session-creation time.
     pub thinking: Option<String>,
+    /// See `Request::SessionNew::tools`'s own doc comment. Same
+    /// "only meaningful for `WorkerMode::New`" reasoning as `goal`/
+    /// `parent_id`: unlike `thinking`, nothing at spawn time other than
+    /// `AgentSession::create` reads this -- `AgentSession::prompt`'s
+    /// tool-calling loop reads the offered tool set back off
+    /// `state.tools` (already persisted by then), not off `WorkerArgs`.
+    pub tools: Option<String>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -131,6 +138,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     goal: args.goal.clone(),
                     parent_id: args.parent_id.clone(),
                     thinking: args.thinking.clone(),
+                    tools: args.tools.clone(),
                 },
                 provider,
                 tool_runtime,
@@ -320,6 +328,7 @@ pub async fn spawn(
         goal,
         parent_id,
         thinking,
+        tools,
     } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -347,6 +356,9 @@ pub async fn spawn(
     }
     if let Some(thinking) = &thinking {
         cmd.arg("--thinking").arg(thinking);
+    }
+    if let Some(tools) = &tools {
+        cmd.arg("--tools").arg(tools);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

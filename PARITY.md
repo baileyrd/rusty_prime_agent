@@ -348,6 +348,39 @@ daemon/worker split rather than requiring the Python control environment:
   own doc comment for why that's `model`'s pattern and not `goal`'s);
   `RustyProviderModel`'s request body includes `"reasoning":
   {"effort": ...}` only when set. No effect on `EchoProvider` sessions.
+- [x] **Real tool-calling loop** (`session new --tools read`, built-in
+  `read_file`/`list_dir` tools). Last revision of this file lumped this
+  in with the RLM programming model's IPython-kernel boundary as
+  Python-bound and out of scope -- reading `rusty_provider`'s actual
+  source (`crates/core/src/types.rs`) showed that conflated two
+  different things: `tool_runtime::ToolRuntime` really is that boundary
+  (still `NoopToolRuntime`, still out of scope below, untouched by this
+  entry), but `rp-server`'s `/v1/chat/completions` already speaks full
+  OpenAI-style tool-calling (`ChatRequest.tools`/`tool_choice`,
+  `ChatMessage.tool_calls`, `Role::Tool`) independently of any kernel --
+  our own `ModelProvider` just never asked for any of it. `provider::
+  ModelProvider::respond` now takes the full turn history plus an
+  offered tool list (`ChatTurn`/`TurnRole`/`ToolDef`, hand-rolled to
+  `rp-server`'s wire shape, not a `rp_core` dependency) and returns
+  either `ProviderReply::Text` or `ProviderReply::ToolCalls`;
+  `AgentSession::prompt` loops on the latter (execute each call via
+  `tools::execute`, append a `Role::Tool` result entry, ask again),
+  capped at 8 rounds to bound a runaway loop. `EchoProvider` ignores the
+  offered tools entirely and never emits `ToolCalls`, so every existing
+  session (no `--tools` flag) is completely unaffected -- proven by the
+  full existing suite passing unchanged. Read-only first: `read_file`/
+  `list_dir`, plain `std::fs`, no path sandboxing (same single-local-user
+  trust model `session_autonomous --quality-gate`'s unsandboxed shell
+  execution already established) -- `--tools shell`/write-capable tools
+  are a natural v2 extension of the same flag, not built now. Manually
+  verified against this sandbox's real Ollama setup: the plumbing
+  round-trips correctly when a model emits a real, structured
+  `tool_calls` response (covered by unit tests against synthetic
+  `rp-server`-shaped JSON); the small local test model (`qwen2.5:0.5b`)
+  itself proved an unreliable tool-caller in practice (it sometimes
+  narrates a tool call as prose instead of emitting one), a known
+  small-model limitation, not a plumbing gap -- `tests/ollama_provider.rs`'s
+  own real-tool-call test is written to tolerate that.
 
 ## Out of scope for this project's current shape
 

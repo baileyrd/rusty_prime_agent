@@ -72,6 +72,15 @@ pub enum Request {
         /// `EchoProvider` sessions. Fixed for this session's whole
         /// lifetime, same as `model`/`goal`.
         thinking: Option<String>,
+        /// Opt-in built-in tool set offered to `model` on every prompt
+        /// (`session new --tools read`), parity with `prime-agent`'s own
+        /// tool-calling loop -- see `session::AgentSession::prompt`'s own
+        /// doc comment for the round-trip this drives. `Some("read")` is
+        /// the only value accepted today (`tools::read_only_tool_defs`);
+        /// `None` (the default) offers no tools at all, leaving every
+        /// existing session's behavior completely unaffected. Fixed for
+        /// this session's whole lifetime, same as `model`/`thinking`.
+        tools: Option<String>,
     },
     SessionAttach {
         session_id: String,
@@ -387,6 +396,22 @@ pub enum Role {
     User,
     Assistant,
     System,
+    /// A tool's result, sent back to the model as its own turn -- see
+    /// `session::AgentSession::prompt`'s tool-calling loop.
+    Tool,
+}
+
+/// One tool call the model requested, in `rp-server`'s own OpenAI-shaped
+/// wire format: `arguments` is the raw, model-generated JSON-arguments
+/// string, passed through to `tools::execute` unparsed rather than
+/// validated against `provider::ToolDef::parameters`'s schema here --
+/// same "skip JSON-Schema validation, let the callee reject malformed
+/// input" reasoning as this project's planned MCP client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +420,22 @@ pub struct TranscriptEntry {
     pub timestamp_ms: u64,
     pub role: Role,
     pub text: String,
+    /// Set only on a `Role::Assistant` entry that's a tool-call request
+    /// (`text` is empty in that case) -- `#[serde(default)]` so
+    /// `transcript.jsonl` files written before Increment 3 still parse.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallRequest>>,
+    /// Set only on a `Role::Tool` entry: which `ToolCallRequest::id` this
+    /// is the result of. `#[serde(default)]` for the same
+    /// pre-existing-transcript reason as `tool_calls`.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// Set only on a `Role::Tool` entry: the tool's name, mirrored onto
+    /// the entry so a transcript reader doesn't have to cross-reference
+    /// the matching `tool_calls` entry to know which tool ran.
+    /// `#[serde(default)]` for the same reason.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,6 +491,11 @@ pub struct SessionState {
     /// `model`/`goal`/`harness`/`parent_id` have it.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// See `Request::SessionNew::tools`'s own doc comment.
+    /// `#[serde(default)]` for the same pre-existing-`state.json` reason
+    /// `model`/`goal`/`harness`/`parent_id`/`thinking` have it.
+    #[serde(default)]
+    pub tools: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +526,8 @@ pub struct SessionSummary {
     pub parent_id: Option<String>,
     /// See `Request::SessionNew::thinking`'s own doc comment.
     pub thinking: Option<String>,
+    /// See `Request::SessionNew::tools`'s own doc comment.
+    pub tools: Option<String>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s

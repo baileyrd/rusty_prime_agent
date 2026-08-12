@@ -54,6 +54,16 @@ Add `--thinking low|medium|high` to request a reasoning/thinking budget
 from that model (parity with `prime-agent --thinking <level>`; no effect
 without `--model`, since `EchoProvider` has no concept of it).
 
+Add `--tools read` to let the model call built-in, read-only tools
+(`read_file`, `list_dir` -- plain filesystem access, no path sandboxing)
+during a prompt: the model can request one, get the result back, and
+continue, looped up to 8 rounds per prompt. Off by default; `EchoProvider`
+sessions can set it too, but never actually invoke a tool.
+
+```sh
+harness session new --model ollama/qwen2.5:0.5b --tools read
+```
+
 ## Global flags
 
 - `--mode json|text` (must come first, before the subcommand) -- switches
@@ -73,7 +83,7 @@ harness daemon shutdown              # gracefully stops every worker, then exits
 ### Sessions
 
 ```sh
-harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high]
+harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>

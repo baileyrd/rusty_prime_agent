@@ -13,6 +13,7 @@ mod rp_server;
 mod schedule;
 mod session;
 mod tool_runtime;
+mod tools;
 mod transport;
 mod worker;
 
@@ -161,7 +162,10 @@ async fn run(args: &[String]) -> Result<()> {
             model,
             goal,
             thinking,
-        } => client::session_new(&state_root, name, model, goal, thinking, output_mode).await,
+            tools,
+        } => {
+            client::session_new(&state_root, name, model, goal, thinking, tools, output_mode).await
+        }
         cli::Command::SessionAttach { session_id } => {
             client::session_attach(&state_root, session_id, output_mode).await
         }
@@ -264,6 +268,7 @@ async fn run(args: &[String]) -> Result<()> {
             goal,
             parent_id,
             thinking,
+            tools,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -274,6 +279,7 @@ async fn run(args: &[String]) -> Result<()> {
                 goal,
                 parent_id,
                 thinking,
+                tools,
             })
             .await
         }
