@@ -74,6 +74,9 @@ pub struct WorkerArgs {
     /// then already lives in its own persisted `state.json`, the same
     /// way `name`/`model` do.
     pub goal: Option<String>,
+    /// See `Request::SessionNew::parent_id`'s own doc comment. Same
+    /// "only meaningful for `WorkerMode::New`" reasoning as `goal`.
+    pub parent_id: Option<String>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -114,9 +117,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             AgentSession::create(
                 &args.state_root,
                 args.session_id.clone(),
-                args.name.clone(),
-                args.model.clone(),
-                args.goal.clone(),
+                crate::session::NewSessionMeta {
+                    name: args.name.clone(),
+                    model: args.model.clone(),
+                    goal: args.goal.clone(),
+                    parent_id: args.parent_id.clone(),
+                },
                 provider,
                 tool_runtime,
             )
@@ -295,11 +301,16 @@ pub async fn spawn(
     state_root: &Path,
     session_id: &str,
     mode: WorkerMode,
-    name: Option<String>,
-    model: Option<String>,
-    goal: Option<String>,
+    meta: crate::session::NewSessionMeta,
 ) -> Result<u32> {
     use rusty_tokio::process::{Command, Stdio};
+
+    let crate::session::NewSessionMeta {
+        name,
+        model,
+        goal,
+        parent_id,
+    } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
 
@@ -320,6 +331,9 @@ pub async fn spawn(
     }
     if let Some(goal) = &goal {
         cmd.arg("--goal").arg(goal);
+    }
+    if let Some(parent_id) = &parent_id {
+        cmd.arg("--parent-id").arg(parent_id);
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

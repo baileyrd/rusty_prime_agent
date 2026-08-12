@@ -205,6 +205,20 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRefine { session_id } => {
             client::session_refine(&state_root, session_id, output_mode).await
         }
+        cli::Command::SessionSpawn {
+            parent_id,
+            task,
+            model,
+            name,
+        } => client::session_spawn(&state_root, parent_id, task, model, name, output_mode).await,
+        cli::Command::SessionChildren { parent_id } => {
+            client::session_children(&state_root, parent_id, output_mode).await
+        }
+        cli::Command::SessionMessage {
+            from_id,
+            to_id,
+            text,
+        } => client::session_message(&state_root, from_id, to_id, text, output_mode).await,
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }
@@ -216,6 +230,7 @@ async fn run(args: &[String]) -> Result<()> {
             name,
             model,
             goal,
+            parent_id,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -224,6 +239,7 @@ async fn run(args: &[String]) -> Result<()> {
                 name,
                 model,
                 goal,
+                parent_id,
             })
             .await
         }

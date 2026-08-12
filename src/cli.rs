@@ -156,6 +156,29 @@ pub enum Command {
     SessionRefine {
         session_id: String,
     },
+    /// `harness session spawn <parent-id> [--model PROVIDER/MODEL]
+    /// [--name NAME] <task text...>` -- bounded, non-Python parity with
+    /// `prime-agent`'s recursive subagents (`rlm(...)`). See
+    /// `client::session_spawn`'s own doc comment for exactly how.
+    SessionSpawn {
+        parent_id: String,
+        task: String,
+        model: Option<String>,
+        name: Option<String>,
+    },
+    /// `harness session children <id>` -- direct children only.
+    SessionChildren {
+        parent_id: String,
+    },
+    /// `harness session message <from-id> <to-id> <text...>` -- parity
+    /// with `agent_message.send(msg, receiver_role="parent"|"child")`;
+    /// `to-id` must be `from-id`'s own parent or one of its own
+    /// children.
+    SessionMessage {
+        from_id: String,
+        to_id: String,
+        text: String,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -177,6 +200,7 @@ pub enum Command {
         name: Option<String>,
         model: Option<String>,
         goal: Option<String>,
+        parent_id: Option<String>,
     },
 }
 
@@ -319,8 +343,67 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     .ok_or_else(|| usage("`session refine` requires a session id"))?;
                 Ok(Command::SessionRefine { session_id })
             }
+            Some("spawn") => {
+                let parent_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session spawn` requires a parent session id"))?;
+                let rest: Vec<&String> = it.collect();
+                let model = scan_named_flag(&rest, "--model")?;
+                let name = scan_named_flag(&rest, "--name")?;
+                // Everything left after pulling `--model`/`--name` (each
+                // flag plus its value) out is the task text, joined back
+                // together the same way `session prompt`'s free-text
+                // tail is.
+                let mut task_parts: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i < rest.len() {
+                    match rest[i].as_str() {
+                        "--model" | "--name" => i += 2,
+                        other => {
+                            task_parts.push(other.to_string());
+                            i += 1;
+                        }
+                    }
+                }
+                if task_parts.is_empty() {
+                    return Err(usage("`session spawn` requires task text"));
+                }
+                Ok(Command::SessionSpawn {
+                    parent_id,
+                    task: task_parts.join(" "),
+                    model,
+                    name,
+                })
+            }
+            Some("children") => {
+                let parent_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session children` requires a session id"))?;
+                Ok(Command::SessionChildren { parent_id })
+            }
+            Some("message") => {
+                let from_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session message` requires a sender session id"))?;
+                let to_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session message` requires a recipient session id"))?;
+                let text: Vec<String> = it.cloned().collect();
+                if text.is_empty() {
+                    return Err(usage("`session message` requires message text"));
+                }
+                Ok(Command::SessionMessage {
+                    from_id,
+                    to_id,
+                    text: text.join(" "),
+                })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -626,6 +709,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut name = None;
     let mut model = None;
     let mut goal = None;
+    let mut parent_id = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -667,6 +751,13 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--parent-id" => {
+                parent_id = Some(
+                    it.next()
+                        .ok_or_else(|| usage("--parent-id requires a value"))?
+                        .clone(),
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -677,5 +768,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         name,
         model,
         goal,
+        parent_id,
     })
 }

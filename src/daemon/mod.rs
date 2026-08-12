@@ -200,12 +200,16 @@ impl Supervisor {
             &self.state_root,
             session_id,
             mode,
-            state.name.clone(),
-            state.model.clone(),
-            // Never re-seeded on revival -- a session's goal already
-            // lives in its own persisted `state.json` by the time it's
-            // resumed/recovered, the same as `name`/`model`.
-            None,
+            crate::session::NewSessionMeta {
+                name: state.name.clone(),
+                model: state.model.clone(),
+                // `goal`/`parent_id` are never re-seeded on revival -- a
+                // session's own `state.json` already carries them by the
+                // time it's resumed/recovered, the same as `name`/
+                // `model`.
+                goal: None,
+                parent_id: None,
+            },
         )
         .await?;
         worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await?;
@@ -221,8 +225,14 @@ impl Supervisor {
             Request::Ping => conn.write_response(Context::Daemon, &Response::Pong).await,
             Request::DaemonStatus => self.handle_daemon_status(&mut conn).await,
             Request::DaemonShutdown => self.handle_daemon_shutdown(&mut conn).await,
-            Request::SessionNew { name, model, goal } => {
-                self.handle_session_new(&mut conn, name, model, goal).await
+            Request::SessionNew {
+                name,
+                model,
+                goal,
+                parent_id,
+            } => {
+                self.handle_session_new(&mut conn, name, model, goal, parent_id)
+                    .await
             }
             Request::SessionList => self.handle_session_list(&mut conn).await,
             Request::SessionAttach { session_id } => {
@@ -336,6 +346,7 @@ impl Supervisor {
         name: Option<String>,
         model: Option<String>,
         goal: Option<String>,
+        parent_id: Option<String>,
     ) -> Result<()> {
         // An explicit `--model` always wins; RUSTY_PRIME_AGENT_MODEL is
         // only a fallback default for callers that don't pass one (e.g.
@@ -344,6 +355,20 @@ impl Supervisor {
         // daemon's own environment that decides, not whichever
         // environment happened to invoke `session new`.
         let model = model.or_else(|| std::env::var("RUSTY_PRIME_AGENT_MODEL").ok());
+        if let Some(parent_id) = &parent_id {
+            let parent_dir = paths::session_dir(&self.state_root, parent_id);
+            if !paths::state_file_path(&parent_dir).exists() {
+                return conn
+                    .write_response(
+                        Context::Daemon,
+                        &Response::Error {
+                            message: format!("unknown parent session {parent_id}"),
+                            conflict: true,
+                        },
+                    )
+                    .await;
+            }
+        }
         let session_id = crate::session::new_session_id();
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -365,9 +390,12 @@ impl Supervisor {
             &self.state_root,
             &session_id,
             WorkerMode::New,
-            name,
-            model,
-            goal,
+            crate::session::NewSessionMeta {
+                name,
+                model,
+                goal,
+                parent_id,
+            },
         )
         .await
         {

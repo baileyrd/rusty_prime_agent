@@ -98,18 +98,38 @@ pub struct AgentSession {
     pending_recovery_marker: Option<SessionEvent>,
 }
 
+/// Creation-time-only metadata for a brand-new session -- bundled so
+/// `AgentSession::create`/`worker::spawn`'s own argument lists don't keep
+/// growing every time a new `session new`-seedable field (`--model`,
+/// `--goal`, `session spawn`'s own `parent_id`) is added. Every field
+/// here is meaningful only for [`AgentSession::create`]: a resumed or
+/// recovered session reads the equivalent values back from its own
+/// persisted `state.json` instead (see `WorkerArgs::goal`'s own doc
+/// comment for why).
+#[derive(Debug, Clone, Default)]
+pub struct NewSessionMeta {
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub goal: Option<String>,
+    pub parent_id: Option<String>,
+}
+
 impl AgentSession {
     /// Create a brand-new session: fresh id, empty transcript, generation
     /// 1. Persists the initial `state.json` before returning.
     pub async fn create(
         state_root: &Path,
         session_id: String,
-        name: Option<String>,
-        model: Option<String>,
-        goal_text: Option<String>,
+        meta: NewSessionMeta,
         provider: Box<dyn ModelProvider>,
         tool_runtime: Box<dyn ToolRuntime>,
     ) -> Result<Self> {
+        let NewSessionMeta {
+            name,
+            model,
+            goal: goal_text,
+            parent_id,
+        } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
         let now = now_ms();
@@ -135,6 +155,7 @@ impl AgentSession {
             model,
             goal,
             harness: HarnessState::default(),
+            parent_id,
         };
         let session = AgentSession {
             state,
@@ -194,7 +215,7 @@ impl AgentSession {
 
     pub fn snapshot_event(&self) -> SessionEvent {
         SessionEvent::Snapshot {
-            state: self.state.clone(),
+            state: Box::new(self.state.clone()),
             transcript: self.transcript.clone(),
         }
     }

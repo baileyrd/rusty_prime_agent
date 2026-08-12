@@ -136,6 +136,7 @@ pub async fn print_once(
             name: None,
             model,
             goal: None,
+            parent_id: None,
         },
     )
     .await?;
@@ -219,6 +220,32 @@ pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> 
     }
 }
 
+/// Shared by [`session_new`] and [`session_spawn`] -- the latter needs
+/// the raw id, not printed text, plus a non-`None` `parent_id`.
+async fn create_session(
+    state_root: &Path,
+    name: Option<String>,
+    model: Option<String>,
+    goal: Option<String>,
+    parent_id: Option<String>,
+) -> Result<String> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionNew {
+            name,
+            model,
+            goal,
+            parent_id,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionNew { session_id } => Ok(session_id),
+        other => Err(unexpected_response(other)),
+    }
+}
+
 pub async fn session_new(
     state_root: &Path,
     name: Option<String>,
@@ -226,66 +253,206 @@ pub async fn session_new(
     goal: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
+    let session_id = create_session(state_root, name, model, goal, None).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::SessionNew { session_id }),
+        OutputMode::Text => println!("{session_id}"),
+    }
+    Ok(())
+}
+
+/// Shared by [`session_list`] and [`session_spawn`]/[`session_children`]/
+/// [`session_message`] -- the latter three need the raw summaries (to
+/// read a parent's `model`, filter by `parent_id`, or validate a
+/// parent/child relationship), not printed text.
+async fn fetch_sessions(state_root: &Path) -> Result<Vec<crate::protocol::SessionSummary>> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionNew { name, model, goal })
+    conn.write_request(Context::Daemon, &Request::SessionList)
         .await?;
     match read_response(&mut conn).await? {
-        response @ Response::SessionNew { .. } => {
-            match (&response, mode) {
-                (_, OutputMode::Json) => print_json(&response),
-                (Response::SessionNew { session_id }, OutputMode::Text) => println!("{session_id}"),
-                _ => unreachable!(),
-            }
-            Ok(())
-        }
+        Response::SessionList { sessions } => Ok(sessions),
         other => Err(unexpected_response(other)),
     }
 }
 
 pub async fn session_list(state_root: &Path, mode: OutputMode) -> Result<()> {
-    let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::SessionList)
-        .await?;
-    match read_response(&mut conn).await? {
-        response @ Response::SessionList { .. } => {
-            if mode == OutputMode::Json {
-                print_json(&response);
-                return Ok(());
-            }
-            let Response::SessionList { sessions } = response else {
-                unreachable!()
-            };
+    let sessions = fetch_sessions(state_root).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::SessionList { sessions }),
+        OutputMode::Text => {
             if sessions.is_empty() {
                 println!("no sessions");
             }
             for s in sessions {
-                let status = match s.status {
-                    SessionStatus::Active => "active",
-                    SessionStatus::Stopped => "stopped",
-                    SessionStatus::Crashed => "crashed",
-                };
-                let name = s.name.as_deref().unwrap_or("-");
-                let worker_pid = s
-                    .worker_pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let model = s.model.as_deref().unwrap_or("echo");
-                println!(
-                    "{}\t{}\t{}\tturns={}\tgeneration={}\tworker_pid={}\tmodel={}\tupdated_at_ms={}",
-                    s.session_id,
-                    status,
-                    name,
-                    s.last_sequence,
-                    s.generation,
-                    worker_pid,
-                    model,
-                    s.updated_at_ms
-                );
+                print_session_summary_line(&s);
             }
-            Ok(())
         }
-        other => Err(unexpected_response(other)),
     }
+    Ok(())
+}
+
+fn print_session_summary_line(s: &crate::protocol::SessionSummary) {
+    let status = match s.status {
+        SessionStatus::Active => "active",
+        SessionStatus::Stopped => "stopped",
+        SessionStatus::Crashed => "crashed",
+    };
+    let name = s.name.as_deref().unwrap_or("-");
+    let worker_pid = s
+        .worker_pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let model = s.model.as_deref().unwrap_or("echo");
+    println!(
+        "{}\t{}\t{}\tturns={}\tgeneration={}\tworker_pid={}\tmodel={}\tupdated_at_ms={}",
+        s.session_id,
+        status,
+        name,
+        s.last_sequence,
+        s.generation,
+        worker_pid,
+        model,
+        s.updated_at_ms
+    );
+}
+
+/// Bounded, non-Python parity with `prime-agent`'s recursive subagents
+/// (`rlm(...)`, `packages/coding-agent/docs/rlm.md`): "The TypeScript
+/// host creates a normal child `AgentSession` with an independent
+/// context and session directory" -- the actual mechanism this project
+/// already has via `session new`, just with `parent_id` recorded and
+/// the parent's `model` inherited unless `--model` overrides it (parity
+/// with "the child inherits the parent model... unless the call
+/// requests another configured model"). Skills/tools/retry-policy
+/// inheritance from that same sentence don't apply here -- this
+/// project's tool runtime is `NoopToolRuntime` and it has no
+/// retry-policy concept to inherit.
+///
+/// "Returns immediately after task admission with a child handle; it
+/// never waits for or returns the child's answer": the task text is
+/// enqueued as a near-immediate one-shot schedule (`ScheduleKind::
+/// Once`) rather than sent as a blocking `SessionPrompt`, reusing the
+/// daemon's existing background schedule-firing loop (`schedule`'s own
+/// module doc comment) as the async dispatch mechanism this project
+/// already has, rather than inventing a new one. `session message` is
+/// the analog of `agent_message.send`.
+pub async fn session_spawn(
+    state_root: &Path,
+    parent_id: String,
+    task: String,
+    model: Option<String>,
+    name: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    let model = match model {
+        Some(m) => Some(m),
+        None => {
+            let sessions = fetch_sessions(state_root).await?;
+            sessions
+                .into_iter()
+                .find(|s| s.session_id == parent_id)
+                .ok_or_else(|| {
+                    HarnessError::conflict(
+                        Context::Daemon,
+                        format!("unknown parent session {parent_id}"),
+                    )
+                })?
+                .model
+        }
+    };
+    let child_id = create_session(state_root, name, model, None, Some(parent_id)).await?;
+    add_schedule(
+        state_root,
+        child_id.clone(),
+        task,
+        crate::protocol::ScheduleKind::Once {
+            at_ms: paths::now_ms(),
+        },
+    )
+    .await?;
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({
+            "type": "session_spawned",
+            "session_id": child_id,
+        })),
+        OutputMode::Text => println!("{child_id}"),
+    }
+    Ok(())
+}
+
+/// `session children <id>` -- direct children only (`parent_id ==
+/// id`), read straight off `session list`'s own summaries rather than
+/// needing a dedicated request.
+pub async fn session_children(
+    state_root: &Path,
+    parent_id: String,
+    mode: OutputMode,
+) -> Result<()> {
+    let children: Vec<_> = fetch_sessions(state_root)
+        .await?
+        .into_iter()
+        .filter(|s| s.parent_id.as_deref() == Some(parent_id.as_str()))
+        .collect();
+    match mode {
+        OutputMode::Json => print_json(&children),
+        OutputMode::Text => {
+            if children.is_empty() {
+                println!("no children");
+            }
+            for s in &children {
+                print_session_summary_line(s);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parity with `agent_message.send(msg, receiver_role="parent"|
+/// "child")`: only a session's own parent or one of its own children is
+/// a valid target, validated here against `session list`'s own
+/// `parent_id` field -- this project's whole trust model is a single
+/// local caller (the same reasoning `session_autonomous`'s
+/// `--quality-gate` shell command already leans on), so this doesn't
+/// need server-side enforcement of its own. Delivered as an ordinary,
+/// visible `SessionPrompt`, prefixed with the sender's id so the
+/// recipient's transcript makes clear where it came from -- `agent_
+/// message`'s replies "arrive only through explicit... replies," never
+/// silently, and this keeps that same visibility.
+pub async fn session_message(
+    state_root: &Path,
+    from_id: String,
+    to_id: String,
+    text: String,
+    mode: OutputMode,
+) -> Result<()> {
+    let sessions = fetch_sessions(state_root).await?;
+    let from = sessions
+        .iter()
+        .find(|s| s.session_id == from_id)
+        .ok_or_else(|| {
+            HarnessError::conflict(Context::Daemon, format!("unknown session {from_id}"))
+        })?;
+    let to = sessions
+        .iter()
+        .find(|s| s.session_id == to_id)
+        .ok_or_else(|| {
+            HarnessError::conflict(Context::Daemon, format!("unknown session {to_id}"))
+        })?;
+    let is_parent = from.parent_id.as_deref() == Some(to_id.as_str());
+    let is_child = to.parent_id.as_deref() == Some(from_id.as_str());
+    if !is_parent && !is_child {
+        return Err(HarnessError::conflict(
+            Context::Daemon,
+            format!("{to_id} is neither the parent nor a child of {from_id}"),
+        ));
+    }
+    let prefixed = format!("[from {from_id}] {text}");
+    let entry = send_prompt(state_root, &to_id, prefixed).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+        OutputMode::Text => print_entry(&entry),
+    }
+    Ok(())
 }
 
 pub async fn session_attach(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
@@ -511,13 +678,14 @@ pub async fn session_rename(
     }
 }
 
-pub async fn schedule_add(
+/// Shared by [`schedule_add`] and [`session_spawn`]'s own near-immediate
+/// one-shot enqueue -- the latter needs the raw id, not printed text.
+async fn add_schedule(
     state_root: &Path,
     session_id: String,
     text: String,
     kind: crate::protocol::ScheduleKind,
-    mode: OutputMode,
-) -> Result<()> {
+) -> Result<String> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
@@ -529,18 +697,24 @@ pub async fn schedule_add(
     )
     .await?;
     match read_response(&mut conn).await? {
-        response @ Response::ScheduleAdded { .. } => {
-            match (&response, mode) {
-                (_, OutputMode::Json) => print_json(&response),
-                (Response::ScheduleAdded { schedule_id }, OutputMode::Text) => {
-                    println!("{schedule_id}")
-                }
-                _ => unreachable!(),
-            }
-            Ok(())
-        }
+        Response::ScheduleAdded { schedule_id } => Ok(schedule_id),
         other => Err(unexpected_response(other)),
     }
+}
+
+pub async fn schedule_add(
+    state_root: &Path,
+    session_id: String,
+    text: String,
+    kind: crate::protocol::ScheduleKind,
+    mode: OutputMode,
+) -> Result<()> {
+    let schedule_id = add_schedule(state_root, session_id, text, kind).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::ScheduleAdded { schedule_id }),
+        OutputMode::Text => println!("{schedule_id}"),
+    }
+    Ok(())
 }
 
 pub async fn schedule_list(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
