@@ -54,7 +54,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "platform"
 version = "0.27.0"
-source = "git+https://github.com/baileyrd/rustils?rev=bc4f6a6a95e2fde628d6064d9584590bfd54fb6e#bc4f6a6a95e2fde628d6064d9584590bfd54fb6e"
+source = "git+https://github.com/baileyrd/rustils?rev=4c0f8f089583d601f89e72377ed8777c8bb45afb#4c0f8f089583d601f89e72377ed8777c8bb45afb"
 dependencies = [
  "thiserror",
 ]
@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "platform-bsd"
 version = "0.27.0"
-source = "git+https://github.com/baileyrd/rustils?rev=bc4f6a6a95e2fde628d6064d9584590bfd54fb6e#bc4f6a6a95e2fde628d6064d9584590bfd54fb6e"
+source = "git+https://github.com/baileyrd/rustils?rev=4c0f8f089583d601f89e72377ed8777c8bb45afb#4c0f8f089583d601f89e72377ed8777c8bb45afb"
 dependencies = [
  "libc",
  "platform",
@@ -71,7 +71,7 @@ dependencies = [
 [[package]]
 name = "platform-linux"
 version = "0.27.0"
-source = "git+https://github.com/baileyrd/rustils?rev=bc4f6a6a95e2fde628d6064d9584590bfd54fb6e#bc4f6a6a95e2fde628d6064d9584590bfd54fb6e"
+source = "git+https://github.com/baileyrd/rustils?rev=4c0f8f089583d601f89e72377ed8777c8bb45afb#4c0f8f089583d601f89e72377ed8777c8bb45afb"
 dependencies = [
  "libc",
  "platform",
@@ -80,7 +80,7 @@ dependencies = [
 [[package]]
 name = "platform-windows"
 version = "0.27.0"
-source = "git+https://github.com/baileyrd/rustils?rev=bc4f6a6a95e2fde628d6064d9584590bfd54fb6e#bc4f6a6a95e2fde628d6064d9584590bfd54fb6e"
+source = "git+https://github.com/baileyrd/rustils?rev=4c0f8f089583d601f89e72377ed8777c8bb45afb#4c0f8f089583d601f89e72377ed8777c8bb45afb"
 dependencies = [
  "platform",
  "winargv",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio"
 version = "0.2.0"
-source = "git+https://github.com/baileyrd/rusty_tokio?rev=5e59c184db6d753b12abb9b3c7f83db8e486c9ff#5e59c184db6d753b12abb9b3c7f83db8e486c9ff"
+source = "git+https://github.com/baileyrd/rusty_tokio?rev=c4a4c635f3f9afdc47a2e8afdcf74e9403dd8658#c4a4c635f3f9afdc47a2e8afdcf74e9403dd8658"
 dependencies = [
  "bytes",
  "crossbeam-deque",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio-macros"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rusty_tokio?rev=5e59c184db6d753b12abb9b3c7f83db8e486c9ff#5e59c184db6d753b12abb9b3c7f83db8e486c9ff"
+source = "git+https://github.com/baileyrd/rusty_tokio?rev=c4a4c635f3f9afdc47a2e8afdcf74e9403dd8658#c4a4c635f3f9afdc47a2e8afdcf74e9403dd8658"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -257,7 +257,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "winargv"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rustils?rev=bc4f6a6a95e2fde628d6064d9584590bfd54fb6e#bc4f6a6a95e2fde628d6064d9584590bfd54fb6e"
+source = "git+https://github.com/baileyrd/rustils?rev=4c0f8f089583d601f89e72377ed8777c8bb45afb#4c0f8f089583d601f89e72377ed8777c8bb45afb"
 dependencies = [
  "platform",
 ]
