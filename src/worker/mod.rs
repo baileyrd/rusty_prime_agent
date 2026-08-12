@@ -147,27 +147,34 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
     }
 }
 
-/// One-time kernel setup once `tool_runtime` is up: puts
-/// `paths::global_skills_dir` on the kernel's `sys.path` so `import
-/// <skill-name>` resolves, for every skill `skills::discover` finds --
-/// see that module's own doc comment for the on-disk layout. A no-op
-/// (zero extra `execute_request` round trips) when no skills are
-/// installed; propagates a genuine execution failure via `?`, same
-/// "fail loudly on a broken startup precondition" convention as
-/// `build_provider`'s own callers.
-async fn install_skills(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
+/// One-time kernel setup once `tool_runtime` is up. Always defines
+/// `rlm_heartbeat()` in the kernel's own globals -- parity with
+/// `prime-agent`'s kernel-side manual re-entry trigger (`session::
+/// execute_python_tool_call` watches for the marker it prints, see that
+/// module's own doc comment) -- and, only when `skills::discover` finds
+/// any, also puts `paths::global_skills_dir` on the kernel's `sys.path`
+/// so `import <skill-name>` resolves. Always exactly one
+/// `execute_request` when `--runtime ipython` (previously zero when no
+/// skills were installed); propagates a genuine execution failure via
+/// `?`, same "fail loudly on a broken startup precondition" convention
+/// as `build_provider`'s own callers.
+async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
+    let mut code = format!(
+        "def rlm_heartbeat():\n    print({marker:?})\n    return \"heartbeat requested\"\n",
+        marker = crate::session::HEARTBEAT_MARKER
+    );
+
     let skills = crate::skills::discover(state_root)?;
-    if skills.is_empty() {
-        return Ok(());
+    if !skills.is_empty() {
+        let skills_dir = paths::global_skills_dir(state_root);
+        let skills_dir_json = serde_json::to_string(&skills_dir.display().to_string())
+            .map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
+        code.push_str(&format!(
+            "import sys; sys.path.insert(0, {skills_dir_json})\n"
+        ));
     }
-    let skills_dir = paths::global_skills_dir(state_root);
-    let skills_dir_json = serde_json::to_string(&skills_dir.display().to_string())
-        .map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
-    tool_runtime
-        .execute(&format!(
-            "import sys; sys.path.insert(0, {skills_dir_json})"
-        ))
-        .await?;
+
+    tool_runtime.execute(&code).await?;
     Ok(())
 }
 
@@ -177,7 +184,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut tool_runtime = build_tool_runtime(&session_dir, args.runtime.as_deref());
     tool_runtime.start().await?;
     if args.runtime.as_deref() == Some("ipython") {
-        install_skills(&args.state_root, tool_runtime.as_mut()).await?;
+        bootstrap_kernel(&args.state_root, tool_runtime.as_mut()).await?;
     }
     let provider = build_provider(&args.state_root, args.model.clone(), args.thinking.clone())?;
 

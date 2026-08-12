@@ -31,6 +31,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusty_tokio::sync::broadcast;
 
@@ -38,10 +39,21 @@ use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
     GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState,
-    Role, SessionEvent, SessionState, SessionStatus, ToolCallRequest, TranscriptEntry,
+    Request, Role, ScheduleKind, SessionEvent, SessionState, SessionStatus, ToolCallRequest,
+    TranscriptEntry,
 };
 use crate::provider::{ChatTurn, ModelProvider, ProviderReply, ToolDef, TurnRole};
 use crate::tool_runtime::ToolRuntime;
+use crate::transport;
+
+/// Printed by the kernel's own `rlm_heartbeat()` (defined in every
+/// `--runtime ipython` kernel by `worker::bootstrap_kernel`) -- parity
+/// with `prime-agent`'s kernel-callable manual re-entry trigger.
+/// `execute_python_tool_call` watches for this in a call's stdout,
+/// strips it from what the model sees, and dispatches to
+/// `trigger_heartbeat` when found. A plain ASCII marker, not something a
+/// real print() is likely to emit by accident.
+pub(crate) const HEARTBEAT_MARKER: &str = "___RPA_HEARTBEAT___";
 
 /// Generates a session id unique enough for this project's needs: not
 /// cryptographically random (no `rand` dependency for a display id no
@@ -445,6 +457,12 @@ impl AgentSession {
     /// failure (the connection dropped, a timeout) still propagates as a
     /// real `Result::Err`, the same as `mcp_client::McpClient::call_tool`'s
     /// own failure path.
+    ///
+    /// If the code called the kernel's own `rlm_heartbeat()` (defined by
+    /// `worker::bootstrap_kernel`), its `HEARTBEAT_MARKER` shows up in
+    /// `stdout` -- stripped from what the model sees and dispatched to
+    /// `trigger_heartbeat` instead of shown as raw internal protocol
+    /// noise.
     async fn execute_python_tool_call(&mut self, arguments: &str) -> Result<String> {
         let value: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(v) => v,
@@ -455,17 +473,76 @@ impl AgentSession {
             None => return Ok("error: missing required `code` argument".to_string()),
         };
         let outcome = self.tool_runtime.execute(&code).await?;
-        let mut text = outcome.stdout;
+        let heartbeat_requested = outcome.stdout.contains(HEARTBEAT_MARKER);
+        let mut text = if heartbeat_requested {
+            outcome.stdout.replace(HEARTBEAT_MARKER, "")
+        } else {
+            outcome.stdout
+        };
         if let Some(result) = outcome.result {
             if !text.is_empty() {
                 text.push('\n');
             }
             text.push_str(&result);
         }
+        if heartbeat_requested {
+            let status = self.trigger_heartbeat().await?;
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&status);
+        }
         if text.is_empty() {
             text = "(no output)".to_string();
         }
         Ok(text)
+    }
+
+    /// Handles a kernel-side `rlm_heartbeat()` call -- parity with
+    /// `prime-agent`'s manual re-entry trigger, see `HEARTBEAT_MARKER`'s
+    /// own doc comment. With no `Active` goal, explains and schedules
+    /// nothing (same precondition `session_autonomous` itself has for
+    /// its own continuation prompts). Otherwise, connects to this
+    /// process's own daemon -- an ordinary client connection to
+    /// `daemon.sock`, the same `transport`/`Request`/`Response`
+    /// primitives every `client.rs` function already uses -- and asks it
+    /// to fire a one-shot continuation prompt (`Request::ScheduleAdd`,
+    /// `ScheduleKind::Once { at_ms: now_ms() }`, the exact "near-
+    /// immediate one-shot" pattern `client::session_spawn` already
+    /// established) rather than calling `self.prompt()` directly (which
+    /// would recurse into this same in-flight `prompt()` call and
+    /// interleave transcript entries out of order) or writing
+    /// `schedules.json` directly (`schedule.rs`'s own doc comment: it has
+    /// exactly one safe writer, the daemon's own background firing loop
+    /// -- a second, unsynchronized writer racing that loop's own
+    /// read-modify-write could lose or resurrect entries). The response
+    /// read is best-effort: a request that's already been written and
+    /// accepted by the daemon has very likely already taken effect even
+    /// if this connection doesn't get to read the ack back.
+    async fn trigger_heartbeat(&self) -> Result<String> {
+        let Some(goal) = &self.state.goal else {
+            return Ok("(heartbeat ignored: no active goal set)".to_string());
+        };
+        if goal.status != GoalStatus::Active {
+            return Ok("(heartbeat ignored: goal is not active)".to_string());
+        }
+        let text = format!("Continue working toward the goal: {}", goal.text);
+
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(
+            Context::Daemon,
+            &Request::ScheduleAdd {
+                session_id: self.state.session_id.clone(),
+                text,
+                kind: ScheduleKind::Once { at_ms: now_ms() },
+            },
+        )
+        .await?;
+        let _ =
+            rusty_tokio::time::timeout(Duration::from_secs(5), conn.read_response(Context::Daemon))
+                .await;
+        Ok("(heartbeat scheduled: will continue toward the goal shortly)".to_string())
     }
 
     /// Returns this session's cached `McpClient`, connecting one (against

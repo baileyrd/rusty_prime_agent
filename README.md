@@ -84,7 +84,10 @@ model sends code, gets stdout/the last expression's value back, and
 variables/imports persist across calls within the session. Off by
 default; `EchoProvider` sessions can set it too, but never actually
 invoke it. Drop real Python packages into `<state-dir>/skills/` to make
-them `import`-able in the kernel -- see "Skills" below.
+them `import`-able in the kernel -- see "Skills" below. The kernel also
+gets a built-in `rlm_heartbeat()` function: calling it (with an `Active`
+goal set) schedules an immediate continuation prompt, the kernel-callable
+sibling of `session repl`'s own `/heartbeat`.
 
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
@@ -225,7 +228,10 @@ harness session repl <id>
 
 Reads lines from stdin, sends each as a prompt, prints the reply, until
 EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
-existing transcript first.
+existing transcript first. A line that's exactly `/heartbeat` manually
+re-enters the session's `Active` goal right away (`"Continue working
+toward the goal: ..."`) -- with no active goal, it prints an explanation
+and sends nothing.
 
 ### Model providers
 

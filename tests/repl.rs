@@ -65,6 +65,60 @@ fn repl_stops_at_an_explicit_exit_line_without_reaching_eof() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// Parity with `prime-agent`'s `/heartbeat` -- see `client::session_repl`'s
+/// own doc comment for why it's an immediate `send_prompt`, not routed
+/// through `session schedule` the way its kernel-callable sibling
+/// (`rlm_heartbeat()`) has to be.
+#[test]
+fn repl_heartbeat_with_no_active_goal_sends_nothing() {
+    let state_dir = common::TempDir::new("repl-heartbeat-no-goal");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/heartbeat\n/exit\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no active goal"),
+        "expected an explanation, got: {stdout}"
+    );
+
+    // Nothing was sent -- the transcript is still empty.
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=0"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_heartbeat_with_an_active_goal_sends_a_continuation_prompt() {
+    let state_dir = common::TempDir::new("repl-heartbeat-active-goal");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "goal", "set", &session_id, "write", "a", "haiku"],
+    );
+    common::assert_success("session goal set", &out);
+
+    let out = run_repl(state_dir.path(), &session_id, "/heartbeat\n/exit\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("echo: Continue working toward the goal: write a haiku"),
+        "got: {stdout}"
+    );
+
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("turns=2"),
+        "one heartbeat should produce one user+assistant pair, got: {listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 #[test]
 fn repl_replays_prior_transcript_before_reading_new_input() {
     let state_dir = common::TempDir::new("repl-replay");

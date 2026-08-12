@@ -834,4 +834,61 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&session_dir);
     }
+
+    /// Real end-to-end coverage for the kernel-side half of `/heartbeat`'s
+    /// sibling, `rlm_heartbeat()`: defines it exactly the way `worker::
+    /// bootstrap_kernel` does, calls it, and confirms the marker
+    /// `session::HEARTBEAT_MARKER` watches for actually shows up in
+    /// `execute()`'s stdout. Deliberately does not go through
+    /// `worker::run`/a real daemon (that needs a real model to decide to
+    /// call `execute_python` in the first place -- small-model tool-call
+    /// reliability is a separate, already-documented caveat elsewhere in
+    /// this project's test suite) -- this is the same "prove the
+    /// mechanism directly and deterministically" reasoning as this
+    /// module's other real-kernel tests. `#[ignore]`d for the same real-
+    /// `ipykernel`-install reason as its siblings.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_rlm_heartbeat_prints_the_marker() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-heartbeat-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the code `worker::bootstrap_kernel` sends.
+        let marker = crate::session::HEARTBEAT_MARKER;
+        let define_code = format!(
+            "def rlm_heartbeat():\n    print({marker:?})\n    return \"heartbeat requested\"\n"
+        );
+        runtime
+            .execute(&define_code)
+            .await
+            .expect("defining rlm_heartbeat should round-trip");
+
+        let outcome = runtime
+            .execute("rlm_heartbeat()")
+            .await
+            .expect("calling rlm_heartbeat should round-trip");
+        assert!(
+            outcome.stdout.contains(marker),
+            "expected the heartbeat marker in stdout, got: {:?}",
+            outcome.stdout
+        );
+        assert_eq!(outcome.result.as_deref(), Some("'heartbeat requested'"));
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
 }
