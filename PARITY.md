@@ -168,6 +168,27 @@ daemon/worker split rather than requiring the Python control environment:
   policy would read -- it does not itself make the agent act on the goal;
   see "Heartbeats, bounded autonomous mode" below for that remaining
   piece.
+- [x] **Bounded autonomous mode** (`session autonomous <id> --max-turns N
+  [--max-time DURATION] [--quality-gate CMD]`, parity with `prime-agent
+  /autonomous`'s turn/token/time budgets and user-defined quality gates).
+  Requires an existing `Active` goal (`session goal set`); repeatedly
+  sends a `Continue working toward the goal: <text>` `SessionPrompt` until
+  `--max-turns` turns have gone out, `--max-time` (if given) elapses, or
+  `--quality-gate` (if given, an arbitrary shell command -- `sh -c` on
+  Unix, `cmd /C` on Windows) exits zero, at which point the goal is
+  marked `Complete`. No token budget: neither `EchoProvider` nor
+  `RustyProviderModel`'s `rp-server` round trip surfaces token counts
+  today, so only turns and wall-clock time are tracked. The goal is
+  re-fetched at the top of every iteration, so an external `pause`/
+  `complete`/`clear` from another client is honored as a normal stop
+  condition on the next turn rather than raced against. Deliberately a
+  one-shot foreground CLI loop (parity with `session prompt` and every
+  other subcommand here), not a persistent daemon-side background loop --
+  `prime-agent /autonomous` itself runs inside an already-live
+  interactive session, which this project doesn't have (see "The
+  interactive TUI" below); an always-on daemon-side autonomous loop
+  would be the larger, genuinely-new-subsystem version of this and isn't
+  attempted.
 
 ## Out of scope for this project's current shape
 
@@ -185,10 +206,14 @@ not attempted here, and not silently implied by anything in
 - **The Continual Harness** (`/refine`, durable supplemental
   prompts/memories/skill descriptions with rollback).
 - **Skills, extensions, prompt templates, themes, MCP integrations.**
-- **Heartbeats, bounded autonomous mode** (`/heartbeat`, `--autonomous*`).
-  (Scheduling itself -- `prime-agent schedule` -- and persistent goals --
-  `prime-agent --goal`/`/goal` -- are both done; see the medium-effort
-  section above.)
+- **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
+  triggers for the same "re-enter a session periodically" mechanism
+  `prime-agent schedule`/`session schedule` already covers server-side
+  (see the medium-effort section above); these two are just alternate
+  entry points into it that need the TUI or the RLM programming model,
+  both themselves out of scope below. (Scheduling, persistent goals, and
+  bounded autonomous mode -- `prime-agent schedule`/`--goal`/`/goal`/
+  `/autonomous` -- are all done; see the medium-effort section above.)
 - **The interactive TUI** and its editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`).

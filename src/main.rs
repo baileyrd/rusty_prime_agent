@@ -166,6 +166,22 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::GoalShow { session_id } => {
             client::goal_show(&state_root, session_id, output_mode).await
         }
+        cli::Command::SessionAutonomous {
+            session_id,
+            max_turns,
+            max_time_ms,
+            quality_gate,
+        } => {
+            client::session_autonomous(
+                &state_root,
+                session_id,
+                max_turns,
+                max_time_ms,
+                quality_gate,
+                output_mode,
+            )
+            .await
+        }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }

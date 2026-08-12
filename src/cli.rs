@@ -101,6 +101,20 @@ pub enum Command {
     GoalShow {
         session_id: String,
     },
+    /// `harness session autonomous <id> --max-turns N [--max-time
+    /// DURATION] [--quality-gate CMD]` -- bounded parity with
+    /// `prime-agent /autonomous`'s turn/token/time budgets and
+    /// user-defined quality gates. No token budget: neither
+    /// `EchoProvider` nor `RustyProviderModel`'s `rp-server` round trip
+    /// surfaces token counts today, so only turns and wall-clock time are
+    /// tracked -- see `PARITY.md`. Requires an existing `Active` goal
+    /// (`session goal set`) to drive the continuation prompts.
+    SessionAutonomous {
+        session_id: String,
+        max_turns: u32,
+        max_time_ms: Option<u64>,
+        quality_gate: Option<String>,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -239,14 +253,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
             }
             Some("schedule") => parse_schedule(&mut it),
             Some("goal") => parse_goal(&mut it),
+            Some("autonomous") => parse_autonomous(&mut it),
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous`, got {other:?}"
             ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename>`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous>`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
@@ -401,6 +416,30 @@ fn parse_goal<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> 
             "expected `session goal set|show|pause|resume|complete|clear`, got {other:?}"
         ))),
     }
+}
+
+/// `session autonomous <id> --max-turns N [--max-time DURATION]
+/// [--quality-gate CMD]`.
+fn parse_autonomous<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command> {
+    let session_id = it
+        .next()
+        .cloned()
+        .ok_or_else(|| usage("`session autonomous` requires a session id"))?;
+    let rest: Vec<&String> = it.collect();
+    let max_turns: u32 = scan_named_flag(&rest, "--max-turns")?
+        .ok_or_else(|| usage("`session autonomous` requires `--max-turns`"))?
+        .parse()
+        .map_err(|_| usage("--max-turns requires a positive integer"))?;
+    let max_time_ms = scan_named_flag(&rest, "--max-time")?
+        .map(|s| parse_duration_ms(&s))
+        .transpose()?;
+    let quality_gate = scan_named_flag(&rest, "--quality-gate")?;
+    Ok(Command::SessionAutonomous {
+        session_id,
+        max_turns,
+        max_time_ms,
+        quality_gate,
+    })
 }
 
 /// A duration string like `30s`/`5m`/`2h`/`1d` (a number plus one of
