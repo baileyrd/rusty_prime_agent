@@ -196,6 +196,9 @@ impl Supervisor {
                 self.handle_session_prompt(&mut conn, session_id, text)
                     .await
             }
+            Request::SessionStop { session_id } => {
+                self.handle_session_stop(&mut conn, session_id).await
+            }
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -366,6 +369,55 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// Parity with `prime-agent stop <agent>`. Deliberately does not go
+    /// through `ensure_worker_running`/`resolve_worker` -- those exist to
+    /// *revive* a session's worker on demand, the opposite of what
+    /// stopping one should do. Held under `spawn_lock` for the same
+    /// reason `ensure_worker_running` is: without it, a `SessionStop`
+    /// racing a concurrent `SessionAttach`/`SessionPrompt`'s respawn
+    /// could observe "no live worker" just before the other request
+    /// finishes spawning one, then never stop it.
+    async fn handle_session_stop(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let _guard = self.spawn_lock.lock().await;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        if !is_worker_alive(&state)? {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::SessionStopAck {
+                        already_stopped: true,
+                    },
+                )
+                .await;
+        }
+        let socket_path = paths::worker_socket_path(&self.state_root, &session_id);
+        if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
+            let _ = private
+                .write_request(Context::Worker, &Request::WorkerShutdown)
+                .await;
+            let _ = private.read_response(Context::Worker).await;
+        }
+        conn.write_response(
+            Context::Daemon,
+            &Response::SessionStopAck {
+                already_stopped: false,
+            },
+        )
+        .await
     }
 
     async fn handle_session_prompt(

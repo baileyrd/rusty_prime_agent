@@ -53,8 +53,18 @@ pub enum Request {
         session_id: String,
         text: String,
     },
+    /// Parity with `prime-agent stop <agent>`: gracefully shut down one
+    /// session's worker without touching any other session or the
+    /// daemon itself. Idempotent -- stopping a session that is already
+    /// `Stopped` or `Crashed` (no live worker to shut down) still
+    /// succeeds, since the end state ("no worker running for this
+    /// session") already holds.
+    SessionStop {
+        session_id: String,
+    },
     /// Private transport only: supervisor -> worker, asking it to persist
-    /// its final state and exit cleanly (used by `daemon shutdown`).
+    /// its final state and exit cleanly (used by `daemon shutdown` and
+    /// `SessionStop`).
     WorkerShutdown,
 }
 
@@ -90,6 +100,13 @@ pub enum Response {
     /// terminal [`Response::Error`].
     SessionAttachStarted {
         session_id: String,
+    },
+    /// `already_stopped` is true when there was no live worker to shut
+    /// down in the first place (already `Stopped`/`Crashed`) -- still a
+    /// success, but lets the CLI print an accurate message instead of
+    /// implying a worker was just torn down.
+    SessionStopAck {
+        already_stopped: bool,
     },
     WorkerShutdownAck,
 }

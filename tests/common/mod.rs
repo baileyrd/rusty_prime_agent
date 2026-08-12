@@ -176,6 +176,12 @@ pub fn worker_pid(state_dir: &Path, session_id: &str) -> u32 {
         .expect("state.json has worker_pid") as u32
 }
 
+pub fn session_stop(state_dir: &Path, session_id: &str) -> String {
+    let out = run(state_dir, &["session", "stop", session_id]);
+    assert_success("session stop", &out);
+    stdout_string(&out)
+}
+
 pub fn session_status(state_dir: &Path, session_id: &str) -> String {
     let text = std::fs::read_to_string(
         state_dir

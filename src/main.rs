@@ -135,6 +135,9 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionPrompt { session_id, text } => {
             client::session_prompt(&state_root, session_id, text).await
         }
+        cli::Command::SessionStop { session_id } => {
+            client::session_stop(&state_root, session_id).await
+        }
         cli::Command::SupervisorMain => daemon::run(state_root, exe_path).await,
         cli::Command::WorkerMain {
             session_id,

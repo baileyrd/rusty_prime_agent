@@ -207,6 +207,23 @@ pub async fn session_prompt(state_root: &Path, session_id: String, text: String)
     }
 }
 
+pub async fn session_stop(state_root: &Path, session_id: String) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::SessionStop { session_id })
+        .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionStopAck { already_stopped } => {
+            if already_stopped {
+                println!("session already stopped");
+            } else {
+                println!("session stopped");
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
 /// Response reads get a bounded timeout: a `connect()` that completed
 /// but whose peer is gone (e.g. a client racing a supervisor that was
 /// just force-killed -- the OS can briefly still complete a connect

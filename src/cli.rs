@@ -1,9 +1,10 @@
 //! Argument parsing and dispatch for the public CLI surface (Required
-//! Behavior: `daemon start/status/shutdown`, `session new/attach/list`)
-//! plus the two hidden entrypoints this binary spawns itself as
-//! (`__supervisor-main`, `__worker-main`).
+//! Behavior: `daemon start/status/shutdown`, `session new/attach/list`,
+//! plus `session stop` -- parity with `prime-agent stop <agent>`, see
+//! `PARITY.md`) plus the two hidden entrypoints this binary spawns itself
+//! as (`__supervisor-main`, `__worker-main`).
 //!
-//! Hand-rolled, not `clap`: the surface is eight fixed subcommands with
+//! Hand-rolled, not `clap`: the surface is nine fixed subcommands with
 //! at most two positional/flag arguments each -- a dependency buys
 //! nothing here that fifty lines of matching doesn't already give
 //! directly, and this project's dependency floor (`platform`,
@@ -29,6 +30,9 @@ pub enum Command {
     SessionPrompt {
         session_id: String,
         text: String,
+    },
+    SessionStop {
+        session_id: String,
     },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
@@ -87,7 +91,16 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     text: text.join(" "),
                 })
             }
-            other => Err(usage(format!("expected `session new|attach|list|prompt`, got {other:?}"))),
+            Some("stop") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session stop` requires a session id"))?;
+                Ok(Command::SessionStop { session_id })
+            }
+            other => Err(usage(format!(
+                "expected `session new|attach|list|prompt|stop`, got {other:?}"
+            ))),
         },
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),

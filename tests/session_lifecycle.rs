@@ -91,6 +91,69 @@ fn session_new_prompt_attach_list_round_trip() {
 }
 
 #[test]
+fn session_stop_shuts_down_one_worker_without_touching_others() {
+    // Parity with `prime-agent stop <agent>`: stopping one session must
+    // not require (or trigger) a full `daemon shutdown`, and must leave
+    // every other session's worker untouched.
+    let state_dir = common::TempDir::new("session-stop");
+    common::daemon_start(state_dir.path());
+
+    let stopped_id = common::session_new(state_dir.path(), Some("to-be-stopped"));
+    let survivor_id = common::session_new(state_dir.path(), Some("survivor"));
+    common::session_prompt(state_dir.path(), &stopped_id, "before stop");
+
+    let status = common::daemon_status(state_dir.path());
+    assert!(
+        status.contains("sessions_active=2"),
+        "expected two active sessions before stopping either, got: {status}"
+    );
+
+    let ack = common::session_stop(state_dir.path(), &stopped_id);
+    assert!(
+        ack.contains("session stopped"),
+        "stopping a live session should not report it as already stopped, got: {ack}"
+    );
+
+    assert!(
+        common::wait_until(
+            || common::session_status(state_dir.path(), &stopped_id) == "stopped",
+            Duration::from_secs(5)
+        ),
+        "session should read back as stopped in state.json after `session stop`"
+    );
+
+    let status = common::daemon_status(state_dir.path());
+    assert!(
+        status.contains("sessions_active=1"),
+        "the survivor session must still be counted active, got: {status}"
+    );
+    assert_eq!(
+        common::session_status(state_dir.path(), &survivor_id),
+        "active",
+        "stopping one session must not affect a different session's status"
+    );
+
+    // Idempotent: stopping an already-stopped session is still a
+    // success, just reported as a no-op rather than a fresh shutdown.
+    let ack = common::session_stop(state_dir.path(), &stopped_id);
+    assert!(
+        ack.contains("already stopped"),
+        "stopping an already-stopped session should say so, got: {ack}"
+    );
+
+    // A prompt against a stopped session must still work -- it resumes
+    // (not recovers/crash-replays) a fresh worker, the same as any other
+    // on-demand respawn.
+    let ack = common::session_prompt(state_dir.path(), &stopped_id, "after stop");
+    assert!(
+        ack.contains("echo: after stop"),
+        "prompting a stopped session should transparently resume it, got: {ack}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn unknown_session_attach_reports_a_conflict_not_a_crash() {
     let state_dir = common::TempDir::new("unknown-session");
     common::daemon_start(state_dir.path());
