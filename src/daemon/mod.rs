@@ -67,6 +67,18 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         spawn_lock: Mutex::new(()),
     });
 
+    // Gated on RUSTY_PRIME_AGENT_PROVIDER=ollama (EchoProvider stays the
+    // default): a singleton per state root, exactly like the supervisor
+    // itself -- see `rp_server::ensure_running`'s own doc comment for why
+    // this lives here rather than in each worker. Failing loud (not
+    // falling back to EchoProvider) on a startup failure matches this
+    // project's own boundary-validation philosophy: a caller that
+    // explicitly opted into the real backend should hear about it
+    // immediately if it can't come up, not silently get echoed prompts.
+    if provider_is_ollama() {
+        crate::rp_server::ensure_running(&state_root).await?;
+    }
+
     supervisor.recover_on_startup().await;
 
     // 20s, not a shorter window: rebinding right after force-killing a
@@ -99,6 +111,14 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
             }
         });
     }
+}
+
+/// Shared, in spirit, with `worker::provider_is_ollama` -- not literally
+/// (different modules, same one-line env check), since sharing it would
+/// mean introducing a dependency between two modules that otherwise have
+/// no reason to know about each other.
+fn provider_is_ollama() -> bool {
+    std::env::var("RUSTY_PRIME_AGENT_PROVIDER").as_deref() == Ok("ollama")
 }
 
 fn record_daemon_pid(state_root: &Path) -> Result<u64> {
@@ -250,6 +270,10 @@ impl Supervisor {
         }
         conn.write_response(Context::Daemon, &Response::DaemonShutdownAck)
             .await?;
+        // No-op if no sidecar was ever started for this state root (the
+        // ordinary EchoProvider case) -- see `rp_server::shutdown`'s own
+        // doc comment.
+        crate::rp_server::shutdown(&self.state_root);
         let _ = std::fs::remove_file(paths::daemon_socket_path(&self.state_root));
         let _ = std::fs::remove_file(paths::daemon_pid_path(&self.state_root));
         // Same blunt-but-honest exit as the worker's own `WorkerShutdown`

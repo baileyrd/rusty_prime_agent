@@ -115,3 +115,49 @@ pub fn is_alive(pid: u32) -> io::Result<bool> {
         }
     }
 }
+
+/// Terminates an arbitrary pid this process did not itself spawn --
+/// `rp_server::shutdown`'s counterpart to `is_alive` above, for tearing
+/// down the `rp-server` sidecar on `daemon shutdown`. Unix: `SIGTERM`
+/// (graceful, not `SIGKILL` -- unlike `tests/common::force_kill`'s
+/// deliberate hard-kill, which exists specifically to *simulate* a crash;
+/// this is an ordinary, cooperative shutdown request). Windows has no
+/// signal-delivery equivalent to ask a process to shut down
+/// cooperatively, so `TerminateProcess` is the only primitive available
+/// either way.
+pub fn kill(pid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(pid, SIGTERM)` on a caller-supplied pid is a
+        // plain, well-defined POSIX call.
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        // SAFETY: plain Win32 calls on a caller-supplied pid; the handle
+        // is checked before use and closed on every path that opened one.
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let ok = TerminateProcess(handle, 1);
+            let err = io::Error::last_os_error();
+            CloseHandle(handle);
+            if ok != 0 {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}

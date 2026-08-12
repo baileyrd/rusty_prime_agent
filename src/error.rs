@@ -30,6 +30,9 @@ pub enum Context {
     Catalog,
     /// CLI argument parsing / dispatch.
     Cli,
+    /// The `rp-server` sidecar (spawn, health check) or a `ModelProvider`
+    /// backend's HTTP call to it -- see `rp_server`/`provider::OllamaProvider`.
+    Provider,
 }
 
 impl fmt::Display for Context {
@@ -40,6 +43,7 @@ impl fmt::Display for Context {
             Context::Session => "session",
             Context::Catalog => "catalog",
             Context::Cli => "cli",
+            Context::Provider => "provider",
         };
         f.write_str(s)
     }

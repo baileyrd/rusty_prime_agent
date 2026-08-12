@@ -74,12 +74,44 @@ environment:
 Would need a new subsystem, but one that composes with the existing
 daemon/worker split rather than requiring the Python control environment:
 
-- **A real `ModelProvider` backend.** `provider::EchoProvider` is a
+- [x] **A real `ModelProvider` backend.** `provider::EchoProvider` was a
   deliberate Phase 1 stand-in (Non-Goal: "stub with a fake provider that
   echoes turns"); `prime-agent` streams real model responses through
-  `--provider`/`--model`/`--api-key`. The `ModelProvider` trait boundary
-  already exists for this; a real backend is an HTTP-calling
-  implementation behind it, not an architecture change.
+  `--provider`/`--model`/`--api-key`. `provider::OllamaProvider`
+  (`RUSTY_PRIME_AGENT_PROVIDER=ollama`, `EchoProvider` stays the default)
+  is a real, network-calling backend built on the existing
+  `ModelProvider` trait boundary rather than a redesign of it -- routed
+  through [`rusty_provider`](https://github.com/baileyrd/rusty_provider)'s
+  `rp-server` (an OpenAI-compatible provider router this org already
+  maintains, per the "check a sibling repo before writing anything from
+  scratch" rule) rather than calling Ollama's own API directly, so the
+  same path composes with any other backend `rusty_provider` already
+  supports (OpenAI, Anthropic, Gemini, Groq, ...), not just Ollama.
+  `rp-server` runs as a supervisor-owned sidecar process (`rp_server.rs`,
+  spawned once at daemon startup, torn down on `daemon shutdown`) rather
+  than a library dependency -- it's built on real `tokio`, not this
+  project's `rusty_tokio`, and two async runtimes in one process is a
+  worse boundary than an HTTP call to a process this project already
+  manages the lifecycle of. `http_client.rs` is a hand-rolled, ~100-line
+  HTTP/1.1 client (connect, one request, read to EOF) rather than a
+  `reqwest`/`hyper` dependency, matching this project's narrow dependency
+  floor -- every call it makes is a single round trip to a loopback peer
+  this project itself spawned. Verified against a real, locally-pulled
+  model (`tests/ollama_provider.rs`, `#[ignore]`d since it needs
+  `ollama serve` + a pulled model + `rp-server` on `PATH`, none of which
+  CI has reason to provide) -- confirmed a live `qwen2.5:0.5b` completion
+  round-tripped through the full stack. That run also surfaced two
+  latent timeout bugs the `EchoProvider`-only test suite could never
+  have caught: `client.rs`'s 5s `RESPONSE_TIMEOUT` and `http_client.rs`'s
+  30s `REQUEST_TIMEOUT` were both tuned against an instant fake reply and
+  too tight for real (even small, CPU-only) model inference (~29s
+  observed) -- `SessionPrompt`'s own response wait now uses a separate,
+  much larger `PROMPT_RESPONSE_TIMEOUT` (120s) than every other request.
+  Environment variables: `RUSTY_PRIME_AGENT_PROVIDER` (`ollama`, unset
+  otherwise), `RUSTY_PRIME_AGENT_MODEL` (required in `ollama` mode, e.g.
+  `ollama/qwen2.5:0.5b`), `RUSTY_PRIME_AGENT_RP_SERVER_BIN` (default
+  `rp-server`, i.e. on `PATH`), `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL`
+  (default `http://127.0.0.1:11434/v1`).
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own

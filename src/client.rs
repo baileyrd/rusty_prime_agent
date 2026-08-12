@@ -139,7 +139,7 @@ pub async fn print_once(
         &Request::SessionPrompt { session_id, text },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
         response @ Response::SessionPromptAck { .. } => {
             match (&response, mode) {
                 (_, OutputMode::Json) => print_json(&response),
@@ -338,7 +338,7 @@ pub async fn session_prompt(
         &Request::SessionPrompt { session_id, text },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
         response @ Response::SessionPromptAck { .. } => {
             match (&response, mode) {
                 (_, OutputMode::Json) => print_json(&response),
@@ -419,19 +419,35 @@ pub async fn session_rename(
 /// project's own `tests/supervisor_restart_recovery.rs`.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `SessionPrompt`'s own response wait, specifically -- every other
+/// request this client sends only waits on local IPC (bind a socket,
+/// read a state file), but a `SessionPrompt` response isn't sent until
+/// `AgentSession::prompt` has a full reply from whatever `ModelProvider`
+/// the worker is using. `EchoProvider` answers instantly, but a real
+/// backend doesn't: measured against `OllamaProvider` (a tiny model,
+/// CPU-only, via a local `rp-server` sidecar -- see `rp_server`'s own
+/// doc comment) a single completion took ~29s. `RESPONSE_TIMEOUT` stays
+/// tight for everything else so a genuinely dead daemon still fails
+/// fast.
+const PROMPT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
 async fn read_response(conn: &mut transport::LineStream) -> Result<Response> {
-    let response =
-        rusty_tokio::time::timeout(RESPONSE_TIMEOUT, conn.read_response(Context::Daemon))
-            .await
-            .map_err(|_| {
-                HarnessError::conflict(Context::Daemon, "daemon did not respond in time")
-            })??
-            .ok_or_else(|| {
-                HarnessError::protocol(
-                    Context::Daemon,
-                    "daemon closed the connection without responding",
-                )
-            })?;
+    read_response_with_timeout(conn, RESPONSE_TIMEOUT).await
+}
+
+async fn read_response_with_timeout(
+    conn: &mut transport::LineStream,
+    timeout: Duration,
+) -> Result<Response> {
+    let response = rusty_tokio::time::timeout(timeout, conn.read_response(Context::Daemon))
+        .await
+        .map_err(|_| HarnessError::conflict(Context::Daemon, "daemon did not respond in time"))??
+        .ok_or_else(|| {
+            HarnessError::protocol(
+                Context::Daemon,
+                "daemon closed the connection without responding",
+            )
+        })?;
     if let Response::Error { message, conflict } = &response {
         return Err(if *conflict {
             HarnessError::conflict(Context::Daemon, message.clone())

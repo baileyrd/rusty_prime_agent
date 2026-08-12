@@ -32,8 +32,10 @@ current shape.
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
-| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock}`) |
-| `provider` | `ModelProvider` trait + `EchoProvider`, Phase 1's stand-in for a real model backend |
+| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock}`, `provider.{json,log}`) |
+| `provider` | `ModelProvider` trait + `EchoProvider` (the default); `OllamaProvider`, a real backend opt-in via `RUSTY_PRIME_AGENT_PROVIDER=ollama` -- see `PARITY.md` |
+| `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers |
+| `http_client` | Minimal hand-rolled HTTP/1.1 client `OllamaProvider`/`rp_server` use to talk to `rp-server` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
@@ -49,7 +51,18 @@ rusty_prime_agent (this project)
     rustils     --  only where rusty_tokio doesn't cover something
 ```
 
-This is a **two-hop** dependency shape, not the direct, broader
+**`rusty_provider`'s `rp-server` is a spawned process, not a `Cargo.toml`
+dependency.** `RUSTY_PRIME_AGENT_PROVIDER=ollama`'s `OllamaProvider`
+(`PARITY.md`) talks to it purely over HTTP (`http_client.rs`) after the
+supervisor spawns it (`rp_server.rs`) -- it is never linked into this
+binary, since it's built on real `tokio` rather than `rusty_tokio`, and
+embedding it as a library would mean two async runtimes in one process.
+This keeps the dependency stack below accurate for everything this
+project actually links against; `rp-server` is an external service this
+project happens to manage the lifecycle of, the same category as Ollama
+itself, not a fourth entry in the stack.
+
+This is otherwise a **two-hop** dependency shape, not the direct, broader
 harness-to-`rustils` dependency the original Phase 1 brief assumed.
 `rusty_tokio::io::{UnixListener, UnixStream}` and
 `rusty_tokio::process::Command`/`Child` are now genuinely cross-platform
