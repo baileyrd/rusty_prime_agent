@@ -151,6 +151,25 @@ pub fn provider_log_path(state: &std::path::Path) -> PathBuf {
     state.join("provider.log")
 }
 
+/// Global tier of prompt-template discovery (`prompt_template::
+/// discover`) -- parity with `prime-agent`'s own `~/.prime/agent/
+/// prompts/*.md`, but nested under this project's own `state_dir()`
+/// rather than inventing a fourth "where does user data go" directory
+/// concept just for this (this project's own "no extra crate for that"
+/// stance, see this module's own doc comment).
+pub fn global_prompts_dir(state: &std::path::Path) -> PathBuf {
+    state.join("prompts")
+}
+
+/// Project tier of prompt-template discovery -- parity with
+/// `prime-agent`'s own project-local `.prime/agent/prompts/*.md`, under
+/// this project's own name instead. Resolved against the current
+/// working directory, not `state_dir()` -- it's meant to live alongside
+/// a project's own source tree, checked in like any other project file.
+pub fn project_prompts_dir(cwd: &std::path::Path) -> PathBuf {
+    cwd.join(".rusty-prime-agent").join("prompts")
+}
+
 /// Create `dir` (and parents) if missing.
 pub fn ensure_dir(context: Context, dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(context, Some(dir.to_path_buf()), e))

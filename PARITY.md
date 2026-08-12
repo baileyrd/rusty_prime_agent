@@ -189,6 +189,28 @@ daemon/worker split rather than requiring the Python control environment:
   interactive TUI" below); an always-on daemon-side autonomous loop
   would be the larger, genuinely-new-subsystem version of this and isn't
   attempted.
+- [x] **Prompt templates** (`prompt-template list`, `prompt-template
+  render <name> [args...]`, `session prompt-template <id> <name>
+  [args...]`, parity with `prime-agent`'s `packages/coding-agent/docs/
+  prompt-templates.md`). Markdown-plus-YAML-frontmatter snippets
+  (`description`, `argument-hint`, then a body) discovered from a global
+  directory (`<state_dir>/prompts/*.md`) and a project-local one
+  (`.rusty-prime-agent/prompts/*.md`, project-local wins on a name
+  collision), invoked by filename minus `.md`. Positional-argument
+  substitution matches `prime-agent`'s own grammar: `$1`/`$2`/... for
+  individual arguments, `$@`/`$ARGUMENTS` for all of them joined by a
+  space, `${@:N}`/`${@:N:L}` for a 1-indexed slice. `prompt-template
+  list`/`render` are pure local directory scans -- no daemon connection
+  at all, unlike almost every other subcommand -- while `session
+  prompt-template` expands and sends the result as an ordinary
+  `SessionPrompt`, parity with typing `/name args...` in `prime-agent`'s
+  live editor. This is deliberately **not** parity with real
+  `prime-agent` "skills" (`packages/coding-agent/docs/skills.md`), which
+  are "importable Python packages" wired to the RLM control environment
+  -- that half needs real code execution (`tool_runtime::ToolRuntime`'s
+  deliberately open seam, Phase 1 backs it with `NoopToolRuntime` only)
+  and stays out of scope below; this increment covers only the
+  plain-text template half of that surface, which needed none.
 
 ## Out of scope for this project's current shape
 
@@ -205,7 +227,12 @@ not attempted here, and not silently implied by anything in
   `receiver_role="parent"/"child"`).
 - **The Continual Harness** (`/refine`, durable supplemental
   prompts/memories/skill descriptions with rollback).
-- **Skills, extensions, prompt templates, themes, MCP integrations.**
+- **Skills, extensions, themes, MCP integrations.** (Prompt templates --
+  the plain-text, non-Python half of `prime-agent skills.md`'s surface --
+  are done; see the medium-effort section above. Real "skills" stay out
+  of scope: they're "importable Python packages" wired to the RLM
+  control environment, same boundary as the RLM programming model item
+  above.)
 - **`/heartbeat` and `rlm_heartbeat`** -- the TUI-command and RLM-function
   triggers for the same "re-enter a session periodically" mechanism
   `prime-agent schedule`/`session schedule` already covers server-side

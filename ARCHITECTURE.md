@@ -37,6 +37,7 @@ current shape.
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server` use to talk to `rp-server` |
 | `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
+| `prompt_template` | Discovery (`paths::global_prompts_dir`/`project_prompts_dir`), frontmatter parsing, and `$1`/`$@`/`${@:N}`-style positional-argument expansion for `prompt-template list/render` and `session prompt-template` -- see `PARITY.md` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 

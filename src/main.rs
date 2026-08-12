@@ -6,6 +6,7 @@ mod error;
 mod http_client;
 mod paths;
 mod procutil;
+mod prompt_template;
 mod protocol;
 mod provider;
 mod rp_server;
@@ -181,6 +182,19 @@ async fn run(args: &[String]) -> Result<()> {
                 output_mode,
             )
             .await
+        }
+        cli::Command::PromptTemplateList => {
+            client::prompt_template_list(&state_root, output_mode).await
+        }
+        cli::Command::PromptTemplateRender { name, args } => {
+            client::prompt_template_render(&state_root, name, args, output_mode).await
+        }
+        cli::Command::SessionPromptTemplate {
+            session_id,
+            name,
+            args,
+        } => {
+            client::session_prompt_template(&state_root, session_id, name, args, output_mode).await
         }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
