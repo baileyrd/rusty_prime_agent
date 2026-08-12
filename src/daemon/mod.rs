@@ -261,6 +261,13 @@ impl Supervisor {
                 self.handle_goal_update(&mut conn, session_id, action).await
             }
             Request::GoalShow { session_id } => self.handle_goal_show(&mut conn, session_id).await,
+            Request::HarnessUpdate { session_id, action } => {
+                self.handle_harness_update(&mut conn, session_id, action)
+                    .await
+            }
+            Request::HarnessShow { session_id } => {
+                self.handle_harness_show(&mut conn, session_id).await
+            }
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -737,6 +744,58 @@ impl Supervisor {
         let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
         conn.write_response(Context::Daemon, &Response::GoalShow { goal: state.goal })
             .await
+    }
+
+    async fn handle_harness_update(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        action: crate::protocol::HarnessAction,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::HarnessUpdate { session_id, action },
+            )
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to harness update",
+                )
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_harness_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&session_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        conn.write_response(
+            Context::Daemon,
+            &Response::HarnessShow {
+                state: state.harness,
+            },
+        )
+        .await
     }
 }
 

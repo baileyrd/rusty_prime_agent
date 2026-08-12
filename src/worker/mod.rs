@@ -231,6 +231,32 @@ async fn handle_private_connection(
             conn.write_response(Context::Worker, &Response::GoalUpdateAck { goal })
                 .await
         }
+        Request::HarnessUpdate { action, .. } => {
+            // Unlike `GoalUpdate` (never fails -- every `GoalAction` is a
+            // no-op on a missing goal rather than an error), `Rollback`
+            // to an out-of-range history index is a genuine, expected
+            // condition that must reach the client as a proper
+            // `Response::Error`, not just propagate via `?` and silently
+            // drop this connection (the fate of an unhandled `Err` from
+            // this whole match, per this function's own doc comment).
+            match session.lock().await.update_harness(action).await {
+                Ok(state) => {
+                    conn.write_response(Context::Worker, &Response::HarnessUpdateAck { state })
+                        .await
+                }
+                Err(err) if err.is_conflict() => {
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::Error {
+                            message: err.to_string(),
+                            conflict: true,
+                        },
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        }
         Request::WorkerShutdown => {
             session.lock().await.mark_stopped().await?;
             conn.write_response(Context::Worker, &Response::WorkerShutdownAck)

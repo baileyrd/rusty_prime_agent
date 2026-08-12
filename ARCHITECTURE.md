@@ -24,10 +24,10 @@ current shape.
 | --- | --- |
 | `main` | Entrypoint, argv dispatch, `harden_inherited_stdio` |
 | `cli` | Argument parsing for the public subcommands |
-| `client` | The CLI-side half of every request: connects to `daemon.sock`, sends a `Request`, prints the `Response`/event stream. Also owns `session_autonomous`'s bounded continuation loop (`session autonomous`, see `PARITY.md`) -- pure client-side orchestration over existing `SessionPrompt`/`GoalShow`/`GoalUpdate` requests, no daemon/worker changes needed |
+| `client` | The CLI-side half of every request: connects to `daemon.sock`, sends a `Request`, prints the `Response`/event stream. Also owns `session_autonomous`'s bounded continuation loop (`session autonomous`) and `session_refine`'s Continual Harness review loop (`session refine`, see `PARITY.md` for both) -- pure client-side orchestration over existing `SessionPrompt`/`SessionAttach`/`GoalShow`/`GoalUpdate`/`HarnessShow`/`HarnessUpdate` requests, no daemon/worker changes needed |
 | `daemon` | The supervisor process: binds the public socket, routes requests, recovers sessions on its own startup |
 | `worker` | The per-session process: binds a private socket, owns one `AgentSession`, serves `SessionAttach`/`SessionPrompt`/`WorkerShutdown` |
-| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, see `PARITY.md`), the (fake) model provider, the per-worker event broadcast |
+| `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>` and Continual Harness `harness: HarnessState`, see `PARITY.md`), the (fake) model provider, the per-worker event broadcast |
 | `catalog` | `session list`'s directory scan, cross-checked against process liveness |
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |

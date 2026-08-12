@@ -211,22 +211,45 @@ daemon/worker split rather than requiring the Python control environment:
   deliberately open seam, Phase 1 backs it with `NoopToolRuntime` only)
   and stays out of scope below; this increment covers only the
   plain-text template half of that surface, which needed none.
+- [x] **The Continual Harness** (`session harness (add <id> <prompt|
+  memory|skill> <text...>|list <id>|rollback <id> <index>)`, `session
+  refine <id>`, parity with `prime-agent`'s Continual Harness paper
+  abstraction, `arxiv.org/abs/2605.09998`: "stores supplemental prompts,
+  memories, skill descriptions, and reusable subagent specifications as
+  durable state that Prime Agent can refine through small,
+  evidence-backed updates"). Subagent specifications are left out --
+  they're tied to recursive subagents, a separate out-of-scope concern
+  below -- so this covers prompts/memories/skill descriptions only.
+  `HarnessState { notes, history }` on `SessionState.harness`, mutated
+  through the worker like `goal`/`schedule`; every successful `Add` or
+  `Rollback` appends the resulting `notes` to `history` as a fresh
+  entry, so `history.last()` always mirrors the current notes and a
+  rollback becomes part of the auditable trail rather than erasing
+  anything from it -- parity with "recorded refinement history."
+  `session refine <id>` is `/refine`'s "reviews the current trajectory
+  and applies a small, evidence-backed update": it fetches the session's
+  transcript (the last 20 entries) and current notes, asks the model to
+  propose one addition, and records the reply as a new `Memory` note.
+  Unlike `prime-agent`'s own hidden analysis call, the review prompt
+  goes through as an ordinary, visible `SessionPrompt` turn -- this
+  project's `ModelProvider` trait has no side channel for a provider
+  call that skips the transcript, and adding one for this alone wasn't
+  worth it, so the "evidence" behind a refinement stays inline and
+  auditable instead of happening invisibly.
 
 ## Out of scope for this project's current shape
 
 Architecturally significant `prime-agent` capabilities that would each
-require a genuinely new subsystem (a Python control environment, a
-scheduler, cross-agent messaging, a durable-state refinement engine) --
-not attempted here, and not silently implied by anything in
-`ARCHITECTURE.md`'s "Known gaps" section:
+require a genuinely new subsystem (a Python control environment,
+cross-agent messaging) -- not attempted here, and not silently implied
+by anything in `ARCHITECTURE.md`'s "Known gaps" section:
 
 - **The RLM programming model** (persistent IPython kernel,
   `tool_runtime::ToolRuntime`'s one deliberate open seam is exactly this
   boundary, but Phase 1 backs it with `NoopToolRuntime` only).
 - **Recursive subagents** (`rlm(...)`, agent-to-agent messaging,
-  `receiver_role="parent"/"child"`).
-- **The Continual Harness** (`/refine`, durable supplemental
-  prompts/memories/skill descriptions with rollback).
+  `receiver_role="parent"/"child"`; the reusable-subagent-specification
+  half of the Continual Harness below is the same boundary).
 - **Skills, extensions, themes, MCP integrations.** (Prompt templates --
   the plain-text, non-Python half of `prime-agent skills.md`'s surface --
   are done; see the medium-effort section above. Real "skills" stay out

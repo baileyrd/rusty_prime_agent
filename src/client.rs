@@ -16,7 +16,8 @@ use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
 use crate::protocol::{
-    GoalAction, GoalState, GoalStatus, Request, Response, SessionEvent, SessionStatus,
+    GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessNoteKind, HarnessState,
+    Request, Response, Role, SessionEvent, SessionStatus, TranscriptEntry,
 };
 use crate::transport;
 
@@ -683,6 +684,199 @@ fn print_goal_text(goal: &Option<GoalState>) {
             };
             println!("{status}\t{}", g.text);
         }
+    }
+}
+
+pub async fn harness_update(
+    state_root: &Path,
+    session_id: String,
+    action: HarnessAction,
+    mode: OutputMode,
+) -> Result<()> {
+    let state = set_harness(state_root, &session_id, action).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::HarnessUpdateAck { state }),
+        OutputMode::Text => print_harness_text(&state),
+    }
+    Ok(())
+}
+
+pub async fn harness_show(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let state = fetch_harness(state_root, &session_id).await?;
+    match mode {
+        OutputMode::Json => print_json(&Response::HarnessShow { state }),
+        OutputMode::Text => print_harness_text(&state),
+    }
+    Ok(())
+}
+
+/// Shared by [`harness_show`] and [`session_refine`] -- the latter needs
+/// the raw value, not printed text.
+async fn fetch_harness(state_root: &Path, session_id: &str) -> Result<HarnessState> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::HarnessShow {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::HarnessShow { state } => Ok(state),
+        other => Err(unexpected_response(other)),
+    }
+}
+
+/// Shared by [`harness_update`] and [`session_refine`]'s own `Add` once
+/// its review proposal comes back -- the latter needs the raw value, not
+/// printed text.
+async fn set_harness(
+    state_root: &Path,
+    session_id: &str,
+    action: HarnessAction,
+) -> Result<HarnessState> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::HarnessUpdate {
+            session_id: session_id.to_string(),
+            action,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::HarnessUpdateAck { state } => Ok(state),
+        other => Err(unexpected_response(other)),
+    }
+}
+
+fn print_harness_text(state: &HarnessState) {
+    if state.notes.is_empty() {
+        println!("no harness notes");
+    }
+    for note in &state.notes {
+        let kind = match note.kind {
+            HarnessNoteKind::Prompt => "prompt",
+            HarnessNoteKind::Memory => "memory",
+            HarnessNoteKind::SkillDescription => "skill",
+        };
+        println!("{}\t{kind}\t{}", note.id, note.text);
+    }
+    println!("history={}", state.history.len());
+}
+
+/// Parity with `prime-agent`'s Continual Harness `/refine`: "reviews the
+/// current trajectory and can apply small, evidence-backed updates to
+/// supplemental harness state." Fetches the session's transcript (via a
+/// `SessionAttach`, read only up to the first `Snapshot` event, then
+/// disconnected -- same as any client that stops reading mid-stream) and
+/// current harness notes, asks the session's own model to propose one
+/// small addition, and records that proposal as a new `Memory` note.
+///
+/// Unlike a hypothetical hidden "analysis" side channel, this review
+/// prompt is sent through the ordinary `SessionPrompt` path, so it (and
+/// the model's reply) show up as regular, visible transcript turns --
+/// the "evidence" behind a refinement stays auditable inline with the
+/// trajectory it reviewed, rather than happening invisibly. That's a
+/// deliberate simplification of `prime-agent`'s own hidden-analysis-call
+/// design, not an oversight: this project's `ModelProvider` trait has no
+/// side channel for a provider call that skips the transcript (see
+/// `session::AgentSession::prompt`), and adding one for this alone
+/// wasn't worth it.
+pub async fn session_refine(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let transcript = fetch_transcript_snapshot(state_root, &session_id).await?;
+    let harness = fetch_harness(state_root, &session_id).await?;
+    let review_prompt = build_refine_prompt(&transcript, &harness.notes);
+    let entry = send_prompt(state_root, &session_id, review_prompt).await?;
+    let proposal = entry.text.trim().to_string();
+    let updated = set_harness(
+        state_root,
+        &session_id,
+        HarnessAction::Add {
+            kind: HarnessNoteKind::Memory,
+            text: proposal.clone(),
+        },
+    )
+    .await?;
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({
+            "type": "refine_applied",
+            "note": proposal,
+            "harness": updated,
+        })),
+        OutputMode::Text => println!(
+            "refine: added memory note (notes={}, history={})",
+            updated.notes.len(),
+            updated.history.len()
+        ),
+    }
+    Ok(())
+}
+
+/// How many of the most recent transcript entries `session_refine`
+/// includes in its review prompt -- bounded so a long-running session
+/// doesn't grow the review prompt without limit; recent turns are the
+/// ones a small, evidence-backed update is actually about.
+const REFINE_TRAJECTORY_WINDOW: usize = 20;
+
+fn build_refine_prompt(transcript: &[TranscriptEntry], notes: &[HarnessNote]) -> String {
+    let mut prompt = String::from(
+        "Review the following trajectory and the current supplemental harness notes. \
+         Propose exactly one small, evidence-backed addition to the harness notes (a \
+         lesson, reminder, or reusable fact) that would help on future turns. Reply with \
+         just the note text.\n\nTrajectory:\n",
+    );
+    let start = transcript.len().saturating_sub(REFINE_TRAJECTORY_WINDOW);
+    for entry in &transcript[start..] {
+        let role = match entry.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        };
+        prompt.push_str(&format!("[{}] {role}: {}\n", entry.sequence, entry.text));
+    }
+    prompt.push_str("\nCurrent harness notes:\n");
+    if notes.is_empty() {
+        prompt.push_str("(none yet)\n");
+    } else {
+        for note in notes {
+            prompt.push_str(&format!("- ({:?}) {}\n", note.kind, note.text));
+        }
+    }
+    prompt
+}
+
+/// Fetches just the recovery-baseline `Snapshot` event from a
+/// `SessionAttach` stream, then drops the connection without reading
+/// further -- an ordinary early client disconnect from the daemon's own
+/// point of view (`session_attach`'s own doc comment covers the same
+/// stream; this is a one-shot read of its first event only).
+async fn fetch_transcript_snapshot(
+    state_root: &Path,
+    session_id: &str,
+) -> Result<Vec<TranscriptEntry>> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionAttach {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionAttachStarted { .. } => {}
+        other => return Err(unexpected_response(other)),
+    }
+    match conn.read_event(Context::Daemon).await? {
+        Some(SessionEvent::Snapshot { transcript, .. }) => Ok(transcript),
+        Some(other) => Err(HarnessError::protocol(
+            Context::Daemon,
+            format!("expected a snapshot event first, got {other:?}"),
+        )),
+        None => Err(HarnessError::protocol(
+            Context::Daemon,
+            "connection closed before a snapshot event",
+        )),
     }
 }
 
