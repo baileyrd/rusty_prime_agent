@@ -170,6 +170,16 @@ pub fn project_prompts_dir(cwd: &std::path::Path) -> PathBuf {
     cwd.join(".rusty-prime-agent").join("prompts")
 }
 
+/// Where `skills::discover` looks for installed skills -- see that
+/// module's own doc comment for why this is global-only (no
+/// project-local tier, unlike `project_prompts_dir`): skill loading runs
+/// inside the worker process, which has no access to the CLI caller's
+/// own cwd the way `prompt_template::discover`'s always-client-side
+/// callers do.
+pub fn global_skills_dir(state: &std::path::Path) -> PathBuf {
+    state.join("skills")
+}
+
 /// Create `dir` (and parents) if missing.
 pub fn ensure_dir(context: Context, dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(context, Some(dir.to_path_buf()), e))

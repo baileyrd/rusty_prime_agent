@@ -83,7 +83,8 @@ uses (independent of, and combinable with, `--tools read`/`mcp`): the
 model sends code, gets stdout/the last expression's value back, and
 variables/imports persist across calls within the session. Off by
 default; `EchoProvider` sessions can set it too, but never actually
-invoke it.
+invoke it. Drop real Python packages into `<state-dir>/skills/` to make
+them `import`-able in the kernel -- see "Skills" below.
 
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
@@ -172,6 +173,20 @@ harness session prompt-template <id> <name> [args...]
 Template bodies support `$1`/`$2`/... (positional args), `$@`/
 `$ARGUMENTS` (all args joined), and `${@:N}`/`${@:N:L}` (a 1-indexed
 slice).
+
+### Skills
+
+Real, importable Python packages for `session new --runtime ipython`
+sessions. Drop a directory into `<state-dir>/skills/<name>/`: a
+`SKILL.md` (`description` frontmatter) alongside a real Python package
+(`__init__.py`). The kernel gets the skills directory added to its
+`sys.path` on startup, so the model can `import <name>` directly --
+`session new --runtime ipython`'s `execute_python` tool description
+lists what's installed.
+
+```sh
+harness skill list
+```
 
 ### The Continual Harness
 

@@ -375,7 +375,7 @@ impl AgentSession {
             _ => Vec::new(),
         };
         if self.state.runtime.as_deref() == Some("ipython") {
-            defs.push(crate::tools::execute_python_tool_def());
+            defs.push(self.execute_python_tool_def_with_skills()?);
         }
         Ok(defs)
     }
@@ -404,6 +404,33 @@ impl AgentSession {
             }
             _ => Ok(crate::tools::execute(name, arguments)),
         }
+    }
+
+    /// `tools::execute_python_tool_def`'s base `ToolDef`, with the names
+    /// (and descriptions, when given) of every skill `skills::discover`
+    /// finds appended to its description -- so the model knows what it
+    /// can `import` without a human having to say so in the prompt.
+    /// Recomputed on every `prompt` call, same as `enabled_tool_defs`'s
+    /// other sources: a skill installed (or removed) between prompts is
+    /// picked up without needing a session restart.
+    fn execute_python_tool_def_with_skills(&self) -> Result<ToolDef> {
+        let mut def = crate::tools::execute_python_tool_def();
+        let skills = crate::skills::discover(&self.state_root)?;
+        if !skills.is_empty() {
+            let listed: Vec<String> = skills
+                .iter()
+                .map(|s| match &s.description {
+                    Some(d) => format!("{} — {d}", s.name),
+                    None => s.name.clone(),
+                })
+                .collect();
+            def.description.push_str(&format!(
+                " Available skills, importable directly (e.g. `import {}`): {}.",
+                skills[0].name,
+                listed.join("; ")
+            ));
+        }
+        Ok(def)
     }
 
     /// Parses `arguments` for a `code` string and runs it against this

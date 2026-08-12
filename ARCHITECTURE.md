@@ -42,7 +42,9 @@ current shape.
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers. Also owns `known_providers`, the env-var-driven provider catalog `harness model list` reads (see `PARITY.md`) -- the same check `write_config` itself uses, so the two can't drift -- `fetch_model_catalog`, a direct `GET /v1/models` query against a sidecar `harness model list --detailed` starts itself (no daemon involved) -- and emits `[mcp] enabled = true` unconditionally in every generated `provider-config.toml`, the same "harmless with nothing configured" reasoning `[providers.ollama]` already gets |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server`/`mcp_client` use to talk to `rp-server`. Decodes `Transfer-Encoding: chunked` responses (`decode_chunked`) -- needed only for `mcp_client`'s SSE-framed calls, a no-op for every other caller, which had only ever seen `Content-Length` framing |
 | `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
-| `prompt_template` | Discovery (`paths::global_prompts_dir`/`project_prompts_dir`), frontmatter parsing, and `$1`/`$@`/`${@:N}`-style positional-argument expansion for `prompt-template list/render` and `session prompt-template` -- see `PARITY.md` |
+| `prompt_template` | Discovery (`paths::global_prompts_dir`/`project_prompts_dir`) and `$1`/`$@`/`${@:N}`-style positional-argument expansion for `prompt-template list/render` and `session prompt-template` -- see `PARITY.md`. Frontmatter parsing itself lives in `frontmatter`, shared with `skills` |
+| `frontmatter` | Hand-rolled `---\nkey: value\n---\n<body>` parsing shared by `prompt_template` and `skills` -- both only ever read a couple of flat string keys |
+| `skills` | Discovery of real, importable Python packages for `session new --runtime ipython` (`paths::global_skills_dir`, `SKILL.md` frontmatter) -- see below and `PARITY.md` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
@@ -199,6 +201,32 @@ second turn-loop mechanism alongside the one Increment 3 already built --
 the tool-calling loop is "how a turn asks for something to happen
 outside the model," and the kernel is one more thing that can happen,
 not a different kind of turn.
+
+## Skills packaging
+
+Real, `import`-able Python packages for `session new --runtime ipython`
+(`prime-agent skills.md`'s Python-package half -- `prompt_template.rs`
+already covers the plain-text half) -- see `PARITY.md` for the full
+story. A skill is a directory under `paths::global_skills_dir`
+(`<state_dir>/skills/<name>/`): a `SKILL.md` (`description` frontmatter,
+parsed by the shared `frontmatter.rs` module) alongside a real Python
+package (`__init__.py`). `skills::discover` is a pure filesystem scan --
+it never inspects the Python itself; a broken package surfaces as an
+ordinary `ImportError` the model sees when it actually tries to `import`
+it, the same "let the callee reject malformed input" stance `tools::
+execute` already takes.
+
+Global tier only -- deliberately no project-local tier the way
+`prompt_template::discover` has one, since the one place skill *loading*
+needs to run (`worker::run`, right after `tool_runtime.start()` succeeds:
+one `execute_request` puts the skills directory on the kernel's own
+`sys.path`) is the worker process, which has no access to the CLI
+caller's own cwd the way `prompt_template::discover`'s always-client-side
+callers do. `session::enabled_tool_defs` appends every discovered
+skill's name/description to the `execute_python` tool's own description,
+so the model knows what it can `import` without being told in the
+prompt. `harness skill list` is the human-facing view, same shape as
+`prompt-template list`.
 
 ## Known gaps
 

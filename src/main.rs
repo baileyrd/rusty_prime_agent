@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod daemon;
 mod error;
+mod frontmatter;
 mod http_client;
 mod ipython_runtime;
 mod mcp_client;
@@ -15,6 +16,7 @@ mod rp_server;
 mod schedule;
 mod session;
 mod sha256;
+mod skills;
 mod tool_runtime;
 mod tools;
 mod transport;
@@ -234,6 +236,7 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::PromptTemplateList => {
             client::prompt_template_list(&state_root, output_mode).await
         }
+        cli::Command::SkillList => client::skill_list(&state_root, output_mode).await,
         cli::Command::PromptTemplateRender { name, args } => {
             client::prompt_template_render(&state_root, name, args, output_mode).await
         }

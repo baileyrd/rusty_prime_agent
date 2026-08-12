@@ -768,4 +768,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Real end-to-end coverage for `skills.rs`'s whole point: a real
+    /// Python package on disk becomes `import`-able inside a real kernel
+    /// once its parent directory is added to `sys.path` -- the exact
+    /// operation `worker::run`'s `install_skills` performs. Deliberately
+    /// drives `sys.path.insert`/`import`/the function call directly
+    /// (rather than going through a real model's own tool-calling
+    /// decision) for the same determinism reason
+    /// `real_kernel_executes_code_and_reports_stdout_and_result` does --
+    /// small-model tool-call reliability is a separate, already-documented
+    /// caveat elsewhere in this project's test suite, not something this
+    /// test needs to also depend on. `#[ignore]`d for the same real-
+    /// `ipykernel`-install reason as its sibling above.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_imports_a_skill_package_after_sys_path_insert() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-skill-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        // A real, minimal Python package -- the same shape `skills::
+        // discover` expects (`SKILL.md` is irrelevant to Python itself;
+        // only `__init__.py` matters for the import to work).
+        let skills_dir = session_dir.join("skills");
+        let package_dir = skills_dir.join("doubler");
+        std::fs::create_dir_all(&package_dir).expect("create skill package dir");
+        std::fs::write(
+            package_dir.join("__init__.py"),
+            "def double(x):\n    return x * 2\n",
+        )
+        .expect("write __init__.py");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        let skills_dir_json = serde_json::to_string(&skills_dir.display().to_string()).unwrap();
+        runtime
+            .execute(&format!(
+                "import sys; sys.path.insert(0, {skills_dir_json})"
+            ))
+            .await
+            .expect("sys.path.insert should round-trip");
+
+        let outcome = runtime
+            .execute("import doubler\ndoubler.double(21)")
+            .await
+            .expect("import + call should round-trip");
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("42"),
+            "expected the real skill package's function to run, got: {outcome:?}"
+        );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
 }
