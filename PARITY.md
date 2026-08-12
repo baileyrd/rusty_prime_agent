@@ -284,10 +284,38 @@ daemon/worker split rather than requiring the Python control environment:
   `write_config` itself uses (`rp_server::known_providers`) so this can
   never drift from what a real `session new --model <name>/...` would
   be able to reach. A pure environment-variable check -- no daemon
-  connection, no network call. Deliberately **not** a full per-model
-  catalog (real model IDs within each provider): that needs a live
-  query against each provider's own API, untestable in CI (no real API
-  keys there) and out of scope below.
+  connection, no network call. Plain `model list` deliberately stays
+  this provider-tier-only view; see the next entry for the real
+  per-model catalog.
+- [x] **Real per-model catalog** (`harness model list --detailed`).
+  Last revision of this file marked this "out of scope" on the
+  assumption that real model IDs need "a live query against each
+  provider's own API" -- untestable in CI, unattemptable without keys.
+  Reading `rusty_provider`'s actual source (`crates/server/src/
+  routes.rs`) showed that's not how it works: `rp-server` already
+  exposes `GET /v1/models`, sourced from its own `route_aliases()`/
+  `configured_providers()`/`priced_models()`, no live per-provider API
+  call needed. `--detailed` starts (or reuses) an `rp-server` sidecar
+  directly from the CLI (`rp_server::ensure_running`, the same call
+  `daemon::Supervisor` makes for `session new --model`) and prints
+  `rp_server::ModelCatalogEntry`'s `id`/`owned_by`/`context_length`.
+  Fails loudly, not silently, when `rp-server` isn't installed/
+  reachable -- covered by a deterministic CI-safe negative test; the
+  real success path (`#[ignore]`d, needs `rp-server` + `ollama serve`)
+  extends the same infra-gated pattern `tests/ollama_provider.rs` uses.
+  Manually verifying that real path against this sandbox's own Ollama
+  setup surfaced a genuine hang: this is the first one-shot CLI command
+  to call `rp_server::ensure_running` directly (every prior caller was
+  either the long-lived daemon, or force-exits via `std::process::exit`)
+  -- its reaper task `.await`s the sidecar's `Child::wait()`, which
+  never resolves for a deliberately long-lived detached process,
+  and `#[rusty_tokio::main]`'s generated `Runtime::drop` waits
+  *unboundedly* for that blocking-pool job before letting the process
+  exit. Fixed in `main.rs` by exiting explicitly on the success path
+  too (the same "blunt but honest" `std::process::exit` convention its
+  error path and `WorkerShutdown`/`handle_daemon_shutdown` already use),
+  not by changing `rp_server.rs`'s existing, daemon-tested reaping
+  behavior -- see `main.rs`'s own doc comment for the full reasoning.
 - [x] **`--thinking <level>`** (`session new --thinking low|medium|
   high`), parity with `prime-agent --thinking <level>`. Last revision of
   this file marked this "genuinely out of scope" on the assumption that
@@ -335,15 +363,6 @@ attempted here, and not silently implied by anything in
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
   read-a-line/send-a-prompt loop underneath the TUI itself is done --
   `session repl`, see the medium-effort section above.)
-- **Per-model catalog entries within `harness model list`** (real model
-  IDs/pricing/context length within each configured provider, not just
-  which providers are configured -- the latter is done, see the
-  medium-effort section above). Not actually Python-bound: `rp-server`
-  exposes `GET /v1/models` with exactly this data, sourced from its own
-  router rather than a live per-provider API query -- tracked as a
-  near-term increment now that this is understood, not left here
-  permanently. (`--thinking <level>` turned out to be the same kind of
-  mis-scoping and is now done; see the medium-effort section above.)
 
 ## Process
 

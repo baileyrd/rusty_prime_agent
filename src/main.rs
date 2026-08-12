@@ -29,9 +29,32 @@ async fn main() {
     harden_inherited_stdio();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(err) = run(&args).await {
-        eprintln!("harness: {err}");
-        std::process::exit(exit_code(&err));
+    match run(&args).await {
+        // `std::process::exit`, not falling off the end of `main` --
+        // same "blunt but honest" reasoning as `WorkerShutdown`'s/
+        // `handle_daemon_shutdown`'s own identical calls, but now load-
+        // bearing for every CLI invocation: `rp_server::ensure_running`
+        // (reachable directly from a one-shot process since `harness
+        // model list --detailed` added it, not just from the long-lived
+        // daemon) spawns a reaper task that `.await`s the rp-server
+        // sidecar's `Child::wait()` -- a deliberately long-lived,
+        // detached process that's never expected to exit on its own.
+        // `#[rusty_tokio::main]`'s generated `Runtime::drop` waits
+        // *unboundedly* for every blocking-pool job (which is where
+        // that `wait()` actually runs) to drain before letting the
+        // process exit, so falling off the end of `main` after a
+        // successful `--detailed` run hung forever waiting for a
+        // sidecar this process deliberately leaves running. Every
+        // other command already prints via `println!`'s line-buffered
+        // writer, which flushes on each trailing newline regardless of
+        // whether stdout is a TTY, so skipping the graceful shutdown
+        // path here doesn't drop or truncate any already-printed
+        // output.
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("harness: {err}");
+            std::process::exit(exit_code(&err));
+        }
     }
 }
 
@@ -225,7 +248,9 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRepl { session_id } => {
             client::session_repl(&state_root, session_id, output_mode).await
         }
-        cli::Command::ModelList => client::model_list(output_mode).await,
+        cli::Command::ModelList { detailed } => {
+            client::model_list(&state_root, detailed, output_mode).await
+        }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }

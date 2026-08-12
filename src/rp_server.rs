@@ -147,6 +147,47 @@ pub fn known_providers() -> Vec<ProviderInfo> {
     providers
 }
 
+/// One entry of `rp-server`'s real per-model catalog (`GET /v1/models`,
+/// `harness model list --detailed`) -- unlike [`ProviderInfo`], these
+/// are actual model IDs/pricing/context length, sourced from
+/// `rp-server`'s own `route_aliases()`/`configured_providers()`/
+/// `priced_models()` rather than an env-var check here. `pricing` is
+/// left as a passthrough `serde_json::Value` (its shape varies by
+/// provider and isn't this project's concern to model precisely) --
+/// `#[serde(default)]` on both optional fields since `rp-server` omits
+/// them for a model it has no priced/context-length data for.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub owned_by: String,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelCatalogEntry>,
+}
+
+/// Queries a running `rp-server` sidecar's real per-model catalog.
+/// Callers are expected to have already called [`ensure_running`] to
+/// get `port` -- this function doesn't spawn anything itself, matching
+/// `provider::RustyProviderModel`'s own "just an HTTP client" shape.
+pub async fn fetch_model_catalog(port: u16) -> Result<Vec<ModelCatalogEntry>> {
+    let (status, body) = http_client::get(port, "/v1/models").await?;
+    if status != 200 {
+        return Err(HarnessError::conflict(
+            Context::Provider,
+            format!("rp-server returned {status} for GET /v1/models: {body}"),
+        ));
+    }
+    let parsed: ModelListResponse =
+        serde_json::from_str(&body).map_err(|e| HarnessError::json(Context::Provider, None, e))?;
+    Ok(parsed.data)
+}
+
 fn write_config(state_root: &Path, port: u16) -> Result<()> {
     let path = paths::provider_config_path(state_root);
     let mut toml = format!("[server]\nhost = \"127.0.0.1\"\nport = {port}\n");

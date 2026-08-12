@@ -608,18 +608,52 @@ async fn send_prompt(
 /// `rp_server::known_providers`'s own doc comment for why). A pure
 /// environment-variable check, no daemon connection at all -- same
 /// reasoning as `prompt_template_list` below.
-pub async fn model_list(mode: OutputMode) -> Result<()> {
-    let providers = crate::rp_server::known_providers();
+///
+/// `detailed`: additionally starts (or reuses) an `rp-server` sidecar
+/// -- the same `rp_server::ensure_running` call `daemon::Supervisor`
+/// makes for `session new --model` -- and queries its real `GET /v1/
+/// models` catalog (see `rp_server::ModelCatalogEntry`'s own doc
+/// comment for the shape). Unlike the plain listing above, this needs
+/// `rp-server` actually installed and reachable, so it fails loudly
+/// (not silently falling back to the plain listing) when it isn't --
+/// same "fail loudly rather than silently degrade" reasoning as
+/// `session_new_with_model_fails_loudly_when_rp_server_is_unavailable`.
+pub async fn model_list(state_root: &Path, detailed: bool, mode: OutputMode) -> Result<()> {
+    if !detailed {
+        let providers = crate::rp_server::known_providers();
+        match mode {
+            OutputMode::Json => print_json(&providers),
+            OutputMode::Text => {
+                for p in &providers {
+                    let status = if p.configured {
+                        "configured"
+                    } else {
+                        "not configured"
+                    };
+                    println!("{}\t{status}", p.name);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let port = crate::rp_server::ensure_running(state_root).await?;
+    let models = crate::rp_server::fetch_model_catalog(port).await?;
     match mode {
-        OutputMode::Json => print_json(&providers),
+        OutputMode::Json => print_json(&models),
         OutputMode::Text => {
-            for p in &providers {
-                let status = if p.configured {
-                    "configured"
-                } else {
-                    "not configured"
-                };
-                println!("{}\t{status}", p.name);
+            if models.is_empty() {
+                println!("no models");
+            }
+            for m in &models {
+                let context_length = m
+                    .context_length
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{}\towned_by={}\tcontext_length={}",
+                    m.id, m.owned_by, context_length
+                );
             }
         }
     }
