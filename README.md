@@ -479,6 +479,22 @@ creates a real branch rather than extending it.
 loop -- asks the model to summarize `<sequence>`'s own branch and
 appends the result as a new entry on your *current* active chain.
 
+`/name <text>` renames the current session (`session rename` wired in).
+`/refine` runs the Continual Harness once (`session refine` wired in).
+`/session` lists every session (`session list` wired in) -- use `/resume
+<id>` below to actually switch to one of them. `/model` lists this
+environment's configured providers (`session model list` wired in, not
+detailed); it doesn't change the current session's model -- that's fixed
+at `session new` time. `/reload` just confirms that context files are
+already re-read fresh on every turn; there's nothing to actually reload.
+`/new [name]` creates a brand-new session and switches this same REPL to
+it (an optional display name is the only argument -- no `--model`/
+`--goal`/etc.). `/resume <id>` switches this REPL to an existing other
+session, replaying its transcript; an unknown id reports an error and
+leaves you on the current session. Both refuse to switch while a reply
+is still generating or a message is queued behind them, so a queued
+follow-up never lands on the wrong session.
+
 ### RPC mode
 
 ```sh

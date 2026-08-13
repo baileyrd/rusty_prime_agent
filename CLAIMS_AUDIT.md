@@ -576,13 +576,20 @@ above:
   `termctl` doesn't have yet, see `ARCHITECTURE.md`'s own "rich editor"
   entry. Multi-line input (`Ctrl-J`) is real too, though it wasn't named
   in this particular upstream bullet.
-- **Slash-command table (23 commands).** -- **Partial, one clause now
-  closed.** Only `/quit` (aliased `/exit`), `/compact`, `/heartbeat`, a
-  bounded `/fork`/`/file`/`/export`/`/tree` exist (the last **closed**
-  since this was last written -- see session-format.md below).
-  `/login`, `/model`, `/effort`, `/resume`, `/new`, `/name`, `/session`,
-  `/clone`, `/share`, `/reload`, and more are absent from the REPL; some
-  (`/refine`, `rename`) exist only as top-level CLI subcommands instead.
+- **Slash-command table (23 commands).** -- **Partial, most named clauses
+  now closed.** `/quit` (aliased `/exit`), `/compact`, `/heartbeat`, a
+  bounded `/fork`/`/file`/`/export`/`/tree` exist, plus (closed since
+  this was last written -- see PARITY.md's "full slash-command surface"
+  entry) bounded forms of `/name`, `/refine` (previously a top-level-CLI-
+  only command), `/session` (list-only, not the full interactive
+  picker), `/model` (list-only, not mid-session switching), `/reload`
+  (a confirmation, not a missing mechanism -- context files already
+  re-read fresh every turn), `/new`, and `/resume`. **Still absent, real
+  gaps**: `/login` (no account system to log into), mid-session `/model
+  <name>`/`/effort <level>` switching (no protocol support to mutate an
+  already-running session), `/clone`, `/share`. `/usage` and `/mcp
+  login|logout` are also absent, for the same "no underlying data
+  model/primitive exists" reason.
 - **`/export [file]` exports to HTML.** -- **Partial.** `/export <path>`
   exists but writes pretty-printed JSON, not HTML.
 - **`/share` (upload as a private gist).** -- **False**, already tracked
