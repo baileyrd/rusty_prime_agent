@@ -666,6 +666,46 @@ daemon/worker split rather than requiring the Python control environment:
   more manual entry points into the same mechanism, not a third
   continuation policy.
 
+## Identified gaps, not yet started
+
+Surfaced by a documentation-level review of `prime-agent`'s real docs
+(`packages/coding-agent/docs/*.md`, 35 files) rather than source
+reading -- unlike "Out of scope" below, each of these fits this
+project's existing shape without a new subsystem. None has been scoped
+or implemented yet.
+
+- **Automatic context compaction.** `prime-agent`'s `compaction.md`:
+  triggers when `contextTokens > contextWindow - reserveTokens`
+  (`reserveTokens` defaults to 16,384 tokens, `keepRecentTokens` to
+  20,000), summarizes older turns via the model itself, and is also
+  user-triggerable with `/compact [instructions]`. This project has no
+  equivalent at any layer -- a session's transcript just grows. That's a
+  real omission specifically because `session_autonomous`, `session
+  schedule --every`, and now `rlm_heartbeat()`/`/heartbeat` all exist to
+  keep a session running indefinitely with no human in the loop, and none
+  of them has any mitigation for the context eventually overflowing the
+  provider's own window -- the session just runs until a real provider
+  rejects an oversized request. The most load-bearing gap in this list,
+  since every feature that would need it is already shipped.
+- **RPC mode** (`--mode rpc`). `prime-agent`'s `rpc.md` describes a
+  bidirectional JSON-RPC channel over stdin/stdout (`set_model`,
+  `cycle_model`, `steer`, `follow_up`, `abort`, `bash`, `compact`, ...)
+  for embedding `prime-agent` inside another program. This project's
+  `--mode json` is one-way: it dumps the wire-protocol event stream, but
+  there's no single command channel a client can write back through
+  besides the ordinary `Request`/`Response` calls `client.rs` already
+  makes over `daemon.sock`. Same transport this project already has
+  (JSONL over a socket) -- the gap is a designed command surface, not new
+  plumbing.
+- **Interval-repeating heartbeats.** `prime-agent`'s heartbeats
+  (`long-running-agents.md`) support `every <interval>` with a label,
+  plus list/pause/resume/clear. This project's `rlm_heartbeat()`/
+  `/heartbeat` (see "Medium-effort" above) fire exactly once per manual
+  call -- there's no repeating variant. `schedule.rs` already has
+  `ScheduleKind::Every { interval_ms }` for `session schedule add
+  --every`; `trigger_heartbeat` reusing that instead of always sending
+  `ScheduleKind::Once` is the shape of the fix, just not attempted yet.
+
 ## Out of scope for this project's current shape
 
 Architecturally significant `prime-agent` capabilities that would each
@@ -700,6 +740,44 @@ attempted here, and not silently implied by anything in
   missing subsystem isn't a Python control environment -- it's an OAuth
   client plus somewhere real to send it, and there's nothing on the
   other end for this project to authenticate against.
+- **ACP mode** (Agent Client Protocol). `prime-agent`'s `--mode acp`
+  speaks JSON-RPC 2.0 to editor integrations (Zed, VS Code). This is an
+  editor-ecosystem integration surface this project has never targeted --
+  there's no editor plugin on the other end to talk to, the same
+  reasoning the `/login` bullet above uses for having no account to log
+  into.
+- **An embeddable SDK** (`createAgentSession()`, custom tools via
+  `defineTool()`, programmatic model/auth configuration). Would need this
+  project to become a library crate rather than a binary-only one --
+  `Cargo.toml` has no `[lib]` target today. A real, nameable architectural
+  change, not attempted.
+- **A tree-structured session data model** (`/tree`/`/fork`/`/clone`'s
+  underlying `id`/`parentId`/active-leaf JSONL structure, see
+  `session-format.md`). Deeper than the already-cut TUI commands
+  themselves: this project's session state (`state.json`/
+  `transcript.jsonl`) is linear, one worker owning one line of turns, and
+  branching would change that data model, not just add REPL commands on
+  top of it.
+- **Context files** (`AGENTS.md`/`CLAUDE.md` auto-loaded from a global
+  dir and walked up from the current directory, `SYSTEM.md`/
+  `APPEND_SYSTEM.md` system-prompt overrides). No equivalent exists here;
+  a session only ever gets the text passed to `session new`/`session
+  prompt`, plus whatever the Continual Harness accumulates on top.
+- **A `settings.json` config file** (project + global, merged). Every
+  knob in this project is a CLI flag or an env var, set fresh per
+  invocation -- there's no persistent, mergeable config file layer
+  underneath them.
+- **`auth.json` with shell-command key resolution** (e.g.
+  `"key": "!security find-generic-password ..."`). This project only
+  ever reads a key from a literal env var (`rp_server.rs`'s
+  `write_config`, see the "Medium-effort" section's provider-selection
+  entry above) -- there's no indirection layer for resolving a key via an
+  arbitrary shell command.
+- **Custom / arbitrary OpenAI-compatible provider registration.** No way
+  to point at an arbitrary base URL; `rp-server`'s own compiled-in
+  provider list is the only surface, and this project has no extension
+  mechanism (see the "Extensions" bullet above) to register a new one at
+  runtime.
 
 ## Process
 
