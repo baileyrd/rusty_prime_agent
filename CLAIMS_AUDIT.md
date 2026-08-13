@@ -312,8 +312,10 @@ worker/session code.
   **False**, same finding as `daemon.md` above.
 - **Extension UI boundary (select/confirm/input/editor/notification
   dialogs, executable callbacks staying host-side).** -- **False/N/A.**
-  No extension system exists in this project (see `PARITY.md`'s
-  Extensions entry) -- there is nothing for this boundary to protect.
+  A bounded extension slice now exists (see `PARITY.md`'s Extensions
+  entry), but it has no dialog-based user-interaction surface at all --
+  `pi` exposes only `on("pre_tool_call", ...)` and `register_command`,
+  neither of which involves a UI boundary to protect.
 - **"If an action changes agent execution or persisted session state, it
   goes through `AgentConnection`. If it changes only terminal
   presentation or local preference UI, it stays client-side."** --
@@ -627,11 +629,12 @@ above:
   only those two closed values, no short alias, no negation flags.
 - **Resource options: `-e`/`--extension`, `--skill <path>`,
   `--prompt-template <path>`, `--theme <path>`, `--no-context-files`.**
-  -- **False**, all of them -- skills/prompt-templates exist only via
-  fixed on-disk discovery directories, with no path-flag override
-  surface; Extensions doesn't exist as a subsystem; a theme is now
-  selectable, but only via `settings.json`'s `theme` field, not a
-  `--theme <path>` CLI flag (which stays absent).
+  -- **False**, all of them -- skills/prompt-templates/extensions all
+  exist only via fixed on-disk discovery directories (`<state_dir>/
+  skills/`, `<state_dir>/extensions/`), with no per-invocation path-flag
+  override surface for any of the three; a theme is now selectable, but
+  only via `settings.json`'s `theme` field, not a `--theme <path>` CLI
+  flag (which stays absent).
 - **Autonomous options: `--autonomous-max-continuations`,
   `--autonomous-gate-retries`, `--autonomous-gate-timeout-ms`,
   `--autonomous-max-tokens`.** -- **Partial.** `--max-turns
@@ -706,8 +709,10 @@ above:
   `entry_count`, `summary`, produced on-demand by `session::AgentSession::
   branch_summarize`, now that the tree structure this entry always
   depended on is real (see session-format.md above). `LabelEntry`/
-  `AgentStatusEntry`/`GitStateEntry` still don't exist -- each still
-  depends on an extension system, still absent.
+  `AgentStatusEntry`/`GitStateEntry` still don't exist -- a bounded
+  extension slice now exists (see `extensions.md` above), but it has no
+  capability for an extension to author its own transcript entries,
+  which each of these three would need.
 
 ## rlm.md
 
@@ -1013,19 +1018,27 @@ tokens across 6 categories, 4 value formats -- a live fetch attempt of
 that file, made while scoping the eventual implementation, disagreed
 with itself across repeated calls on the exact category/token count;
 see `PARITY.md`'s "Themes: token spec + TUI renderer" entry for the
-full story). Extensions is still **False** as implemented -- the
-*reasoning* for why it stays unattempted needed updating (it's not "no
-spec exists anywhere to bound against," it's "a spec exists in
-prime-agent's own docs, but is a large surface relative to this
-project's current CLI/daemon shape"), but nothing has actually been
-built. **Themes is now Partial**: a bounded token spec plus a minimal
-ANSI-rendering layer landed (`src/theme.rs`, wired into a handful of
-`session_repl`'s own output points, `settings.json`'s new `theme`
-field) -- real colored terminal output where there was previously
-none, though only for the plain-text output this project's own REPL
-already produces (no markdown/syntax/diff rendering exists to color,
-so most of the 52-token schema validates but isn't consumed). See the
-`PARITY.md` entries for both.
+full story). **Both Extensions and Themes are now Partial** (updated
+from this section's original "still False" for Extensions): a bounded
+token spec plus a minimal ANSI-rendering layer landed for Themes
+(`src/theme.rs`, wired into a handful of `session_repl`'s own output
+points, `settings.json`'s new `theme` field) -- real colored terminal
+output where there was previously none, though only for the plain-text
+output this project's own REPL already produces (no markdown/syntax/
+diff rendering exists to color, so most of the 52-token schema
+validates but isn't consumed). For Extensions, a genuinely scoped first
+slice landed too (`src/extensions.rs`, the `pi` object `worker::
+bootstrap_kernel` now injects into every `--runtime ipython` kernel): a
+Python-package-based extension model (matching this project's own
+established Python-via-kernel extensibility pattern, not `prime-agent`'s
+literal JS/TS `ExtensionAPI`) supporting exactly two of the ~25 named
+lifecycle events -- `pi.on("pre_tool_call", handler)` (a real blocking
+hook on `AgentSession::execute_tool_call`, the one chokepoint every tool
+call passes through) and `pi.register_command(name, handler)` (a
+`session_repl`-invocable `/name <args>`). `registerTool`/
+`registerShortcut`/`registerProvider`, the other ~23 lifecycle events,
+dialog-based user interaction, and custom rendering remain unimplemented
+-- see the `PARITY.md` entries for both subsystems' full stories.
 
 ## tui.md
 

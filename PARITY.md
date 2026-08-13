@@ -2351,6 +2351,99 @@ daemon/worker split rather than requiring the Python control environment:
   `ollama_provider.rs` tests) proving a `settings.json`-only threshold
   (no env var set at all) actually triggers a real compaction round trip
   through the daemon/worker/provider, not just the in-process unit tests.
+- [x] **Extensions: manifest/registration format + event-hook system.**
+  Previously filed under "Needs a new subsystem" (see that section's own
+  entry, now narrowed rather than removed) as "genuinely undefined," then
+  corrected once by reading `prime-agent`'s real `docs/extensions.md`
+  directly -- a concrete spec exists: a default-export factory receiving
+  an `ExtensionAPI`, `pi.registerTool()`/`registerCommand()`/
+  `registerShortcut()`/`registerProvider()`/`on(event, handler)` across
+  roughly 25 named lifecycle events. That correction stood; what changed
+  here is scope, not the finding -- the "first increment" that entry
+  called out as tractable (one blocking pre-tool-call hook plus one
+  custom-command registration point) is what actually shipped, deliberately
+  bounded rather than attempting the full ~25-event surface.
+
+  **A real, load-bearing design constraint found before writing any
+  code, not discovered via a hanging test**: this project's extensibility
+  story is already Python-via-kernel (skills, RLM), not JS/TS like
+  `prime-agent`'s own `ExtensionAPI` -- so an extension here is a Python
+  package (`<state_root>/extensions/<name>/EXTENSION.md` +
+  `__init__.py` defining `def register(pi): ...`), discovered the exact
+  same way `skills::discover` already works (mirrored line-for-line in
+  the new `src/extensions.rs`). The `pi` object's two methods,
+  `pi.on("pre_tool_call", handler)` and `pi.register_command(name,
+  handler, description="")`, had to stay *synchronous* Python (no `await
+  host_request(...)`, unlike `goal`/`agent_message`/`compact`/`rlm(...)`)
+  for a real reason: an extension's own `register(pi)` call happens
+  through a plain `import <name>` statement inside `worker::
+  bootstrap_kernel`'s bootstrap cell, and ordinary module-level code
+  executed via `import` does **not** get IPython's own top-level-`await`
+  support the way a genuine `execute_request` cell does -- an `async def
+  register` pattern would need `bootstrap_kernel`'s single
+  `tool_runtime.execute(&code)` call to pause and resume mid-registration
+  (`pending_host_request` machinery `execute_python_tool_call` has and
+  `bootstrap_kernel` deliberately doesn't), for no actual benefit:
+  registration itself never needs to notify Rust mid-flight. What Rust
+  *does* need (which commands got registered, whether any hook exists)
+  is read back in one shot instead, via one more marker-prefixed `print`
+  (`EXTENSION_REGISTRY_MARKER`) appended to the end of the same bootstrap
+  code string -- the same "no host_request round trip needed" technique
+  `session::HEARTBEAT_MARKER` already established for `rlm_heartbeat()`.
+
+  `pi.on("pre_tool_call", handler)` is a real blocking hook:
+  `AgentSession::execute_tool_call` -- confirmed to be the one real
+  chokepoint every tool call passes through regardless of backend
+  (`execute_python`, built-in read tools, MCP) before any implementation
+  work started, not assumed -- now calls `run_pre_tool_call_hooks` first;
+  a handler returning a non-empty string skips the real tool call
+  entirely and substitutes that string as the result
+  (`"blocked by extension: <reason>"`), matching `prime-agent`'s own
+  "hook can veto/replace a tool call" semantics for this one event.
+  `pi.register_command(name, handler, description="")` makes `/name
+  <args>` invocable from `session_repl` (a new fallback in the slash-
+  command dispatch chain, tried *after* every built-in command, calling
+  the new `Request::SessionExtensionCommand` -> `daemon::
+  handle_session_extension_command` -> worker relay ->
+  `AgentSession::invoke_extension_command`); an unrecognized command name
+  reads as a friendly `"unknown extension command: /name"`, not a hard
+  error -- the same non-fatal shape `/resume <unknown-id>` already has.
+  Deliberately **not** added to `REPL_SLASH_COMMANDS` (the flat list Tab-
+  completion consults) -- extension commands aren't known statically, so
+  there's no completion for them, an honest bounded limitation rather
+  than a lookup against a registry Tab-completion would need to query
+  live.
+
+  Verified three ways: the full existing CI-safe suite plus a new
+  CI-safe `tests/repl.rs` case (`repl_unknown_extension_command_reports_a_friendly_message`)
+  proving the friendly-fallback path on a session that never ran
+  `--runtime ipython` at all (no extension registry ever installed); a
+  new `#[ignore]`d real-kernel test in `ipython_runtime.rs`
+  (`real_kernel_pi_registers_a_command_and_a_pre_tool_call_hook`) driving
+  the exact `_Pi` class `bootstrap_kernel` generates against a genuine
+  `ipykernel`, confirming both `register_command`+`_run_command` and
+  `on("pre_tool_call", ...)`+`_run_pre_tool_call_hooks` actually work --
+  this surfaced one real bug in the test itself (not the implementation):
+  an assertion expected calling a command that returns Python `None` to
+  produce `execute_result` text `"None"`, but IPython's interactive
+  displayhook suppresses `execute_result` entirely for a `None` value
+  (identical to a plain Python REPL), so a "no output" case reads as no
+  `execute_result` at all -- fixed once actually run against a real
+  kernel, not assumed from reading the wire protocol docs; and the full
+  `extensions.rs` unit suite (6 tests: empty/missing directory, a
+  directory without `EXTENSION.md` skipped, a real extension discovered
+  and parsed, a missing `description` field, sorted-by-name ordering) --
+  a line-for-line mirror of `skills.rs`'s own test suite, same discovery
+  code shape.
+
+  Still genuinely absent, same "picked a real subset, not a fake-complete
+  first slice" stance the original "Needs a new subsystem" entry called
+  for: `registerTool`/`registerShortcut`/`registerProvider` (custom
+  LLM-callable tools, keybindings, provider registration), the other
+  ~23 named lifecycle events beyond `pre_tool_call`, the dialog-based
+  user-interaction surface (`select`/`confirm`/`input`/`editor`), custom
+  rendering, and extension-scoped persistent state. None of these are
+  implied to exist by anything here or in `ARCHITECTURE.md`.
 
 ## Needs a new subsystem
 
@@ -2360,33 +2453,33 @@ Python control environment, one an account/identity system) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
-- **Extensions.** Named in this bullet's original heading alongside
-  "skills"/"themes" (skills now done, see the medium-effort section
-  above). An earlier pass here searched only *this project's own* docs
-  and the stray "Extension UI sub-protocol" mention under RPC mode's
-  "Explicitly not implemented" note, found no manifest/registration/
-  capability spec in either, and concluded the whole surface was
-  "genuinely undefined." **Correction, found by reading `prime-agent`'s
-  own `docs/extensions.md` directly (`CLAIMS_AUDIT.md`'s recursive
-  doc-tree pass) rather than relying on a stray cross-reference:** a
-  concrete spec does exist, just not in this project's own reach --
-  `extensions.md` documents a real manifest/registration format (a
-  default-export factory receiving an `ExtensionAPI`,
+- **Extensions, the rest of the surface.** Named in this bullet's
+  original heading alongside "skills"/"themes" (both now done, see the
+  medium-effort section above). An earlier pass here searched only *this
+  project's own* docs, found no manifest/registration/capability spec,
+  and concluded the whole surface was "genuinely undefined." Corrected by
+  reading `prime-agent`'s own `docs/extensions.md` directly: a concrete
+  spec exists (`extensions.md` documents a real manifest/registration
+  format -- a default-export factory receiving an `ExtensionAPI`,
   `pi.registerTool()`/`registerCommand()`/`registerShortcut()`/
-  `registerProvider()`/`on(event, handler)` for roughly 25 named
-  lifecycle events with documented payload shapes) and a real capability
-  list (custom LLM-callable tools, event interception, the dialog-based
-  user-interaction surface the earlier pass already found, custom
-  commands, session persistence, custom rendering). So the "nothing to
-  bound a first increment against" framing was wrong -- a first
-  increment (e.g. one blocking pre-tool-call hook plus one custom-
-  command registration point against this project's own `tool_runtime`/
-  CLI dispatch) is genuinely scopable now. It stays unimplemented all
-  the same: this is a large surface to build a registration/event system
-  for relative to this project's current CLI/daemon shape, and doing it
-  justice would mean picking a real subset rather than a first,
-  necessarily-incomplete slice masquerading as "extensions support" --
-  a deliberate scope decision now, not an absence-of-spec one.
+  `registerProvider()`/`on(event, handler)` across roughly 25 named
+  lifecycle events). The bounded first slice that correction made
+  scopable -- one blocking `pre_tool_call` hook plus one custom-command
+  registration point, as a Python package matching this project's own
+  established Python-via-kernel extensibility model rather than
+  `prime-agent`'s literal JS/TS `ExtensionAPI` -- has since shipped; see
+  the medium-effort section's own "Extensions: manifest/registration
+  format + event-hook system" entry for the full design, the real
+  sync-vs-async constraint found and worked around before it could cause
+  a bug, and what got verified against a genuine kernel. What's named
+  here now is only the remainder that entry explicitly left out:
+  `registerTool`/`registerShortcut`/`registerProvider`, the other ~23
+  lifecycle events, the dialog-based user-interaction surface, custom
+  rendering, and extension-scoped persistent state -- each a large
+  enough surface on its own (an LLM-callable-tool registry, a keybinding
+  system, a provider registry, a modal dialog protocol with no rendering
+  substrate to build it on) that picking any one of them up is its own
+  future increment, not a continuation of this one.
 - **"Steering"** -- interrupting an already-in-flight prompt instead of
   queuing a follow-up behind it (the other half of `prime-agent`'s
   "steering vs. follow-up queuing" surface; the follow-up-queuing half

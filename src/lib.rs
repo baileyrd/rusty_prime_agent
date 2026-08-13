@@ -51,6 +51,7 @@ mod catalog;
 mod cli;
 mod client;
 mod daemon;
+mod extensions;
 mod frontmatter;
 mod http_client;
 mod ipython_runtime;

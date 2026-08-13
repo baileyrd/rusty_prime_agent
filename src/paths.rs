@@ -180,6 +180,15 @@ pub fn global_skills_dir(state: &std::path::Path) -> PathBuf {
     state.join("skills")
 }
 
+/// `<state_dir>/extensions/` -- parity with a bounded slice of
+/// `prime-agent`'s own extension system, see `extensions.rs`'s own
+/// module doc comment. Same global-only reasoning as
+/// [`global_skills_dir`] just above: extension loading runs inside the
+/// worker process, which has no access to the CLI caller's own cwd.
+pub fn global_extensions_dir(state: &std::path::Path) -> PathBuf {
+    state.join("extensions")
+}
+
 /// Create `dir` (and parents) if missing.
 pub fn ensure_dir(context: Context, dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(context, Some(dir.to_path_buf()), e))

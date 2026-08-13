@@ -315,6 +315,14 @@ impl Supervisor {
                 self.handle_session_compact(&mut conn, session_id, instructions)
                     .await
             }
+            Request::SessionExtensionCommand {
+                session_id,
+                command,
+                args,
+            } => {
+                self.handle_session_extension_command(&mut conn, session_id, command, args)
+                    .await
+            }
             Request::SessionSetActiveLeaf {
                 session_id,
                 sequence,
@@ -1176,6 +1184,40 @@ impl Supervisor {
                 HarnessError::protocol(
                     Context::Worker,
                     "worker closed before responding to compact",
+                )
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_session_extension_command(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        command: String,
+        args: String,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::SessionExtensionCommand {
+                    session_id,
+                    command,
+                    args,
+                },
+            )
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to extension command",
                 )
             })?;
         conn.write_response(Context::Daemon, &response).await

@@ -216,12 +216,39 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// already loaded, no round trip needed); these globals exist so kernel
 /// code can also read/display them directly, matching what a real
 /// `prime-agent` session exposes.
+/// The `pi` object every discovered extension's own `register(pi)`
+/// receives -- bounded parity with `prime-agent`'s `ExtensionAPI`
+/// (`extensions.md`), scoped to the two pieces `PARITY.md`'s own
+/// "Extensions" entry calls out as the tractable first slice:
+/// `pi.on("pre_tool_call", handler)` and `pi.register_command(name,
+/// handler, description="")`. Deliberately *synchronous* Python methods
+/// (no `await host_request(...)`, unlike `goal`/`agent_message`/
+/// `compact`/`rlm(...)` above) -- registration itself never needs a
+/// round trip back into Rust; it only ever appends to `pi`'s own
+/// in-kernel lists/dict. This matters for a real, load-bearing reason:
+/// an extension's own top-level `register(pi)` call happens from inside
+/// a plain `import <name>` statement below, and plain module-level code
+/// executed via `import` does **not** get IPython's own top-level-
+/// `await` support the way a real `execute_request` cell (this whole
+/// bootstrap included) does -- an `async def register(pi): await
+/// pi.on(...)` pattern would need the *caller* to `await
+/// extension.register(pi)` from bootstrap's own top level for the
+/// `await` inside `register` to work at all, which would in turn need
+/// this function's single `tool_runtime.execute(&code)` call below to
+/// handle a `pending_host_request` pause -- machinery `bootstrap_kernel`
+/// doesn't have (unlike `execute_python_tool_call`'s own pause/resume
+/// loop) and doesn't need, since nothing here has to notify Rust
+/// mid-registration. What Rust actually needs (which commands got
+/// registered, whether any hook exists) is read back in one shot at the
+/// very end of this same code string instead -- see `EXTENSION_REGISTRY_MARKER`.
+const EXTENSION_REGISTRY_MARKER: &str = "___RPA_EXTENSION_REGISTRY___";
+
 async fn bootstrap_kernel(
     state_root: &Path,
     tool_runtime: &mut dyn ToolRuntime,
     rlm_depth: u32,
     rlm_max_depth: u32,
-) -> Result<()> {
+) -> Result<crate::extensions::ExtensionRegistry> {
     let mut code = format!(
         "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n\n\
          RLM_DEPTH = {rlm_depth}\n\
@@ -277,7 +304,32 @@ async fn bootstrap_kernel(
          \x20       if instructions is not None:\n\
          \x20           payload['instructions'] = instructions\n\
          \x20       return await host_request('compact.now', payload)\n\
-         compact = _Compact()\n",
+         compact = _Compact()\n\n\
+         class _Pi:\n\
+         \x20   def __init__(self):\n\
+         \x20       self._pre_tool_call_hooks = []\n\
+         \x20       self._commands = {{}}\n\
+         \x20   def on(self, event, handler):\n\
+         \x20       if event != 'pre_tool_call':\n\
+         \x20           raise ValueError(\n\
+         \x20               'unknown event %r -- only \\'pre_tool_call\\' is supported'\n\
+         \x20               % (event,)\n\
+         \x20           )\n\
+         \x20       self._pre_tool_call_hooks.append(handler)\n\
+         \x20   def register_command(self, name, handler, description=''):\n\
+         \x20       self._commands[name] = (handler, description)\n\
+         \x20   def _run_pre_tool_call_hooks(self, tool_name, arguments):\n\
+         \x20       for hook in self._pre_tool_call_hooks:\n\
+         \x20           result = hook(tool_name, arguments)\n\
+         \x20           if result:\n\
+         \x20               return result\n\
+         \x20       return None\n\
+         \x20   def _run_command(self, name, args):\n\
+         \x20       entry = self._commands.get(name)\n\
+         \x20       if entry is None:\n\
+         \x20           return None\n\
+         \x20       return entry[0](args)\n\
+         pi = _Pi()\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 
@@ -291,8 +343,68 @@ async fn bootstrap_kernel(
         ));
     }
 
-    tool_runtime.execute(&code).await?;
-    Ok(())
+    // Parity with a bounded slice of `prime-agent`'s extension system --
+    // see `extensions.rs`'s own module doc comment for the full design.
+    // Each discovered extension is `import`ed (a plain, synchronous
+    // statement -- see `_Pi`'s own doc comment above for why this has
+    // to stay synchronous) and, if it defines a top-level `register`
+    // function, called with the shared `pi` object so it can call
+    // `pi.on(...)`/`pi.register_command(...)`.
+    let extensions = crate::extensions::discover(state_root)?;
+    if !extensions.is_empty() {
+        let extensions_dir = paths::global_extensions_dir(state_root);
+        let extensions_dir_json = serde_json::to_string(&extensions_dir.display().to_string())
+            .map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
+        code.push_str(&format!(
+            "import sys; sys.path.insert(0, {extensions_dir_json})\n"
+        ));
+        for extension in &extensions {
+            let name_ident = &extension.name;
+            code.push_str(&format!(
+                "import {name_ident}\n\
+                 if hasattr({name_ident}, 'register'):\n\
+                 \x20   {name_ident}.register(pi)\n"
+            ));
+        }
+    }
+
+    // One marker-prefixed `print` at the very end reads back everything
+    // registered above in this same call -- the same technique
+    // `session::HEARTBEAT_MARKER` already established, chosen for the
+    // same reason: a plain `print()` is the only channel from kernel
+    // code back to this process that doesn't need the pause/resume
+    // machinery a real `host_request` round trip would.
+    code.push_str(&format!(
+        "import json as __rpa_json\n\
+         print({EXTENSION_REGISTRY_MARKER:?} + __rpa_json.dumps({{\n\
+         \x20   'commands': {{k: v[1] for k, v in pi._commands.items()}},\n\
+         \x20   'has_pre_tool_call_hook': len(pi._pre_tool_call_hooks) > 0,\n\
+         }}))\n"
+    ));
+
+    let outcome = tool_runtime.execute(&code).await?;
+    parse_extension_registry(&outcome.stdout)
+}
+
+/// Extracts the JSON payload `EXTENSION_REGISTRY_MARKER` prefixes in
+/// `bootstrap_kernel`'s own final `print` line -- the exact same
+/// "find the marker, parse what follows to the end of that line"
+/// technique `session::extract_heartbeat_marker` already uses, just
+/// parsing structured JSON instead of a bare duration string. A missing
+/// marker (shouldn't happen -- this function's own `code` string always
+/// ends with it -- but a real kernel could in principle fail partway
+/// through, e.g. an extension's own `register(pi)` raising) reads as an
+/// empty registry rather than a hard error: bootstrap still succeeded
+/// enough to be usable, just without whatever extension state didn't
+/// make it into the final print.
+fn parse_extension_registry(stdout: &str) -> Result<crate::extensions::ExtensionRegistry> {
+    let Some(start) = stdout.find(EXTENSION_REGISTRY_MARKER) else {
+        return Ok(crate::extensions::ExtensionRegistry::default());
+    };
+    let after = &stdout[start + EXTENSION_REGISTRY_MARKER.len()..];
+    let line_len = after.find('\n').unwrap_or(after.len());
+    let json = &after[..line_len];
+    serde_json::from_str(json).map_err(|e| HarnessError::json(Context::Runtime, None, e))
 }
 
 /// The worker process entrypoint (`harness __worker-main`).
@@ -300,7 +412,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let session_dir = paths::session_dir(&args.state_root, &args.session_id);
     let mut tool_runtime = build_tool_runtime(&session_dir, args.runtime.as_deref());
     tool_runtime.start().await?;
-    if args.runtime.as_deref() == Some("ipython") {
+    let extension_registry = if args.runtime.as_deref() == Some("ipython") {
         bootstrap_kernel(
             &args.state_root,
             tool_runtime.as_mut(),
@@ -308,11 +420,13 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             args.rlm_max_depth
                 .unwrap_or(crate::session::DEFAULT_RLM_MAX_DEPTH),
         )
-        .await?;
-    }
+        .await?
+    } else {
+        crate::extensions::ExtensionRegistry::default()
+    };
     let provider = build_provider(&args.state_root, args.model.clone(), args.thinking.clone())?;
 
-    let session = match args.mode {
+    let mut session = match args.mode {
         WorkerMode::New => {
             AgentSession::create(
                 &args.state_root,
@@ -348,6 +462,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             session
         }
     };
+    session.install_extension_registry(extension_registry);
     let session = Arc::new(Mutex::new(session));
 
     let socket_path = paths::worker_socket_path(&args.state_root, &args.session_id);
@@ -447,6 +562,18 @@ async fn handle_private_connection(
             conn.write_response(
                 Context::Worker,
                 &Response::SessionCompactAck { compacted, summary },
+            )
+            .await
+        }
+        Request::SessionExtensionCommand { command, args, .. } => {
+            let output = session
+                .lock()
+                .await
+                .invoke_extension_command(&command, &args)
+                .await?;
+            conn.write_response(
+                Context::Worker,
+                &Response::SessionExtensionCommandResult { output },
             )
             .await
         }

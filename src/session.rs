@@ -100,6 +100,32 @@ fn extract_heartbeat_marker(stdout: &str) -> Option<(String, String)> {
     Some((every, without_marker))
 }
 
+/// `run_pre_tool_call_hooks`'s own marker -- see `HEARTBEAT_MARKER`'s
+/// doc comment for the general shape; this one's payload is a JSON
+/// value (`null` for "allowed", a string for "blocked, here's why")
+/// rather than a bare duration string.
+const EXTENSION_HOOK_RESULT_MARKER: &str = "___RPA_EXTENSION_HOOK_RESULT___";
+
+/// `invoke_extension_command`'s own marker -- same shape as
+/// [`EXTENSION_HOOK_RESULT_MARKER`], a JSON value (whatever the
+/// registered command handler returned, or `null`).
+const EXTENSION_COMMAND_RESULT_MARKER: &str = "___RPA_EXTENSION_COMMAND_RESULT___";
+
+/// Finds `marker` in `stdout` and parses the JSON on the rest of that
+/// line -- the shared half of `run_pre_tool_call_hooks`/
+/// `invoke_extension_command`'s own marker handling, `extract_heartbeat_
+/// marker`'s JSON-payload sibling. `None` for a missing marker or
+/// unparseable JSON alike -- callers treat both the same as "no real
+/// answer came back" (allowed/no output), not a hard error, the same
+/// tolerance a Python-level exception already gets elsewhere in this
+/// file.
+fn extract_marker_json(stdout: &str, marker: &str) -> Option<serde_json::Value> {
+    let start = stdout.find(marker)?;
+    let after = &stdout[start + marker.len()..];
+    let line_len = after.find('\n').unwrap_or(after.len());
+    serde_json::from_str(after[..line_len].trim()).ok()
+}
+
 /// Conservative, deliberately approximate context-length trigger for
 /// automatic compaction (`maybe_compact`, called every round of
 /// `prompt`'s tool-calling loop) -- parity with `prime-agent`'s
@@ -239,6 +265,22 @@ pub struct AgentSession {
     /// Stashing it here instead lets the first attach after a recovery
     /// deliver it deterministically, right after the snapshot.
     pending_recovery_marker: Option<SessionEvent>,
+    /// What every discovered extension's own `register(pi)` call
+    /// registered during `worker::bootstrap_kernel` -- see
+    /// `extensions.rs`'s own module doc comment. Name → description;
+    /// the actual callable stays in the kernel's own memory, dispatched
+    /// back into by name (`invoke_extension_command`/
+    /// `run_pre_tool_call_hooks`). Never persisted to `state.json` --
+    /// registration lives entirely in the live kernel's memory, which
+    /// doesn't survive a worker restart either, so `install_extension_
+    /// registry` rebuilds this fresh every time a worker starts.
+    registered_commands: std::collections::HashMap<String, String>,
+    /// Whether at least one `pi.on("pre_tool_call", handler)` was
+    /// registered -- checked before `execute_tool_call` pays for the
+    /// extra kernel round trip `run_pre_tool_call_hooks` needs, so an
+    /// ordinary session with no extensions (or none using this hook)
+    /// never pays anything for a feature it doesn't use.
+    has_pre_tool_call_hook: bool,
 }
 
 /// Creation-time-only metadata for a brand-new session -- bundled so
@@ -355,6 +397,8 @@ impl AgentSession {
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             pending_recovery_marker: None,
+            registered_commands: std::collections::HashMap::new(),
+            has_pre_tool_call_hook: false,
         };
         session.write_state().await?;
         Ok(session)
@@ -405,6 +449,8 @@ impl AgentSession {
             tool_runtime,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             pending_recovery_marker: None,
+            registered_commands: std::collections::HashMap::new(),
+            has_pre_tool_call_hook: false,
         };
         session.write_state().await?;
         Ok(session)
@@ -594,6 +640,17 @@ impl AgentSession {
     /// neither `state.tools` nor `state.runtime` can have changed
     /// in between within one `prompt` call.
     async fn execute_tool_call(&mut self, name: &str, arguments: &str) -> Result<String> {
+        // Bounded parity with a slice of `prime-agent`'s extension
+        // system -- see `extensions.rs`'s own module doc comment. This
+        // is the one chokepoint every tool call passes through
+        // regardless of backend (`execute_python`, built-in read tools,
+        // MCP-proxied tools alike), so it's where a genuinely "blocking"
+        // pre-tool-call hook has to live -- checked before any of the
+        // three backends below ever runs, not layered on top of one of
+        // them.
+        if let Some(reason) = self.run_pre_tool_call_hooks(name, arguments).await? {
+            return Ok(format!("blocked by extension: {reason}"));
+        }
         if name == "execute_python" && self.state.runtime.as_deref() == Some("ipython") {
             return self.execute_python_tool_call(arguments).await;
         }
@@ -604,6 +661,89 @@ impl AgentSession {
             }
             _ => Ok(crate::tools::execute(name, arguments)),
         }
+    }
+
+    /// Installs what `worker::bootstrap_kernel` discovered every
+    /// extension registered -- called once, right after that bootstrap
+    /// (or left at its all-empty `Default` for a non-`ipython` session,
+    /// which never bootstraps anything to register in the first place).
+    pub fn install_extension_registry(&mut self, registry: crate::extensions::ExtensionRegistry) {
+        self.registered_commands = registry.commands;
+        self.has_pre_tool_call_hook = registry.has_pre_tool_call_hook;
+    }
+
+    /// Runs every registered `pi.on("pre_tool_call", handler)` hook (in
+    /// registration order, first non-empty result wins) against one
+    /// about-to-happen tool call, returning the blocking reason if any
+    /// hook returned one. A no-op, no kernel round trip at all, unless
+    /// `has_pre_tool_call_hook` is already known true -- the common case
+    /// (no extensions, or none using this hook) never pays for a kernel
+    /// call just to learn that. Uses the same marker-`print` technique
+    /// `worker::bootstrap_kernel`'s own registry query does (see
+    /// `EXTENSION_HOOK_RESULT_MARKER`), not `host_request`: this is a
+    /// plain, synchronous "run this expression, get its value back" need,
+    /// the same shape `execute_python_tool_call` already has for the
+    /// model's own code, not a kernel-initiated callback.
+    async fn run_pre_tool_call_hooks(
+        &mut self,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<Option<String>> {
+        if !self.has_pre_tool_call_hook {
+            return Ok(None);
+        }
+        let tool_name_json = serde_json::to_string(tool_name)
+            .map_err(|e| HarnessError::json(Context::Session, None, e))?;
+        // `arguments` is already a JSON string the model produced (a
+        // tool call's own `arguments` field), so it's passed through
+        // `json.loads` in the generated code rather than re-escaped as
+        // a JSON *string containing* JSON -- a hook handler receives the
+        // real parsed arguments object, not a string it would have to
+        // parse itself.
+        let arguments_json = serde_json::to_string(arguments)
+            .map_err(|e| HarnessError::json(Context::Session, None, e))?;
+        let code = format!(
+            "import json as __rpa_json\n\
+             __rpa_result = pi._run_pre_tool_call_hooks({tool_name_json}, __rpa_json.loads({arguments_json}))\n\
+             print({EXTENSION_HOOK_RESULT_MARKER:?} + __rpa_json.dumps(__rpa_result))\n"
+        );
+        let outcome = self.tool_runtime.execute(&code).await?;
+        Ok(
+            extract_marker_json(&outcome.stdout, EXTENSION_HOOK_RESULT_MARKER)
+                .and_then(|v| v.as_str().map(str::to_string)),
+        )
+    }
+
+    /// Invokes an extension-registered command (`pi.register_command`),
+    /// the `AgentSession` half of a REPL's own `/name <args>` fallback
+    /// (see `client::session_repl`'s own doc comment for the client
+    /// side). An unregistered `name` returns a friendly explanatory
+    /// string rather than an error -- the same "surface it, don't fail
+    /// the whole request" posture `handle_host_request`'s own unknown-
+    /// `kind` fallback already takes, since a REPL user typing an
+    /// unrecognized `/foo` is normal, recoverable input, not a protocol
+    /// failure. Only reachable at all when `state.runtime ==
+    /// Some("ipython")` -- `registered_commands` is always empty
+    /// otherwise, so this degrades to the same friendly message.
+    pub async fn invoke_extension_command(&mut self, name: &str, args: &str) -> Result<String> {
+        if !self.registered_commands.contains_key(name) {
+            return Ok(format!("unknown extension command: /{name}"));
+        }
+        let name_json = serde_json::to_string(name)
+            .map_err(|e| HarnessError::json(Context::Session, None, e))?;
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| HarnessError::json(Context::Session, None, e))?;
+        let code = format!(
+            "import json as __rpa_json\n\
+             __rpa_result = pi._run_command({name_json}, {args_json})\n\
+             print({EXTENSION_COMMAND_RESULT_MARKER:?} + __rpa_json.dumps(__rpa_result))\n"
+        );
+        let outcome = self.tool_runtime.execute(&code).await?;
+        let result = extract_marker_json(&outcome.stdout, EXTENSION_COMMAND_RESULT_MARKER)
+            .and_then(|v| v.as_str().map(str::to_string));
+        Ok(result
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(no output)".to_string()))
     }
 
     /// `tools::execute_python_tool_def`'s base `ToolDef`, with the names
