@@ -308,13 +308,15 @@ daemon/worker split rather than requiring the Python control environment:
   an existing session's own transcript up through `--at N` (or the whole
   thing, if omitted) -- reusing this project's existing session-creation
   machinery the same way recursive subagents did, not a new intra-
-  session data structure. Explicitly does NOT deliver: `/tree`
-  visualization (nothing to visualize beyond `session children`'s
-  existing parent/child view), active-leaf switching mid-session (each
-  fork is a separate, permanently-diverged session, not a pointer moved
-  within one), or `/clone`'s live-state duplication (a running kernel
-  connection or MCP session dies with the source worker, same as any
-  other session boundary).
+  session data structure at the time this was written. (Both `/tree`
+  visualization and active-leaf switching mid-session exist now -- see
+  the "Intra-session tree branching" and "`/tree` navigation +
+  active-leaf switching" entries further down -- but that's a separate
+  mechanism from `session fork`'s own session-level copy, not something
+  this entry grew after the fact.) `/clone`'s live-state duplication
+  still isn't delivered by anything: a running kernel connection or MCP
+  session dies with the source worker, same as any other session
+  boundary.
 
   New `protocol::ForkedFrom { session_id, at_sequence }` on
   `SessionState`/`SessionSummary` (`#[serde(default)]`, the same
@@ -428,15 +430,13 @@ daemon/worker split rather than requiring the Python control environment:
   unchanged, the same relay `SessionRename`/`SessionCompact` already
   use.
 
-  Deliberately scoped to data model + protocol/backend mechanism only:
-  no CLI/REPL command calls `set_active_leaf` yet (no `/tree`
-  navigation surface exists to drive it from), matching this project's
-  own established pattern of landing a protocol/backend increment
-  before its CLI surface (`rlm_depth`/`rlm_max_depth` landed the same
-  way, before any CLI exposed them). `/tree` visualization and
-  active-leaf switching from `session_repl` are the next increment;
-  `/clone`'s live-state duplication and branch summaries are the one
-  after that.
+  This first increment was deliberately scoped to data model +
+  protocol/backend mechanism only: no CLI/REPL command called
+  `set_active_leaf` yet, matching this project's own established
+  pattern of landing a protocol/backend increment before its CLI
+  surface (`rlm_depth`/`rlm_max_depth` landed the same way). The
+  `/tree` navigation surface that drives it is the very next entry in
+  this list.
 
   Verified with new unit tests: ordinary linear `append` calls each
   produce `parent_sequence` equal to the previous entry; `set_active_leaf`
@@ -451,12 +451,62 @@ daemon/worker split rather than requiring the Python control environment:
   stayed green after switching `build_turns`/`compact_now` onto
   `active_chain`, confirming no regression to ordinary single-branch
   sessions.
+- [x] **`/tree` navigation + active-leaf switching** -- the CLI/REPL
+  surface deferred from the increment just above. `harness session tree
+  <id>` (display) and `harness session set-active-leaf <id> <sequence>`
+  (navigation) as top-level commands, plus `/tree` and `/tree <sequence>`
+  wired into `session_repl`'s loop the same "one command name, display
+  with no argument, act with one" shape a bounded REPL slice can afford
+  without a real interactive picker (`prime-agent`'s own `/tree` is a
+  TUI feature with one; this project has no raw-mode UI yet to build one
+  in, see the "Needs a new subsystem" TUI entry below).
+
+  `client::session_tree` reconstructs the tree client-side from the two
+  fields the wire protocol already carries end to end
+  (`TranscriptEntry::parent_sequence`, `SessionState::
+  active_leaf_sequence`, both already serialized onto `SessionEvent::
+  Snapshot`) rather than adding a new pre-rendered request/response shape
+  -- the same "the client renders, the wire carries data" split every
+  other `--mode text` renderer in this project already follows. Its own
+  `effective_parent` helper mirrors `AgentSession::active_chain`'s
+  legacy-fallback rule exactly, so a pre-branching session still renders
+  as the flat chain it always was. `client::session_set_active_leaf` is
+  the first client surface to reach `Request::SessionSetActiveLeaf` at
+  all.
+
+  Fixed a real gap this increment's own tests surfaced: `set_active_leaf`
+  returning `Err` for an unknown sequence, then propagated via a bare `?`
+  out of `worker::handle_private_connection`, closed the private
+  connection with no response at all -- every request relayed across
+  that boundary before this one (`SessionRename`, `SessionCompact`)
+  happens to never fail, so nothing had exercised this path. The daemon's
+  own relay then saw the closed connection as "worker closed before
+  responding" (a protocol error, not the real conflict), and the CLI
+  printed an opaque message instead of the actual "no transcript entry at
+  sequence 999" text. Fixed by matching `set_active_leaf`'s `Result`
+  explicitly in `handle_private_connection` and writing a `Response::
+  Error { conflict: true, .. }` back over the private connection instead
+  -- the same explicit-match-not-`?` shape `daemon::Supervisor::
+  handle_session_fork` already uses for its own genuinely-failable step,
+  now established as the pattern for private-transport requests too.
+
+  Verified with a new `tests/session_tree.rs` integration suite: ordinary
+  prompting reports a linear chain with the current active leaf; `--mode
+  text` marks exactly the active entry `(active)`; `set_active_leaf`
+  followed by a prompt produces a real fork (two entries sharing one
+  parent, `active_leaf_sequence` pointing down the new branch, both
+  branches still present in the full transcript); an unknown sequence
+  reports a conflict with the bad sequence in the message; and an empty
+  session reports "no turns yet" rather than an empty/malformed tree.
+  Plus a manual pass in this sandbox confirming the same end to end
+  against the real compiled binary, including through `session_repl`'s
+  `/tree`/`/tree <sequence>` lines.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
   below for the pieces that genuinely don't have a bounded slice --
-  image paste, steering vs. follow-up queuing, `/tree`, `/clone`,
-  `/share` -- and why).
+  image paste, steering vs. follow-up queuing, `/clone`, `/share` -- and
+  why; `/tree` itself is covered by the entry just above).
 
   `/file <path>` reads a local file client-side and queues its content
   to be prepended to the *next* line that actually sends a prompt (a
@@ -626,11 +676,15 @@ daemon/worker split rather than requiring the Python control environment:
   replays the session's existing transcript first, so resuming a
   session in the REPL shows its prior turns the same way `session
   attach` would. None of the TUI's own editor/message-queue features
-  (file reference, image paste, steering vs. follow-up queuing,
-  `/tree`/`/fork`/`/clone`/`/compact`/`/export`/`/share`) -- those stay
-  unimplemented below; this is the bare loop underneath all of that, the
-  same "extract the tractable session-level mechanism, leave the rich
-  surface out" move as `session spawn`/prompt templates above.
+  existed at the time this entry was first written (file reference,
+  image paste, steering vs. follow-up queuing, `/tree`/`/fork`/`/clone`/
+  `/compact`/`/export`/`/share`) -- this was the bare loop underneath all
+  of that, the same "extract the tractable session-level mechanism,
+  leave the rich surface out" move as `session spawn`/prompt templates
+  above. Most have since landed (see the `/file`/`/fork`/`/export` and
+  `/tree`/active-leaf-switching entries further down); image paste,
+  steering vs. follow-up queuing, and `/clone`/`/share` still haven't,
+  see "Needs a new subsystem" below for why.
 - [x] **Model/provider catalog listing** (`harness model list`), the
   provider tier of `prime-agent model list`'s catalog browse: which of
   the known providers (`openai`/`anthropic`/`gemini`/`groq`/`ollama`,
@@ -1741,21 +1795,21 @@ attempted here, and not silently implied by anything in
   lands, so there is no window during which a second line could even be
   read, let alone dispatched as steering-vs-queued; this isn't "harder
   in a REPL," it's structurally absent without a real concurrent-input
-  event loop). `/tree`'s own visualization/navigation surface and `/clone`
-  (live-state duplication) stay out of scope for the reasons given
-  above and in the medium-effort section's `session fork` entry --
-  the underlying active-leaf transcript model both would sit on top
-  of is now real, see that entry's own "Intra-session tree branching"
-  writeup.
+  event loop). `/clone` (live-state duplication) stays out of scope for
+  the reasons given above and in the medium-effort section's `session
+  fork` entry -- a running kernel connection or MCP session dies with
+  the source worker, same as any other session boundary, and that's not
+  something a bounded increment can fix without a genuinely different
+  worker-handoff mechanism.
 
   Investigated the rest of this bullet's original list piece by piece
-  rather than leaving it one atomic blob, the same way `/tree`/`/fork`/
-  `/clone` got split earlier -- `/file`, `/fork`, `/compact`, and
-  `/export` all turned out to have honest, bounded REPL-only slices and
-  are now done, see the medium-effort section's `session_repl` entry.
-  `/share` stays out of scope: it needs somewhere to send the export
-  *to* (a hosted paste/share destination), the same "nothing on the
-  other end" shape `/login` has just below.
+  rather than leaving it one atomic blob -- `/file`, `/fork`, `/compact`,
+  `/export`, and (once its own underlying data model landed) `/tree`
+  all turned out to have honest, bounded REPL-only slices and are now
+  done, see the medium-effort section's `session_repl`/`/tree`
+  entries. `/share` stays out of scope: it needs somewhere to send the
+  export *to* (a hosted paste/share destination), the same "nothing on
+  the other end" shape `/login` has just below.
 - **`/login`**, an in-session OAuth-style flow to Prime Intellect's own
   hosted account system. `prime-agent`'s own
   [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md)

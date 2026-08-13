@@ -620,23 +620,27 @@ above:
   **False.** No interactive picker exists; `session list` is a flat
   print and there's no delete command at all (only manual directory
   removal).
-- **`/tree`/`/fork`/`/clone` comparison.** -- **Partial.** `/fork` has a
-  real (bounded) analog -- `session fork` matches reasonably well. The
-  data model `/tree` and `/clone` would need is now real (see
-  session-format.md below), but neither's own CLI/REPL surface (`/tree`
-  navigation, `/clone`'s live-state duplication) exists yet.
+- **`/tree`/`/fork`/`/clone` comparison.** -- **Partial, one clause now
+  closed.** `/fork` has a real (bounded) analog -- `session fork` matches
+  reasonably well. **Closed**: `/tree` now has a real analog too --
+  `harness session tree <id>` / `/tree` in `session_repl` for display,
+  `harness session set-active-leaf <id> <sequence>` / `/tree <sequence>`
+  for navigation. `/clone`'s live-state duplication is still missing --
+  see session-format.md below.
 
 ## session-format.md
 
 - **"Sessions... form a tree structure via `id`/`parentId` fields,
-  enabling in-place branching."** -- **Partial.** No separate `id`
-  field (this project addresses tree position via the pre-existing
-  `sequence: u64` instead of a new id concept), but `TranscriptEntry::
-  parent_sequence: Option<u64>` is a real `parentId` analog, and
-  `SessionState::active_leaf_sequence` tracks the branch point
-  `AgentSession::set_active_leaf` can redirect mid-session -- in-place
-  branching itself is real. No CLI/REPL surface exposes it yet (no
-  `/tree`, no way to trigger `set_active_leaf` outside the protocol).
+  enabling in-place branching."** -- **Partial, one clause now closed.**
+  No separate `id` field (this project addresses tree position via the
+  pre-existing `sequence: u64` instead of a new id concept), but
+  `TranscriptEntry::parent_sequence: Option<u64>` is a real `parentId`
+  analog, and `SessionState::active_leaf_sequence` tracks the branch
+  point `AgentSession::set_active_leaf` can redirect mid-session --
+  in-place branching itself is real. **Closed**: a CLI/REPL surface now
+  exposes it (`session tree`/`/tree` display, `session set-active-leaf`/
+  `/tree <sequence>` navigation) -- still no true interactive picker, the
+  same "no raw-mode UI yet" gap the rest of the TUI surface has.
 - **File location: one `<session-id>.jsonl` file per session.** --
   **False.** A directory with separate `state.json`
   (pointer/recovery metadata) and `transcript.jsonl` (append-only log).

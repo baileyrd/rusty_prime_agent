@@ -610,23 +610,63 @@ SessionSetActiveLeafAck { active_leaf_sequence }`, forwarded from the
 public daemon socket to the owning worker's private socket unchanged --
 the same relay `SessionRename`/`SessionCompact` already use.
 
-No CLI/REPL command calls `set_active_leaf` yet -- this increment is
-deliberately data model + protocol/backend only, matching the pattern
-`rlm_depth`/`rlm_max_depth` set (landing before any CLI exposed them).
-`/tree` navigation and active-leaf switching from `session_repl` are the
-next increment; `/clone`'s live-state duplication and branch summaries
-are the one after that.
+This first increment landed with no CLI/REPL command calling
+`set_active_leaf` yet -- deliberately data model + protocol/backend
+only, matching the pattern `rlm_depth`/`rlm_max_depth` set (landing
+before any CLI exposed them). The next section covers the surface that
+now does.
 
-## REPL commands: `/file`, `/fork`, `/export`
+## `/tree` navigation + active-leaf switching
+
+The CLI/REPL surface for the mechanism above: `harness session tree
+<id>` (display) and `harness session set-active-leaf <id> <sequence>`
+(navigation) as top-level commands (`client::session_tree`/`client::
+session_set_active_leaf`), plus `/tree` and `/tree <sequence>` wired
+into `session_repl`'s own stdin loop -- the same "one command name,
+display with no argument, act with one" shape a bounded REPL slice can
+afford without `prime-agent`'s own real interactive picker (this
+project has no raw-mode UI yet to build one in).
+
+`session_tree` reconstructs the tree entirely client-side from fields
+the wire protocol already carries end to end -- `TranscriptEntry::
+parent_sequence` and `SessionState::active_leaf_sequence`, both already
+serialized onto `SessionEvent::Snapshot` -- rather than adding a new
+pre-rendered request/response shape, the same "the client renders, the
+wire carries data" split every other `--mode text` renderer already
+follows. Its own `effective_parent` helper mirrors `AgentSession::
+active_chain`'s legacy-fallback rule exactly (duplicated, not shared,
+since the client and worker are different processes communicating only
+over the wire protocol), so a pre-branching session still renders as
+the flat chain it always was. `fetch_session_snapshot` (a small
+generalization of the existing `fetch_transcript_snapshot`, which now
+just discards the `SessionState` half) is what fetches both halves in
+one `SessionAttach`-then-read-first-`Snapshot`-then-disconnect round
+trip.
+
+One real gap this increment's own tests surfaced and fixed:
+`set_active_leaf`'s `Err` for an unknown sequence, previously propagated
+via a bare `?` out of `worker::handle_private_connection`, closed the
+private connection with no response at all instead of reaching the
+client as the conflict it actually is -- every request relayed across
+that private-transport boundary before this one (`SessionRename`,
+`SessionCompact`) happens to never fail, so nothing had exercised an
+error path there before. Fixed by matching the `Result` explicitly in
+`handle_private_connection` and writing a `Response::Error { conflict:
+true, .. }` back over the private connection instead of using `?` --
+the same explicit-match-not-`?` shape `daemon::Supervisor::
+handle_session_fork` already uses for its own genuinely-failable step,
+now the established pattern for private-transport requests too.
+
+## REPL commands: `/file`, `/fork`, `/export`, `/tree`
 
 Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/
 message-queue features -- see `PARITY.md` for the full story, including
 which pieces of that surface (image paste, steering vs. follow-up
-queuing, `/tree`, `/clone`, `/share`) don't have a bounded slice and
-why. All three live in `client::session_repl`'s own stdin loop, the
-same shape `/heartbeat`/`/compact` already established: a REPL-only
-line command calling directly into an existing client-side function,
-no daemon/worker/protocol change.
+queuing, `/clone`, `/share`) don't have a bounded slice and why. All
+four live in `client::session_repl`'s own stdin loop, the same shape
+`/heartbeat`/`/compact` already established: a REPL-only line command
+calling directly into an existing client-side function, no daemon/
+worker/protocol change.
 
 `/file <path>` reads a local file and stashes its content in a
 `pending_file_content: Option<String>` local to the loop, consumed (and

@@ -164,6 +164,8 @@ harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
 harness session compact <id> [instructions...]   # force compaction now
 harness session fork <id> [--at N] [--name NAME]  # copy into a brand-new session
+harness session tree <id>                     # show every branch of the transcript
+harness session set-active-leaf <id> <sequence>  # switch which entry the next prompt continues from
 ```
 
 Sessions with a real `--model` automatically compact their own context
@@ -181,18 +183,28 @@ starting transcript is a copy of `<id>`'s own transcript up through
 `--at N` (or the whole thing, if `--at` is omitted) -- bounded parity
 with a slice of `prime-agent`'s `/fork` (session-level forking, not
 intra-session branching -- see `ARCHITECTURE.md` for exactly what that
-distinction means. Intra-session branching's own data model (an
-active-leaf pointer any transcript entry can redirect) now exists
-underneath the protocol, but no `/tree` visualization or CLI/REPL
-command reaches it yet). The new session carries forward the source's
-`--model`/
-`--thinking`/`--tools`/`--runtime` configuration but starts with no goal
-and no Continual Harness history, since both would only be accurate
-against the source's full history, not necessarily a truncated copy of
-it. `--at N` past the source's own last turn is a conflict, not a
-silent clamp. Prompting the fork never affects the source session, or
+distinction means). The new session carries forward the source's
+`--model`/`--thinking`/`--tools`/`--runtime` configuration but starts
+with no goal and no Continual Harness history, since both would only be
+accurate against the source's full history, not necessarily a truncated
+copy of it. `--at N` past the source's own last turn is a conflict, not
+a silent clamp. Prompting the fork never affects the source session, or
 vice versa -- they're two ordinary, unrelated sessions from that point
 on.
+
+`session tree` prints every branch of `<id>`'s own transcript (not just
+the currently active one), indented by depth, with the entry the next
+prompt would continue from marked `(active)`. `session set-active-leaf
+<id> <sequence>` redirects that pointer -- the *next* prompt (or
+`/compact`) continues from `<sequence>` instead of wherever it was
+before; if `<sequence>` already has a child down the previously-active
+path, the next append becomes a second child of the same parent, a real
+fork inside one session's own transcript (parity with `session-format.md`'s
+`id`/`parentId`, in-place branching -- see `ARCHITECTURE.md` for the
+full mechanism). Unlike `session fork`, nothing new is created: it's one
+session, one transcript, with more than one branch in it. A `<sequence>`
+that doesn't name a real transcript entry is a conflict, not a silent
+no-op.
 
 ### Scheduling
 
@@ -401,6 +413,14 @@ into the next ordinary prompt text. `/fork [--at N] [--name TEXT]` is
 `session fork` wired into the REPL loop, same as `session compact` is
 via `/compact`. `/export <path>` writes the session's current
 transcript to a local file as pretty-printed JSON.
+
+`/tree` prints every branch of the session's own transcript (same
+output as `session tree`), marking the entry the next prompt would
+continue from. `/tree <sequence>` redirects that pointer instead of
+displaying anything (`session set-active-leaf` wired into the loop) --
+the next line you type continues from `<sequence>`, and if that entry
+already has a child down the previously-active path, your next prompt
+creates a real branch rather than extending it.
 
 ### RPC mode
 
