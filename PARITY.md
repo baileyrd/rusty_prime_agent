@@ -177,6 +177,55 @@ daemon/worker split rather than requiring the Python control environment:
   catalog, and a pre-set `GROQ_API_KEY` env var was confirmed (via a
   marker-file command that never got created) to short-circuit
   `auth.json` entirely rather than double-resolving it.
+- [x] **Custom / arbitrary OpenAI-compatible provider registration**, a
+  `<state_root>/providers.json` letting a session point at a
+  self-hosted vLLM server, LM Studio, a company-internal proxy, or any
+  other OpenAI-wire-compatible endpoint that `rp-server`'s own
+  compiled-in `OPTIONAL_PROVIDERS` list has no entry for.
+
+  Confirmed against `rusty_provider`'s real router source
+  (`crates/router/src/config.rs`/`lib.rs`) before implementing, not
+  guessed: a provider's *name* is an arbitrary TOML table key
+  (`HashMap<String, ProviderConfig>`), routed on by splitting an
+  incoming `"name/model"` string on the first `/` -- `kind` is the only
+  closed enum (`openai`/`anthropic`/`gemini`), and any wire-compatible
+  self-hosted endpoint registers as `kind = "openai"`, exactly
+  `rusty_provider`'s own shipped `config.example.toml` pattern (`groq`/
+  `together`/`fireworks`, three arbitrary names all `kind = "openai"`).
+  This meant `provider.rs`/`cli.rs`/`client.rs` needed zero changes:
+  `--model <name>/<model>` was always an opaque, unvalidated string
+  forwarded straight through to `rp-server`, which is the only thing
+  that ever rejects an unknown name (a 4xx from `/v1/chat/completions`).
+
+  New `src/providers.rs`: `providers::load(state_root)` reads
+  `{"<name>": {"base_url": "...", "kind": "openai"}}` entries
+  (`kind` optional, defaults to `"openai"`), same permissive-parse
+  stance `settings::load`/`auth::load` already take. `rp_server::
+  all_providers` merges this with the hardcoded `OPTIONAL_PROVIDERS`
+  into the one list `write_config`/`known_providers`/`resolve_auth_env`
+  now all iterate instead of the bare const; a custom entry reusing a
+  reserved name (a built-in provider name, or `"ollama"`) is silently
+  dropped rather than erroring or colliding into a duplicate
+  `[providers.*]` TOML table. A registered provider's key is supplied
+  the exact same way a built-in one's is: an env var (derived as
+  `<NAME>_API_KEY`, non-alphanumerics folded to `_`), or an `auth.json`
+  entry keyed by the same provider name -- `auth.rs` needed no changes
+  at all, since it was already a plain name-keyed map.
+
+  Verified three ways: CI-safe unit tests (`src/providers.rs`'s own
+  `load` in isolation; `src/rp_server.rs`'s `all_providers` merging in a
+  custom entry, dropping one that reuses a reserved name, and
+  `resolve_auth_env`/`write_config` resolving a custom provider's own
+  `auth.json` entry and activating its `[providers.*]` block), a CI-safe
+  integration test (`tests/model_list.rs`: a registered custom provider
+  is listed, and its derived env var flips it to `configured`), and a
+  real end-to-end pass in this sandbox against a real `rp-server`
+  sidecar: Ollama's own OpenAI-compatible endpoint
+  (`http://127.0.0.1:11434/v1`) registered under the made-up name
+  `my-vllm` (not the built-in `ollama` special case) appeared as
+  `my-vllm/*` in `rp-server`'s real `/v1/models` catalog, and `session
+  new --model my-vllm/qwen2.5:0.5b` round-tripped a real completion
+  through it.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -975,12 +1024,6 @@ attempted here, and not silently implied by anything in
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"
   above) and the compaction summary -- there's nothing for either to
   hook into without a larger design change than either of those needed.
-- **Custom / arbitrary OpenAI-compatible provider registration.** No way
-  to point at an arbitrary base URL; `rp-server`'s own compiled-in
-  provider list is the only surface, and this project has no extension
-  mechanism (see the "Extensions" bullet above) to register a new one at
-  runtime.
-
 ## Process
 
 Each increment above gets implemented, tested (a real integration test

@@ -259,6 +259,33 @@ running a `!command` as a side effect of listing; the command only ever
 runs when a real `rp-server` sidecar is actually starting up. Global
 only, same cwd-visibility reason `settings.json` is.
 
+### Custom providers (`providers.json`)
+
+Drop a `providers.json` into the state directory to point `--model` at
+any self-hosted OpenAI-compatible endpoint -- a vLLM server, LM Studio,
+a company-internal proxy -- that isn't one of the built-in
+`openai`/`anthropic`/`gemini`/`groq`/`ollama` names:
+
+```json
+{
+  "my-vllm": { "base_url": "http://127.0.0.1:8000/v1" }
+}
+```
+
+`kind` is optional and defaults to `"openai"`, the right value for any
+wire-compatible self-hosted endpoint. The registered name works
+everywhere a built-in provider name does -- `session new --model
+my-vllm/<model>`, `harness model list`/`--detailed` -- and its API key
+is supplied the same way a built-in provider's is: an env var (derived
+as `<NAME>_API_KEY`, e.g. `MY_VLLM_API_KEY`), or an `auth.json` entry
+keyed by the same name (see above). A custom entry reusing a reserved
+name (a built-in provider's own name, or `ollama`) is silently ignored.
+Global only, same cwd-visibility reason `settings.json`/`auth.json` are.
+
+```sh
+harness session new --model my-vllm/some-model-id
+```
+
 ### The Continual Harness
 
 Durable supplemental notes (prompts, memories, skill descriptions) a

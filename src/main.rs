@@ -13,6 +13,7 @@ mod procutil;
 mod prompt_template;
 mod protocol;
 mod provider;
+mod providers;
 mod rp_server;
 mod schedule;
 mod session;

@@ -116,6 +116,64 @@ const OPTIONAL_PROVIDERS: &[(&str, &str, &str)] = &[
     ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
 ];
 
+/// One resolved provider `write_config`/`known_providers`/
+/// `resolve_auth_env` can act on, whether it came from the hardcoded
+/// [`OPTIONAL_PROVIDERS`] or a user's own `<state_root>/providers.json`
+/// -- see [`all_providers`].
+struct ProviderEntry {
+    name: String,
+    base_url: String,
+    api_key_env: String,
+    kind: String,
+}
+
+/// The env var name a registered custom provider's key is looked for
+/// under, absent an explicit override -- `<NAME>_API_KEY` with every
+/// non-alphanumeric character (hyphens are the common case: `my-vllm`)
+/// folded to `_`, the same shape every built-in `OPTIONAL_PROVIDERS`
+/// entry's own `*_API_KEY` var already has.
+fn custom_provider_api_key_env(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{}_API_KEY", sanitized.to_ascii_uppercase())
+}
+
+/// Merges [`OPTIONAL_PROVIDERS`] with `<state_root>/providers.json`
+/// (`providers::load`, see that module's own doc comment for why an
+/// arbitrary provider *name* is exactly the mechanism `rp-server`'s real
+/// router already supports) into the one list every provider-aware
+/// function in this module iterates. A custom entry reusing a reserved
+/// name (one of `OPTIONAL_PROVIDERS`'s own names, or `"ollama"`, which
+/// `write_config` always appends as its own unconditional block) is
+/// silently dropped rather than an error -- the built-in wins, the same
+/// permissive "an ambiguous config entry is ignored, not fatal" stance
+/// `settings.json`'s own unknown-field handling already takes.
+fn all_providers(state_root: &Path) -> Vec<ProviderEntry> {
+    let mut entries: Vec<ProviderEntry> = OPTIONAL_PROVIDERS
+        .iter()
+        .map(|(name, base_url, api_key_env)| ProviderEntry {
+            name: name.to_string(),
+            base_url: base_url.to_string(),
+            api_key_env: api_key_env.to_string(),
+            kind: "openai".to_string(),
+        })
+        .collect();
+    for (name, custom) in crate::providers::load(state_root) {
+        if name == "ollama" || entries.iter().any(|e| e.name == name) {
+            continue;
+        }
+        entries.push(ProviderEntry {
+            api_key_env: custom_provider_api_key_env(&name),
+            base_url: custom.base_url,
+            kind: custom.kind,
+            name,
+        });
+    }
+    entries
+}
+
 /// One entry of the provider catalog (`harness model list`) -- bounded
 /// parity with `prime-agent model list`'s catalog browse: which
 /// backends `write_config` would activate given this process's own
@@ -129,12 +187,13 @@ pub struct ProviderInfo {
     pub configured: bool,
 }
 
-/// Every provider name `write_config` could ever activate, plus whether
-/// this process's own environment (or `<state_root>/auth.json`)
-/// configures it right now -- exactly the same `OPTIONAL_PROVIDERS`/
-/// env-var-or-auth.json-entry check [`ensure_running`] itself uses, so
-/// this can never drift from what a real `session new --model
-/// <name>/...` would actually be able to reach. Ollama is always
+/// Every provider name `write_config` could ever activate -- every
+/// `OPTIONAL_PROVIDERS` entry plus whatever `<state_root>/providers.json`
+/// registers (see [`all_providers`]) -- plus whether this process's own
+/// environment (or `<state_root>/auth.json`) configures it right now.
+/// Exactly the same env-var-or-auth.json-entry check [`ensure_running`]
+/// itself uses, so this can never drift from what a real `session new
+/// --model <name>/...` would actually be able to reach. Ollama is always
 /// `configured: true`: it needs no real key (see `write_config`'s own
 /// doc comment).
 ///
@@ -145,11 +204,12 @@ pub struct ProviderInfo {
 /// listing. See `auth`'s own module doc comment.
 pub fn known_providers(state_root: &Path) -> Vec<ProviderInfo> {
     let auth = crate::auth::load(state_root);
-    let mut providers: Vec<ProviderInfo> = OPTIONAL_PROVIDERS
-        .iter()
-        .map(|(name, _base_url, api_key_env)| ProviderInfo {
-            name: name.to_string(),
-            configured: std::env::var_os(api_key_env).is_some() || auth.contains_key(*name),
+    let mut providers: Vec<ProviderInfo> = all_providers(state_root)
+        .into_iter()
+        .map(|entry| ProviderInfo {
+            configured: std::env::var_os(&entry.api_key_env).is_some()
+                || auth.contains_key(&entry.name),
+            name: entry.name,
         })
         .collect();
     providers.push(ProviderInfo {
@@ -200,28 +260,31 @@ pub async fn fetch_model_catalog(port: u16) -> Result<Vec<ModelCatalogEntry>> {
     Ok(parsed.data)
 }
 
-/// For every `OPTIONAL_PROVIDERS` entry whose env var isn't already set
-/// in this process's own environment, checks `<state_root>/auth.json`
-/// for an entry and resolves it (see `auth::resolve_key`) -- an env var
-/// already being set always wins, `auth.json` never consulted in that
-/// case, the same precedence `settings.json`'s own overrides established
-/// for a different pair of tiers. Returns `(api_key_env, resolved_key)`
-/// pairs only for what `auth.json` actually configured; the daemon's own
-/// process environment is never mutated -- callers hand these to the
-/// spawned `rp-server` child's own `Command::env` instead (see
-/// `ensure_running`), so a caller who never restarts the daemon still
-/// sees a same-process-lifetime `auth.json` edit take effect on the next
+/// For every provider `all_providers` returns whose env var isn't
+/// already set in this process's own environment, checks
+/// `<state_root>/auth.json` for an entry (keyed by that same provider
+/// name -- `auth.rs` needed no changes at all for custom providers to
+/// work, see `providers`' own module doc comment) and resolves it (see
+/// `auth::resolve_key`) -- an env var already being set always wins,
+/// `auth.json` never consulted in that case, the same precedence
+/// `settings.json`'s own overrides established for a different pair of
+/// tiers. Returns `(api_key_env, resolved_key)` pairs only for what
+/// `auth.json` actually configured; the daemon's own process environment
+/// is never mutated -- callers hand these to the spawned `rp-server`
+/// child's own `Command::env` instead (see `ensure_running`), so a
+/// caller who never restarts the daemon still sees a
+/// same-process-lifetime `auth.json` edit take effect on the next
 /// sidecar spawn, without a stray global env var leaking anywhere else.
 async fn resolve_auth_env(state_root: &Path) -> Result<Vec<(String, String)>> {
     let auth = crate::auth::load(state_root);
     let mut resolved = Vec::new();
-    for (name, _base_url, api_key_env) in OPTIONAL_PROVIDERS {
-        if std::env::var_os(api_key_env).is_some() {
+    for entry in all_providers(state_root) {
+        if std::env::var_os(&entry.api_key_env).is_some() {
             continue;
         }
-        if let Some(provider_auth) = auth.get(*name) {
+        if let Some(provider_auth) = auth.get(&entry.name) {
             let key = crate::auth::resolve_key(&provider_auth.key).await?;
-            resolved.push((api_key_env.to_string(), key));
+            resolved.push((entry.api_key_env, key));
         }
     }
     Ok(resolved)
@@ -230,14 +293,15 @@ async fn resolve_auth_env(state_root: &Path) -> Result<Vec<(String, String)>> {
 fn write_config(state_root: &Path, port: u16, resolved_env: &[(String, String)]) -> Result<()> {
     let path = paths::provider_config_path(state_root);
     let mut toml = format!("[server]\nhost = \"127.0.0.1\"\nport = {port}\n");
-    for (name, base_url, api_key_env) in OPTIONAL_PROVIDERS {
-        let configured = std::env::var_os(api_key_env).is_some()
-            || resolved_env.iter().any(|(k, _)| k == api_key_env);
+    for entry in all_providers(state_root) {
+        let configured = std::env::var_os(&entry.api_key_env).is_some()
+            || resolved_env.iter().any(|(k, _)| *k == entry.api_key_env);
         if !configured {
             continue;
         }
         toml.push_str(&format!(
-            "\n[providers.{name}]\nkind = \"openai\"\nbase_url = \"{base_url}\"\napi_key_env = \"{api_key_env}\"\n"
+            "\n[providers.{}]\nkind = \"{}\"\nbase_url = \"{}\"\napi_key_env = \"{}\"\n",
+            entry.name, entry.kind, entry.base_url, entry.api_key_env
         ));
     }
     // Ollama unconditionally: it needs no real key, and this project's
@@ -498,6 +562,129 @@ mod tests {
         write_config(&root, 12345, &[]).unwrap();
         let toml = std::fs::read_to_string(paths::provider_config_path(&root)).unwrap();
         assert!(!toml.contains("[providers.groq]"), "got: {toml}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn custom_provider_api_key_env_uppercases_and_folds_non_alphanumerics() {
+        assert_eq!(custom_provider_api_key_env("my-vllm"), "MY_VLLM_API_KEY");
+        assert_eq!(
+            custom_provider_api_key_env("company.proxy"),
+            "COMPANY_PROXY_API_KEY"
+        );
+    }
+
+    #[test]
+    fn all_providers_includes_a_registered_custom_provider() {
+        let root = temp_state_root("all-providers-custom");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"my-vllm": {"base_url": "http://127.0.0.1:8000/v1"}}"#,
+        )
+        .unwrap();
+        let entries = all_providers(&root);
+        let custom = entries.iter().find(|e| e.name == "my-vllm").unwrap();
+        assert_eq!(custom.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(custom.kind, "openai");
+        assert_eq!(custom.api_key_env, "MY_VLLM_API_KEY");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A custom entry reusing a reserved name (a built-in
+    /// `OPTIONAL_PROVIDERS` name, or `"ollama"`) is silently dropped --
+    /// the built-in's own `base_url` survives untouched, proving the
+    /// built-in wins rather than the custom entry overriding it or the
+    /// two colliding into a duplicate `[providers.groq]` TOML table
+    /// (which `rp-server`'s own TOML parser would reject).
+    #[test]
+    fn all_providers_drops_a_custom_entry_reusing_a_reserved_name() {
+        let root = temp_state_root("all-providers-reserved");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{
+                "groq": {"base_url": "http://should-not-win.example.com"},
+                "ollama": {"base_url": "http://should-not-win.example.com"}
+            }"#,
+        )
+        .unwrap();
+        let entries = all_providers(&root);
+        assert_eq!(entries.iter().filter(|e| e.name == "groq").count(), 1);
+        let groq = entries.iter().find(|e| e.name == "groq").unwrap();
+        assert_eq!(groq.base_url, "https://api.groq.com/openai/v1");
+        assert!(
+            entries.iter().all(|e| e.name != "ollama"),
+            "ollama is appended separately by write_config, never through all_providers"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn known_providers_lists_a_registered_custom_provider() {
+        let root = temp_state_root("known-providers-custom");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"my-vllm": {"base_url": "http://127.0.0.1:8000/v1"}}"#,
+        )
+        .unwrap();
+        let providers = known_providers(&root);
+        let custom = providers
+            .iter()
+            .find(|p| p.name == "my-vllm")
+            .expect("my-vllm listed");
+        assert!(!custom.configured, "no key configured yet");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn resolve_auth_env_resolves_a_custom_providers_auth_json_entry() {
+        let root = temp_state_root("resolve-auth-env-custom");
+        {
+            let _guard = PROVIDER_ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var("MY_VLLM_API_KEY");
+        }
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"my-vllm": {"base_url": "http://127.0.0.1:8000/v1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("auth.json"),
+            r#"{"my-vllm": {"key": "sk-custom-literal"}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_auth_env(&root).await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![(
+                "MY_VLLM_API_KEY".to_string(),
+                "sk-custom-literal".to_string()
+            )]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_config_activates_a_registered_custom_provider_with_its_own_kind() {
+        let root = temp_state_root("write-config-custom");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"my-vllm": {"base_url": "http://127.0.0.1:8000/v1", "kind": "openai"}}"#,
+        )
+        .unwrap();
+        let resolved_env = vec![("MY_VLLM_API_KEY".to_string(), "sk-resolved".to_string())];
+        write_config(&root, 12345, &resolved_env).unwrap();
+        let toml = std::fs::read_to_string(paths::provider_config_path(&root)).unwrap();
+        assert!(toml.contains("[providers.my-vllm]"), "got: {toml}");
+        assert!(
+            toml.contains("base_url = \"http://127.0.0.1:8000/v1\""),
+            "got: {toml}"
+        );
+        assert!(
+            toml.contains("api_key_env = \"MY_VLLM_API_KEY\""),
+            "got: {toml}"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
