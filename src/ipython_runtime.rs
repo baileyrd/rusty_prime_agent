@@ -6,15 +6,29 @@
 //!
 //! Scope, confirmed against a real, locally-installed `ipykernel` via raw-
 //! socket probing before this module was written (see this project's PR
-//! history for Increment 5): only `shell` (DEALER) and `iopub` (SUB) are
-//! opened -- `stdin` (kernel-side `input()` prompts), `control`
-//! (interrupt/shutdown-request), and `heartbeat` are all out of scope for
-//! v1, matching the plan's own explicit deferrals ("interrupt/cancel,
-//! kernel restart-on-crash, rich display data, multi-kernel pooling").
-//! [`shutdown`](IpythonKernelRuntime::shutdown) tears the kernel down with
-//! a plain process kill rather than a graceful `shutdown_request` for the
-//! same reason: that request travels over `control`, which this module
-//! doesn't open.
+//! history for Increment 5): `shell` (DEALER), `iopub` (SUB), and `control`
+//! (DEALER) are opened -- `stdin` (kernel-side `input()` prompts) and
+//! `heartbeat` remain out of scope, matching the plan's own explicit
+//! deferrals ("kernel restart-on-crash, rich display data, multi-kernel
+//! pooling"). `control` was added specifically to carry `comm_open`/
+//! `comm_msg` host-request replies without deadlocking a running `shell`
+//! cell (`rlm-runtime.md`'s own stated reason for using a second channel:
+//! `shell` processes messages serially, so a reply sent there for a
+//! request that originated *during* an in-flight `execute_request` would
+//! never be read until that same request finishes) -- confirmed
+//! independently by raw-socket probing that the kernel's `control` port
+//! answers with the exact same 6-frame `<IDS|MSG>` shape `shell` does, so
+//! [`send_shell`](IpythonKernelRuntime::send_shell)/
+//! [`recv_shell`](IpythonKernelRuntime::recv_shell)'s signing/framing logic
+//! is shared via [`build_signed_message`] rather than duplicated.
+//! [`shutdown`](IpythonKernelRuntime::shutdown) now attempts a graceful
+//! `shutdown_request` over `control` first (bounded, best-effort --
+//! confirmed by the same raw-socket probing that the kernel replies
+//! `{"status":"ok","restart":false}` and exits on its own), falling back
+//! to the same plain process kill regardless of whether that reply
+//! arrived -- harmless against a kernel that already exited gracefully,
+//! the same tolerance `rp_server::shutdown`'s own `procutil::kill` call
+//! has.
 //!
 //! The kernel subprocess is *not* detached the way `rp_server`/
 //! `worker::spawn` detach their children: it's meant to live and die with
@@ -101,6 +115,7 @@ pub struct IpythonKernelRuntime {
     kernel_pid: Option<u32>,
     shell: Option<ZmtpSocket>,
     iopub: Option<ZmtpSocket>,
+    control: Option<ZmtpSocket>,
     next_msg_seq: u64,
 }
 
@@ -117,6 +132,7 @@ impl IpythonKernelRuntime {
             kernel_pid: None,
             shell: None,
             iopub: None,
+            control: None,
             next_msg_seq: 0,
         }
     }
@@ -138,37 +154,40 @@ impl IpythonKernelRuntime {
     /// traffic (see that loop's own inline comment).
     async fn send_shell(&mut self, msg_type: &str, content: serde_json::Value) -> Result<String> {
         let msg_id = self.next_msg_id();
-        let header = serde_json::json!({
-            "msg_id": msg_id,
-            "msg_type": msg_type,
-            "username": "rusty-prime-agent",
-            "session": self.jupyter_session,
-            "date": iso8601_now(),
-            "version": "5.3",
-        });
-        let header_b = serde_json::to_vec(&header)
-            .map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
-        let parent_b = b"{}".to_vec();
-        let meta_b = b"{}".to_vec();
-        let content_b = serde_json::to_vec(&content)
-            .map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
-        let sig = hmac_sha256_hex(
-            self.key.as_bytes(),
-            &[&header_b, &parent_b, &meta_b, &content_b],
-        );
-
+        let frames = build_signed_message(
+            &self.key,
+            &self.jupyter_session,
+            &msg_id,
+            msg_type,
+            &content,
+        )?;
         let shell = self.shell.as_mut().ok_or_else(|| {
             HarnessError::conflict(Context::Runtime, "kernel shell socket not connected")
         })?;
         shell
-            .send_multipart(&[
-                b"<IDS|MSG>",
-                sig.as_bytes(),
-                &header_b,
-                &parent_b,
-                &meta_b,
-                &content_b,
-            ])
+            .send_multipart(&frames.iter().map(Vec::as_slice).collect::<Vec<_>>())
+            .await?;
+        Ok(msg_id)
+    }
+
+    /// Same as [`send_shell`](Self::send_shell), on the `control` socket
+    /// instead -- see this module's own doc comment for why `control`
+    /// exists at all (avoiding a `shell`-channel deadlock on host-request
+    /// replies).
+    async fn send_control(&mut self, msg_type: &str, content: serde_json::Value) -> Result<String> {
+        let msg_id = self.next_msg_id();
+        let frames = build_signed_message(
+            &self.key,
+            &self.jupyter_session,
+            &msg_id,
+            msg_type,
+            &content,
+        )?;
+        let control = self.control.as_mut().ok_or_else(|| {
+            HarnessError::conflict(Context::Runtime, "kernel control socket not connected")
+        })?;
+        control
+            .send_multipart(&frames.iter().map(Vec::as_slice).collect::<Vec<_>>())
             .await?;
         Ok(msg_id)
     }
@@ -188,6 +207,18 @@ impl IpythonKernelRuntime {
             HarnessError::conflict(Context::Runtime, "kernel shell socket not connected")
         })?;
         let frames = shell.recv_multipart().await?;
+        parse_jupyter_message(&frames)
+    }
+
+    /// Reads one Jupyter message off `control` -- same framing as
+    /// `recv_shell`, confirmed by direct raw-socket probing against a real
+    /// `ipykernel` before this module opened the socket (see this
+    /// module's own doc comment).
+    async fn recv_control(&mut self) -> Result<(String, serde_json::Value, serde_json::Value)> {
+        let control = self.control.as_mut().ok_or_else(|| {
+            HarnessError::conflict(Context::Runtime, "kernel control socket not connected")
+        })?;
+        let frames = control.recv_multipart().await?;
         parse_jupyter_message(&frames)
     }
 
@@ -290,6 +321,12 @@ impl ToolRuntime for IpythonKernelRuntime {
             // to a fixed sleep (see this module's own const doc comment).
             let _ = rusty_tokio::time::timeout(IOPUB_WELCOME_TIMEOUT, iopub.recv_multipart()).await;
             self.iopub = Some(iopub);
+
+            // By this point `shell`'s own connect-retry loop above already
+            // proved the kernel process is fully up, so a single attempt
+            // (no retry loop) is enough here.
+            let control = ZmtpSocket::connect("127.0.0.1", control_port, "DEALER").await?;
+            self.control = Some(control);
 
             let (msg_type, _parent_header, _content) =
                 rusty_tokio::time::timeout(STARTUP_TIMEOUT, async {
@@ -407,18 +444,82 @@ impl ToolRuntime for IpythonKernelRuntime {
     fn shutdown(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             if let Some(pid) = self.kernel_pid.take() {
-                // Best-effort: a kernel that already exited on its own
-                // (e.g. its own parent-poller noticing this process is
-                // about to go away) makes this a harmless no-op, the same
-                // tolerance `rp_server::shutdown`'s own `procutil::kill`
-                // call has.
+                // Best-effort graceful shutdown first, over `control` (the
+                // channel this exists to carry, per this module's own doc
+                // comment) -- confirmed by direct raw-socket probing
+                // against a real `ipykernel` before this was written: the
+                // kernel replies `{"status":"ok","restart":false}` and
+                // then exits on its own. Bounded and best-effort: a wedged
+                // or already-gone kernel must not hang this call, and
+                // `procutil::kill` right after is always still run
+                // regardless of whether the graceful reply arrived --
+                // harmless against a kernel that already exited on its
+                // own, the same tolerance `rp_server::shutdown`'s own
+                // `procutil::kill` call has.
+                if self.control.is_some() {
+                    let graceful = rusty_tokio::time::timeout(
+                        Duration::from_secs(3),
+                        self.send_control(
+                            "shutdown_request",
+                            serde_json::json!({"restart": false}),
+                        ),
+                    )
+                    .await;
+                    if graceful.is_ok() {
+                        let _ =
+                            rusty_tokio::time::timeout(Duration::from_secs(3), self.recv_control())
+                                .await;
+                    }
+                }
                 let _ = procutil::kill(pid);
             }
             self.shell = None;
             self.iopub = None;
+            self.control = None;
             Ok(())
         })
     }
+}
+
+/// Builds the 6 signed frames of one Jupyter message
+/// (`<IDS|MSG>`/signature/header/parent_header/metadata/content) --
+/// shared by [`IpythonKernelRuntime::send_shell`] and
+/// [`IpythonKernelRuntime::send_control`] rather than duplicated, since
+/// both channels use identical framing (confirmed by direct raw-socket
+/// probing against a real `ipykernel`, see this module's own doc
+/// comment). `parent_header`/`metadata` are always the empty object: this
+/// module only ever originates *requests* (never replies to a message it
+/// received), so there is never a real parent to attach.
+fn build_signed_message(
+    key: &str,
+    session: &str,
+    msg_id: &str,
+    msg_type: &str,
+    content: &serde_json::Value,
+) -> Result<Vec<Vec<u8>>> {
+    let header = serde_json::json!({
+        "msg_id": msg_id,
+        "msg_type": msg_type,
+        "username": "rusty-prime-agent",
+        "session": session,
+        "date": iso8601_now(),
+        "version": "5.3",
+    });
+    let header_b =
+        serde_json::to_vec(&header).map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
+    let parent_b = b"{}".to_vec();
+    let meta_b = b"{}".to_vec();
+    let content_b =
+        serde_json::to_vec(content).map_err(|e| HarnessError::json(Context::Runtime, None, e))?;
+    let sig = hmac_sha256_hex(key.as_bytes(), &[&header_b, &parent_b, &meta_b, &content_b]);
+    Ok(vec![
+        b"<IDS|MSG>".to_vec(),
+        sig.into_bytes(),
+        header_b,
+        parent_b,
+        meta_b,
+        content_b,
+    ])
 }
 
 fn paths_ensure_dir(dir: &std::path::Path) -> Result<()> {
@@ -763,6 +864,55 @@ mod tests {
             "expected the error result to mention ValueError, got: {:?}",
             error_outcome.result
         );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real end-to-end coverage that the `control` channel connected in
+    /// `start()` is actually live and speaks the same framing `shell`
+    /// does -- confirmed independently by raw-socket probing before this
+    /// module opened the socket (see this module's own doc comment), this
+    /// test proves the same thing through the actual `send_control`/
+    /// `recv_control` methods rather than a standalone probe script.
+    /// `#[ignore]`d for the same real-`ipykernel`-install reason as its
+    /// siblings.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_control_channel_round_trips_kernel_info_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-control-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        let request_msg_id = runtime
+            .send_control("kernel_info_request", serde_json::json!({}))
+            .await
+            .expect("control channel should accept kernel_info_request");
+        let (msg_type, parent_header, content) =
+            rusty_tokio::time::timeout(Duration::from_secs(10), runtime.recv_control())
+                .await
+                .expect("control channel should reply within the timeout")
+                .expect("control channel reply should parse as a Jupyter message");
+
+        assert_eq!(msg_type, "kernel_info_reply");
+        assert_eq!(
+            parent_header.get("msg_id").and_then(|v| v.as_str()),
+            Some(request_msg_id.as_str())
+        );
+        assert_eq!(content.get("status").and_then(|v| v.as_str()), Some("ok"));
 
         runtime.shutdown().await.expect("shutdown should succeed");
 
