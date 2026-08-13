@@ -235,6 +235,30 @@ as "no settings" rather than an error. Global only, same cwd-visibility
 reason `--runtime ipython` skills and context files don't have a
 project-local tier either.
 
+### Provider keys (`auth.json`)
+
+Drop an `auth.json` into the state directory to configure a provider's
+API key without exporting a real env var, parity with `prime-agent`'s
+own `auth.json`:
+
+```json
+{
+  "groq": { "key": "sk-a-literal-key" },
+  "anthropic": { "key": "!security find-generic-password -w -s my-service" }
+}
+```
+
+A `key` is either a literal string, used as-is, or a string prefixed
+with `!`, whose remainder runs as a shell command (`sh -c`/`cmd /C`);
+its trimmed stdout becomes the key. An already-set env var
+(`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GROQ_API_KEY`)
+always wins over an `auth.json` entry for that same provider -- the
+command is never even run in that case. `harness model list` (no
+`--detailed`) only checks whether an `auth.json` entry *exists*, never
+running a `!command` as a side effect of listing; the command only ever
+runs when a real `rp-server` sidecar is actually starting up. Global
+only, same cwd-visibility reason `settings.json` is.
+
 ### The Continual Harness
 
 Durable supplemental notes (prompts, memories, skill descriptions) a

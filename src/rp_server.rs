@@ -30,7 +30,11 @@
 //! needs no real key) -- `rusty_tokio::process::Command` inherits this
 //! process's full environment by default, so whichever of those vars the
 //! daemon was started with reach `rp-server` without this module having
-//! to forward them one at a time. A session's own `--model
+//! to forward them one at a time. [`resolve_auth_env`] extends this with
+//! `<state_root>/auth.json` (see the `auth` module) for whichever of
+//! those same env vars *aren't* already set -- resolved values are
+//! handed to the spawned `rp-server` child directly (`Command::env`),
+//! never `std::env::set_var`'d onto this process itself. A session's own `--model
 //! provider/model` string picks which of these `rp-server`'s router
 //! actually dispatches to per request; a provider with no key configured
 //! simply isn't a valid choice (`rp-server` itself reports that, as a
@@ -126,18 +130,26 @@ pub struct ProviderInfo {
 }
 
 /// Every provider name `write_config` could ever activate, plus whether
-/// this process's own environment configures it right now -- exactly
-/// the same `OPTIONAL_PROVIDERS`/env-var check `write_config` itself
-/// uses, so this can never drift from what a real `session new --model
+/// this process's own environment (or `<state_root>/auth.json`)
+/// configures it right now -- exactly the same `OPTIONAL_PROVIDERS`/
+/// env-var-or-auth.json-entry check [`ensure_running`] itself uses, so
+/// this can never drift from what a real `session new --model
 /// <name>/...` would actually be able to reach. Ollama is always
 /// `configured: true`: it needs no real key (see `write_config`'s own
 /// doc comment).
-pub fn known_providers() -> Vec<ProviderInfo> {
+///
+/// Deliberately only checks whether an `auth.json` entry *exists*, the
+/// same presence-only check already used for env vars -- never resolves
+/// a `!command` entry, so a plain `harness model list` (no daemon
+/// involved) never runs an arbitrary command as a side effect of
+/// listing. See `auth`'s own module doc comment.
+pub fn known_providers(state_root: &Path) -> Vec<ProviderInfo> {
+    let auth = crate::auth::load(state_root);
     let mut providers: Vec<ProviderInfo> = OPTIONAL_PROVIDERS
         .iter()
         .map(|(name, _base_url, api_key_env)| ProviderInfo {
             name: name.to_string(),
-            configured: std::env::var_os(api_key_env).is_some(),
+            configured: std::env::var_os(api_key_env).is_some() || auth.contains_key(*name),
         })
         .collect();
     providers.push(ProviderInfo {
@@ -188,11 +200,40 @@ pub async fn fetch_model_catalog(port: u16) -> Result<Vec<ModelCatalogEntry>> {
     Ok(parsed.data)
 }
 
-fn write_config(state_root: &Path, port: u16) -> Result<()> {
+/// For every `OPTIONAL_PROVIDERS` entry whose env var isn't already set
+/// in this process's own environment, checks `<state_root>/auth.json`
+/// for an entry and resolves it (see `auth::resolve_key`) -- an env var
+/// already being set always wins, `auth.json` never consulted in that
+/// case, the same precedence `settings.json`'s own overrides established
+/// for a different pair of tiers. Returns `(api_key_env, resolved_key)`
+/// pairs only for what `auth.json` actually configured; the daemon's own
+/// process environment is never mutated -- callers hand these to the
+/// spawned `rp-server` child's own `Command::env` instead (see
+/// `ensure_running`), so a caller who never restarts the daemon still
+/// sees a same-process-lifetime `auth.json` edit take effect on the next
+/// sidecar spawn, without a stray global env var leaking anywhere else.
+async fn resolve_auth_env(state_root: &Path) -> Result<Vec<(String, String)>> {
+    let auth = crate::auth::load(state_root);
+    let mut resolved = Vec::new();
+    for (name, _base_url, api_key_env) in OPTIONAL_PROVIDERS {
+        if std::env::var_os(api_key_env).is_some() {
+            continue;
+        }
+        if let Some(provider_auth) = auth.get(*name) {
+            let key = crate::auth::resolve_key(&provider_auth.key).await?;
+            resolved.push((api_key_env.to_string(), key));
+        }
+    }
+    Ok(resolved)
+}
+
+fn write_config(state_root: &Path, port: u16, resolved_env: &[(String, String)]) -> Result<()> {
     let path = paths::provider_config_path(state_root);
     let mut toml = format!("[server]\nhost = \"127.0.0.1\"\nport = {port}\n");
     for (name, base_url, api_key_env) in OPTIONAL_PROVIDERS {
-        if std::env::var_os(api_key_env).is_none() {
+        let configured = std::env::var_os(api_key_env).is_some()
+            || resolved_env.iter().any(|(k, _)| k == api_key_env);
+        if !configured {
             continue;
         }
         toml.push_str(&format!(
@@ -239,7 +280,8 @@ pub async fn ensure_running(state_root: &Path) -> Result<u16> {
     }
 
     let port = pick_free_port()?;
-    write_config(state_root, port)?;
+    let resolved_env = resolve_auth_env(state_root).await?;
+    write_config(state_root, port, &resolved_env)?;
 
     let log_path = paths::provider_log_path(state_root);
     let log_file = std::fs::File::create(&log_path)
@@ -252,6 +294,14 @@ pub async fn ensure_running(state_root: &Path) -> Result<u16> {
     // whose api_key_env isn't set is skipped at startup), so this is a
     // placeholder, not a real credential.
     cmd.env("OLLAMA_API_KEY", "unused-ollama-key");
+    // Keys `auth.json` resolved for a provider whose env var wasn't
+    // already set -- handed to the child directly rather than
+    // `std::env::set_var`'d onto this (daemon) process, so an
+    // `auth.json` edit never needs a daemon restart to take effect and
+    // never leaks into anything else this process does.
+    for (key, value) in &resolved_env {
+        cmd.env(key, value);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
@@ -312,4 +362,142 @@ pub fn shutdown(state_root: &Path) {
         let _ = procutil::kill(state.pid);
     }
     let _ = std::fs::remove_file(paths::provider_state_path(state_root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_state_root(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rpa-rp-server-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Guards every test below's env-var *mutation* (never held across an
+    /// `.await` -- `clippy::await_holding_lock` rightly flags that, and a
+    /// `std::sync::Mutex` isn't an async-aware one anyway). Each test
+    /// below targets a different `OPTIONAL_PROVIDERS` var (`OPENAI_*`/
+    /// `ANTHROPIC_*`/`GEMINI_*`/`GROQ_*`), so there's no real cross-test
+    /// race to close here regardless -- this exists purely to match
+    /// `session::tests::COMPACT_ENV_GUARD`'s own defensive-consistency
+    /// reasoning for a different pair of vars, dropped before the
+    /// `resolve_auth_env` call each test actually awaits.
+    static PROVIDER_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[rusty_tokio::test]
+    async fn resolve_auth_env_skips_a_provider_whose_env_var_is_already_set() {
+        let root = temp_state_root("skip-env-set");
+        {
+            let _guard = PROVIDER_ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::set_var("OPENAI_API_KEY", "sk-already-set");
+        }
+        // A command that would error loudly if it ever actually ran --
+        // proves the env var short-circuits before `auth.json` (and its
+        // `!`-command) is even consulted, not just that the *result*
+        // happens to match.
+        std::fs::write(root.join("auth.json"), r#"{"openai": {"key": "!exit 1"}}"#).unwrap();
+        let resolved = resolve_auth_env(&root).await.unwrap();
+        assert!(
+            resolved.iter().all(|(k, _)| k != "OPENAI_API_KEY"),
+            "got: {resolved:?}"
+        );
+        std::env::remove_var("OPENAI_API_KEY");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn resolve_auth_env_resolves_a_literal_key_from_auth_json() {
+        let root = temp_state_root("literal-auth-json");
+        {
+            let _guard = PROVIDER_ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        std::fs::write(
+            root.join("auth.json"),
+            r#"{"anthropic": {"key": "sk-literal-from-auth-json"}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_auth_env(&root).await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-literal-from-auth-json".to_string()
+            )]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn resolve_auth_env_resolves_a_bang_command_key_from_auth_json() {
+        let root = temp_state_root("command-auth-json");
+        {
+            let _guard = PROVIDER_ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var("GEMINI_API_KEY");
+        }
+        std::fs::write(
+            root.join("auth.json"),
+            r#"{"gemini": {"key": "!echo sk-resolved-via-command"}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_auth_env(&root).await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![(
+                "GEMINI_API_KEY".to_string(),
+                "sk-resolved-via-command".to_string()
+            )]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn resolve_auth_env_propagates_a_failing_command_loudly() {
+        let root = temp_state_root("failing-command-auth-json");
+        {
+            let _guard = PROVIDER_ENV_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        std::fs::write(root.join("auth.json"), r#"{"groq": {"key": "!exit 1"}}"#).unwrap();
+        assert!(resolve_auth_env(&root).await.is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_config_activates_a_provider_configured_only_via_resolved_auth_json() {
+        let _guard = PROVIDER_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("GROQ_API_KEY");
+        let root = temp_state_root("write-config-auth-json");
+        let resolved_env = vec![("GROQ_API_KEY".to_string(), "sk-resolved".to_string())];
+        write_config(&root, 12345, &resolved_env).unwrap();
+        let toml = std::fs::read_to_string(paths::provider_config_path(&root)).unwrap();
+        assert!(toml.contains("[providers.groq]"), "got: {toml}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_config_skips_a_provider_configured_by_neither_env_nor_auth_json() {
+        let _guard = PROVIDER_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("GROQ_API_KEY");
+        let root = temp_state_root("write-config-unconfigured");
+        write_config(&root, 12345, &[]).unwrap();
+        let toml = std::fs::read_to_string(paths::provider_config_path(&root)).unwrap();
+        assert!(!toml.contains("[providers.groq]"), "got: {toml}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

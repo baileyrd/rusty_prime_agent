@@ -1,3 +1,4 @@
+mod auth;
 mod catalog;
 mod cli;
 mod client;

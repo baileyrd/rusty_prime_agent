@@ -47,6 +47,7 @@ project's current shape.
 | `skills` | Discovery of real, importable Python packages for `session new --runtime ipython` (`paths::global_skills_dir`, `SKILL.md` frontmatter) -- see below and `PARITY.md` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `settings` | `<state_dir>/settings.json` read/parse (`load`) -- see below |
+| `auth` | `<state_dir>/auth.json` read/parse plus `!command` key resolution (`load`/`resolve_key`) -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
 ## Dependency stack
@@ -346,6 +347,31 @@ in order, the env var, then `settings::load(&self.state_root)`, then the
 hardcoded default -- one more fallback tier under what was already there,
 not a new precedence model. Global only, same cwd-visibility reason
 `skills::discover`/`read_context_file` are.
+
+## `auth.json`
+
+Parity with `prime-agent`'s own `auth.json` -- see `PARITY.md` for the
+full story. `auth::load(state_root)` reads `<state_dir>/auth.json` into
+a `{provider name -> {"key": ...}}` map, same permissive-parse stance
+`settings::load` already takes. `auth::resolve_key` turns one entry's
+`key` into a real string: a literal value as-is, or (a `!`-prefixed
+value) the trimmed stdout of running the rest as a shell command
+(`sh -c`/`cmd /C`, bounded by a 10s timeout) -- the same trust model
+`session_autonomous --quality-gate` already accepts, no sandboxing,
+because there is exactly one local caller.
+
+`rp_server::resolve_auth_env(state_root)` is the only caller: for every
+`OPTIONAL_PROVIDERS` entry whose env var isn't already set in the
+daemon's own environment, it resolves an `auth.json` entry (if any) into
+an `(api_key_env, key)` pair. `ensure_running` hands each pair straight
+to the spawned `rp-server` child via `Command::env`, never
+`std::env::set_var`-ing the daemon's own process -- an `auth.json` edit
+takes effect on the next sidecar spawn without a daemon restart.
+`write_config` activates a `[providers.*]` block when either the env var
+or a resolved `auth.json` entry configures it; `known_providers`
+(`harness model list`) only checks *presence* of an `auth.json` entry,
+never resolving a `!command`, so a plain listing can't run an arbitrary
+command as a side effect.
 
 ## Known gaps
 

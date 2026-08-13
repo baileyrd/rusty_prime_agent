@@ -57,6 +57,35 @@ fn a_configured_api_key_env_var_flips_that_provider_to_configured() {
     assert!(stdout.contains("groq\tnot configured"), "got: {stdout}");
 }
 
+/// `known_providers` deliberately only checks whether an `auth.json`
+/// entry *exists*, never resolving a `!command` one -- see `auth`'s own
+/// module doc comment for why. Proven here with a command that would
+/// leave unmistakable evidence if it ever actually ran (writes a marker
+/// file); `model list` (no `--detailed`, no daemon) must never create
+/// it.
+#[test]
+fn an_auth_json_entry_flips_that_provider_to_configured_without_running_its_command() {
+    let state_dir = common::TempDir::new("model-list-auth-json");
+    let marker = state_dir.path().join("should-not-exist");
+    std::fs::write(
+        state_dir.path().join("auth.json"),
+        format!(
+            r#"{{"groq": {{"key": "!echo ran > {}"}}}}"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let out = run_with_env(state_dir.path(), &[]);
+    common::assert_success("model list", &out);
+    let stdout = common::stdout_string(&out);
+    assert!(stdout.contains("groq\tconfigured"), "got: {stdout}");
+    assert!(
+        !marker.exists(),
+        "model list must not execute an auth.json !command, only check presence"
+    );
+}
+
 #[test]
 fn json_mode_emits_a_structured_provider_list() {
     let state_dir = common::TempDir::new("model-list-json");
