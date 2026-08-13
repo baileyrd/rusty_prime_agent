@@ -769,6 +769,50 @@ dispatch (`/heartbeat`, `/compact`, `/file`, `/fork`, `/tree`,
 existing loop the same way `/tree` layered onto it earlier rather than a
 rewrite of it.
 
+## Interactive TUI: rich editor (multi-line, `@` fuzzy search, Tab completion)
+
+Builds directly on the raw-mode foundation above -- see `PARITY.md`'s
+own "Interactive TUI: rich editor" entry for the full writeup, including
+the real pseudo-terminal verification proving multi-line composition
+and Tab completion actually work end to end, not just in isolated unit
+tests.
+
+**Multi-line input**: raw mode leaves `\r` (Enter) and `\n` (`Ctrl-J`)
+genuinely distinct bytes -- `read_raw_line` treats `\r` as submit, `\n`
+as "insert a literal newline and keep composing." Backspacing across a
+`Ctrl-J`-inserted line boundary rejoins the buffer but doesn't attempt
+to move the terminal's own cursor back up a line already scrolled past
+-- that needs real cursor-positioning primitives `termctl` deliberately
+doesn't have yet.
+
+**`complete_repl_line`** is the one completion mechanism behind both Tab
+completion and `@` fuzzy search: the buffer's first word starting with
+`/` completes against `REPL_SLASH_COMMANDS` (a fixed list kept in sync
+with `session_repl`'s own dispatch by construction); the current word
+(wherever it is in the line) starting with `@` fuzzy-completes the path
+fragment after it against real filesystem entries via
+`complete_at_path`. `fuzzy_matches` does in-order subsequence matching
+(every character of the fragment appears somewhere in the candidate, in
+order, case-insensitively) rather than a plain prefix match -- real
+"fuzzy," not "starts with." `common_prefix` gives bash-style ambiguous
+completion (complete to the longest shared prefix across all matching
+candidates); zero candidates or no further shared prefix rings the
+terminal bell instead of opening any kind of listing UI -- there isn't
+one, by design (a live interactive dropdown needs terminal cursor
+positioning `termctl` doesn't expose yet, tracked as the genuinely
+out-of-scope piece in `PARITY.md`'s "Needs a new subsystem" section).
+
+**`expand_at_references`** is the submission-time half of the `@` slice:
+every `@<path>` token anywhere in the final line (Tab-completed or typed
+out by hand) that resolves to a real, readable file gets expanded inline
+into that file's own content, formatted the same way `/file`'s own
+`pending_file_content` prefix already is -- placed precisely where
+referenced rather than only prepended, a more precise placement `/file`
+structurally can't offer. Applied to the line regardless of whether it
+came from the raw-mode read loop or the piped/cooked-mode fallback,
+so it's testable without a real terminal (`tests/repl.rs` covers it end
+to end against a real, piped `session repl` process).
+
 ## REPL commands: `/file`, `/fork`, `/export`, `/tree`, `/branch-summary`
 
 Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/

@@ -324,3 +324,54 @@ fn repl_export_command_writes_the_transcript_to_a_file() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Bounded parity with `prime-agent`'s TUI-side "`@` fuzzy search" file
+/// reference -- see `client::expand_at_references`'s own doc comment.
+/// Applies regardless of whether the line came from a real raw-mode
+/// terminal or (as here) piped/cooked-mode input, so it's CI-safe: an
+/// `@<path>` token in a submitted line is expanded into that file's own
+/// content before the prompt is sent.
+#[test]
+fn repl_expands_an_at_reference_to_the_referenced_files_content() {
+    let state_dir = common::TempDir::new("repl-at-reference");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let referenced = state_dir.path().join("notes.txt");
+    std::fs::write(&referenced, "the referenced file's content").unwrap();
+    let referenced_str = referenced.to_str().unwrap();
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        &format!("please read @{referenced_str}\n"),
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("the referenced file's content"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// An `@<path>` token whose path doesn't resolve to a real file is left
+/// exactly as typed -- most likely an ordinary `@`-mention, not a
+/// botched file reference.
+#[test]
+fn repl_leaves_an_at_token_untouched_when_the_path_does_not_exist() {
+    let state_dir = common::TempDir::new("repl-at-reference-missing");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hey @nonexistent-file-xyz\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("echo: hey @nonexistent-file-xyz"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
