@@ -883,7 +883,7 @@ async fn send_prompt(
 /// `session_new_with_model_fails_loudly_when_rp_server_is_unavailable`.
 pub async fn model_list(state_root: &Path, detailed: bool, mode: OutputMode) -> Result<()> {
     if !detailed {
-        let providers = crate::rp_server::known_providers();
+        let providers = crate::rp_server::known_providers(state_root);
         match mode {
             OutputMode::Json => print_json(&providers),
             OutputMode::Text => {

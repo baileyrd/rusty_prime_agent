@@ -57,6 +57,41 @@ fn a_configured_api_key_env_var_flips_that_provider_to_configured() {
     assert!(stdout.contains("groq\tnot configured"), "got: {stdout}");
 }
 
+/// `known_providers` deliberately only checks whether an `auth.json`
+/// entry *exists*, never resolving a `!command` one -- see `auth`'s own
+/// module doc comment for why. Proven here with a command that would
+/// leave unmistakable evidence if it ever actually ran (writes a marker
+/// file); `model list` (no `--detailed`, no daemon) must never create
+/// it.
+#[test]
+fn an_auth_json_entry_flips_that_provider_to_configured_without_running_its_command() {
+    let state_dir = common::TempDir::new("model-list-auth-json");
+    let marker = state_dir.path().join("should-not-exist");
+    // Built with `serde_json` rather than a hand-formatted string: a raw
+    // Windows path (`D:\a\...`) contains backslashes that are JSON escape
+    // characters, so splicing `marker.display()` straight into a format
+    // string produces invalid JSON on that platform (and `auth::load`'s
+    // own permissive "malformed reads as no entries" then hides the bug
+    // as a false negative rather than a parse error).
+    let auth_json = serde_json::json!({
+        "groq": { "key": format!("!echo ran > {}", marker.display()) }
+    });
+    std::fs::write(
+        state_dir.path().join("auth.json"),
+        serde_json::to_string(&auth_json).unwrap(),
+    )
+    .unwrap();
+
+    let out = run_with_env(state_dir.path(), &[]);
+    common::assert_success("model list", &out);
+    let stdout = common::stdout_string(&out);
+    assert!(stdout.contains("groq\tconfigured"), "got: {stdout}");
+    assert!(
+        !marker.exists(),
+        "model list must not execute an auth.json !command, only check presence"
+    );
+}
+
 #[test]
 fn json_mode_emits_a_structured_provider_list() {
     let state_dir = common::TempDir::new("model-list-json");

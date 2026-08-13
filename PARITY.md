@@ -129,6 +129,54 @@ daemon/worker split rather than requiring the Python control environment:
   on `PATH`), `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL` (default
   `http://127.0.0.1:11434/v1`), plus each provider's own real
   `*_API_KEY` to activate it.
+- [x] **`auth.json` with shell-command key resolution**, parity with
+  `prime-agent`'s own `auth.json`. New `src/auth.rs`: `auth::load
+  (state_root)` reads `<state_root>/auth.json` (global only, same
+  cwd-visibility reason `settings.json`/`skills::discover` are, and same
+  permissive "malformed or missing reads as no entries" stance
+  `settings::load` established), mapping provider name to a `{"key":
+  ...}` entry; `auth::resolve_key` returns a literal `key` string as-is,
+  or (a string prefixed with `!`) the trimmed stdout of running the rest
+  as a shell command -- `sh -c`/`cmd /C`, the exact cross-platform split
+  `client::run_quality_gate` already used for an identical need, bounded
+  by a 10s timeout so a forgotten interactive prompt (e.g. a GUI Keychain
+  dialog) can't hang `rp-server` sidecar startup indefinitely. A
+  non-zero exit is a loud error, not a silent "unconfigured".
+
+  Precedence, highest wins: an already-set env var beats an `auth.json`
+  entry for that same provider, which beats being unconfigured at all --
+  the same "env var wins" order `settings.json`'s own overrides
+  established, for a different pair of tiers (no hardcoded default to
+  fall back to for an API key). `rp_server::resolve_auth_env` computes,
+  for every `OPTIONAL_PROVIDERS` entry whose env var isn't already set,
+  a resolved `(api_key_env, key)` pair from `auth.json`; `write_config`
+  now activates a `[providers.*]` block when either condition holds, and
+  `ensure_running` hands each resolved pair to the spawned `rp-server`
+  child directly via `Command::env` -- the daemon's own process
+  environment is never mutated (`std::env::set_var`), so an `auth.json`
+  edit takes effect on the very next sidecar spawn without a daemon
+  restart, and without leaking into anything else the daemon does.
+
+  `known_providers` (`harness model list`, no daemon involved) only
+  checks whether an `auth.json` entry *exists*, the same presence-only
+  check it already used for env vars -- it deliberately never resolves a
+  `!command` entry, so a plain listing never runs an arbitrary command as
+  a side effect.
+
+  Verified two ways: CI-safe unit tests (`src/auth.rs`'s own `load`/
+  `resolve_key` in isolation -- a literal key, a `!echo ...` command, a
+  failing command reported loudly; `src/rp_server.rs`'s
+  `resolve_auth_env`/`write_config` -- an already-set env var skips
+  `auth.json` entirely, including a `!command` that would error loudly if
+  it ever actually ran; a literal and a `!command` entry both resolve and
+  activate the right `[providers.*]` block) and a real end-to-end pass in
+  this sandbox against a real `rp-server` sidecar: an `auth.json`
+  `!echo ...` entry for `groq` actually reached the spawned child's
+  environment and activated `groq` in both the generated
+  `provider-config.toml` and `rp-server`'s own real `/v1/models`
+  catalog, and a pre-set `GROQ_API_KEY` env var was confirmed (via a
+  marker-file command that never got created) to short-circuit
+  `auth.json` entirely rather than double-resolving it.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -927,12 +975,6 @@ attempted here, and not silently implied by anything in
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"
   above) and the compaction summary -- there's nothing for either to
   hook into without a larger design change than either of those needed.
-- **`auth.json` with shell-command key resolution** (e.g.
-  `"key": "!security find-generic-password ..."`). This project only
-  ever reads a key from a literal env var (`rp_server.rs`'s
-  `write_config`, see the "Medium-effort" section's provider-selection
-  entry above) -- there's no indirection layer for resolving a key via an
-  arbitrary shell command.
 - **Custom / arbitrary OpenAI-compatible provider registration.** No way
   to point at an arbitrary base URL; `rp-server`'s own compiled-in
   provider list is the only surface, and this project has no extension
