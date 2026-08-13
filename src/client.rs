@@ -1136,6 +1136,42 @@ pub async fn session_compact(
     }
 }
 
+/// `session fork <id> [--at N] [--name NAME]` -- see `protocol::
+/// Request::SessionFork`'s own doc comment. Same response shape as
+/// `session new` (`Response::SessionNew`): a fork *is* a brand-new
+/// session, from the client's point of view no different from one
+/// created any other way once it exists.
+pub async fn session_fork(
+    state_root: &Path,
+    session_id: String,
+    at_sequence: Option<u64>,
+    name: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionFork {
+            session_id,
+            at_sequence,
+            name,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionNew { session_id } => {
+            match mode {
+                OutputMode::Json => print_json(&Response::SessionNew {
+                    session_id: session_id.clone(),
+                }),
+                OutputMode::Text => println!("{session_id}"),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
 /// Shared by [`schedule_add`] and [`session_spawn`]'s own near-immediate
 /// one-shot enqueue -- the latter needs the raw id, not printed text.
 async fn add_schedule(

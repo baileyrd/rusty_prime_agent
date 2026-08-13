@@ -122,6 +122,7 @@ harness session prompt <id> <text...>
 harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
 harness session compact <id> [instructions...]   # force compaction now
+harness session fork <id> [--at N] [--name NAME]  # copy into a brand-new session
 ```
 
 Sessions with a real `--model` automatically compact their own context
@@ -133,6 +134,21 @@ optionally focused with free-text `instructions` (parity with
 `prime-agent /compact [instructions]`). A no-op, not an error, on a
 session with no `--model` set (nothing to summarize with) or nothing old
 enough to fold away yet.
+
+`session fork` creates a brand-new, fully independent session whose
+starting transcript is a copy of `<id>`'s own transcript up through
+`--at N` (or the whole thing, if `--at` is omitted) -- bounded parity
+with a slice of `prime-agent`'s `/fork` (session-level forking, not
+intra-session branching; no `/tree` visualization or active-leaf
+switching -- see `ARCHITECTURE.md` for exactly what that distinction
+means and why). The new session carries forward the source's `--model`/
+`--thinking`/`--tools`/`--runtime` configuration but starts with no goal
+and no Continual Harness history, since both would only be accurate
+against the source's full history, not necessarily a truncated copy of
+it. `--at N` past the source's own last turn is a conflict, not a
+silent clamp. Prompting the fork never affects the source session, or
+vice versa -- they're two ordinary, unrelated sessions from that point
+on.
 
 ### Scheduling
 

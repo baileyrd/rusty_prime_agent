@@ -289,6 +289,71 @@ daemon/worker split rather than requiring the Python control environment:
   involved), and `tests/dispatch_one_shot.rs` drives a real running
   daemon (`common::daemon_start`, still a real subprocess) through the
   re-exported `dispatch_one_shot` call instead of parsing CLI stdout.
+- [x] **Session-level forking, `session fork <id> [--at N] [--name
+  NAME]`** -- a bounded, honest slice of `prime-agent`'s `/tree`/`/fork`/
+  `/clone` (`id`/`parentId`/active-leaf JSONL structure, per
+  `session-format.md`), landed only after closely investigating whether
+  any bounded slice of that structure was buildable at all. It isn't:
+  `TranscriptEntry`'s `sequence: u64` is a total, linear order
+  interpreted by one meaning everywhere it's read (`build_turns`,
+  `session attach`'s replay, `find_compaction_fold_count`'s backward
+  walk, ...), so real intra-session branching (multiple divergent
+  continuations of *one* transcript, with an active-leaf pointer to
+  switch between) would need every one of those reworked at once -- not
+  a field addable underneath them the way compaction's own boundary
+  was, genuinely one atomic, invasive change. What *is* real and bounded
+  is **session-level** forking: `session fork` creates a brand-new,
+  independent session (own directory, own `state.json`/
+  `transcript.jsonl`, own worker) whose starting transcript is a copy of
+  an existing session's own transcript up through `--at N` (or the whole
+  thing, if omitted) -- reusing this project's existing session-creation
+  machinery the same way recursive subagents did, not a new intra-
+  session data structure. Explicitly does NOT deliver: `/tree`
+  visualization (nothing to visualize beyond `session children`'s
+  existing parent/child view), active-leaf switching mid-session (each
+  fork is a separate, permanently-diverged session, not a pointer moved
+  within one), or `/clone`'s live-state duplication (a running kernel
+  connection or MCP session dies with the source worker, same as any
+  other session boundary).
+
+  New `protocol::ForkedFrom { session_id, at_sequence }` on
+  `SessionState`/`SessionSummary` (`#[serde(default)]`, the same
+  pre-existing-`state.json` pattern every field added since Phase 1
+  uses) -- deliberately distinct from `SessionState::parent_id`
+  (recursive subagents relate whole sessions by *ownership*; this
+  relates them by *shared transcript history*, and conflating the two
+  would make one field mean two structurally unrelated things).
+  `session::snapshot_for_fork` reads a source session's `state.json`/
+  `transcript.jsonl` straight off disk (the same "files are the source
+  of truth" reasoning `catalog::scan` already relies on, so this works
+  whether or not the source's own worker happens to be running) and
+  truncates to `--at N`, erroring loudly (a conflict, not silently
+  clamped) if `N` is past the transcript's real end.
+  `session::seed_forked_session` writes a fresh `state.json`/
+  `transcript.jsonl` for the new session id, carrying forward the
+  source's `model`/`thinking`/`tools`/`runtime` configuration but
+  deliberately NOT `goal`/`harness` -- both are narrative fields whose
+  accuracy depends on the *full* history they were last updated against,
+  which a truncated copy may not match, so a fork starts with neither.
+  `daemon::handle_session_fork` spawns the new worker with
+  `WorkerMode::Resume` (not `New`, which always starts an empty
+  transcript; not `Recover`, which would misleadingly append a crash
+  marker) -- `AgentSession::recover`'s ordinary full-replay picks up
+  exactly what `seed_forked_session` wrote, the same path any other
+  resumed session goes through.
+
+  Verified with unit tests (`snapshot_for_fork` truncating correctly and
+  rejecting an out-of-range sequence; `seed_forked_session` producing a
+  `state.json`/`transcript.jsonl` pair `AgentSession::recover` replays
+  correctly, including the model/thinking-carries-forward,
+  goal-does-not-carry-forward distinction) and a real end-to-end
+  integration test suite (`tests/session_fork.rs`): truncation at a
+  given sequence, forking the whole transcript, a display name, an
+  out-of-range `--at` reported as a conflict, an unknown source session
+  reported as a conflict, the fork and source staying fully independent
+  after further prompts on each, and `--mode json`'s `forked_from`
+  provenance -- plus a manual pass in this sandbox confirming the same
+  end to end against the real compiled binary.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -1072,13 +1137,20 @@ attempted here, and not silently implied by anything in
   there's no editor plugin on the other end to talk to, the same
   reasoning the `/login` bullet above uses for having no account to log
   into.
-- **A tree-structured session data model** (`/tree`/`/fork`/`/clone`'s
-  underlying `id`/`parentId`/active-leaf JSONL structure, see
-  `session-format.md`). Deeper than the already-cut TUI commands
-  themselves: this project's session state (`state.json`/
-  `transcript.jsonl`) is linear, one worker owning one line of turns, and
-  branching would change that data model, not just add REPL commands on
-  top of it.
+- **Intra-session tree branching** (`/tree`'s underlying `id`/`parentId`/
+  active-leaf JSONL structure inside one session's own transcript, see
+  `session-format.md`). Investigated closely (see the "Session-level
+  forking" entry above for what a closer look actually found) and
+  confirmed still out of scope: `TranscriptEntry`'s `sequence: u64` is a
+  total, linear order interpreted by one meaning everywhere it's read
+  (`build_turns`, `session attach`'s replay, `find_compaction_fold_count`'s
+  backward walk, ...) -- real branching needs every one of those to
+  resolve "the transcript" against a chosen leaf/path first, all at once,
+  not a field addable underneath them the way compaction's own boundary
+  or `session fork`'s own provenance marker were. Unlike those two, this
+  is one atomic, invasive change with no honest bounded slice to land
+  first -- `/tree` visualization and active-leaf switching mid-session
+  stay unimplemented alongside it.
 - **`SYSTEM.md`/`APPEND_SYSTEM.md`** (system-prompt override/append).
   This project has no base system prompt at all to override or append
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"

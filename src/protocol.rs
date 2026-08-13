@@ -145,6 +145,26 @@ pub enum Request {
         session_id: String,
         instructions: Option<String>,
     },
+    /// `session fork <id> [--at N]` -- bounded parity with a slice of
+    /// `prime-agent`'s `/fork` (see `PARITY.md`'s "Tree-structured
+    /// session data model" entry for exactly what's NOT attempted: no
+    /// `/tree` visualization, no active-leaf switching mid-session, no
+    /// `/clone`). Public transport only, unlike `SessionRename`/
+    /// `SessionCompact` -- this creates a brand-new, independent session
+    /// (its own directory, own worker) rather than mutating
+    /// `session_id`'s, so there's no "owning worker" to forward it to;
+    /// the daemon handles it directly, the same way `SessionNew` does.
+    /// The new session's starting transcript is a copy of `session_id`'s
+    /// own transcript up through `at_sequence` (or the whole thing, if
+    /// `None`) -- session-level forking reusing this project's existing
+    /// session-creation machinery, not intra-session branching. See
+    /// `ForkedFrom`'s own doc comment for what does and doesn't carry
+    /// forward onto the new session.
+    SessionFork {
+        session_id: String,
+        at_sequence: Option<u64>,
+        name: Option<String>,
+    },
     /// Parity with `prime-agent schedule add`: registers a prompt the
     /// daemon itself will inject into `session_id` later, without any
     /// client attached -- see `schedule`'s own module doc comment for
@@ -550,6 +570,33 @@ pub struct SessionState {
     /// after Phase 1 has it.
     #[serde(default)]
     pub compaction: Option<CompactionState>,
+    /// See `ForkedFrom`'s own doc comment. `#[serde(default)]` for the
+    /// same pre-existing-`state.json` reason every other field added
+    /// after Phase 1 has it.
+    #[serde(default)]
+    pub forked_from: Option<ForkedFrom>,
+}
+
+/// Provenance for a session created by `session fork <id> [--at N]`
+/// (`Request::SessionFork`) -- a *session-level* fork, not intra-session
+/// branching: a fork is a brand-new session (own directory, own
+/// `state.json`/`transcript.jsonl`, own worker) whose initial transcript
+/// is a copy of `session_id`'s own transcript up through `at_sequence`.
+/// Distinct from `SessionState::parent_id` (recursive subagents,
+/// `session spawn`): that field relates whole sessions by ownership
+/// ("this session was spawned to work on behalf of that one"); this one
+/// relates them by shared transcript history ("this session's early
+/// turns are a verbatim copy of that one's"). Deliberately *not* used to
+/// carry `goal`/`harness` forward onto the forked session -- both are
+/// narrative fields whose accuracy depends on the *full* history they
+/// were last updated against, which a truncated copy may not match, so
+/// a fork starts with neither and only carries forward configuration
+/// (`model`/`thinking`/`tools`/`runtime`) that doesn't have that
+/// problem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkedFrom {
+    pub session_id: String,
+    pub at_sequence: u64,
 }
 
 /// A session's running compaction summary, parity with `prime-agent`'s
@@ -607,6 +654,9 @@ pub struct SessionSummary {
     pub tools: Option<String>,
     /// See `Request::SessionNew::runtime`'s own doc comment.
     pub runtime: Option<String>,
+    /// See `ForkedFrom`'s own doc comment. `None` for a session that
+    /// wasn't created by `session fork`.
+    pub forked_from: Option<ForkedFrom>,
 }
 
 /// One registered schedule entry, persisted per-session (see `schedule`'s
