@@ -7,6 +7,16 @@ description = "Cross-platform daemon-backed agent harness core (Phase 1: daemon/
 license = "MIT"
 publish = false
 
+[lib]
+# Cargo would derive `rusty_prime_agent` from `[package] name` even
+# without this section at all (hyphens fold to underscores) -- named
+# explicitly so it's not implicit which importable name `tests/*.rs`'s
+# own `use rusty_prime_agent::...` and any external embedder depend on.
+# See `src/lib.rs`'s own doc comment for why this crate has a real,
+# bounded public API now, not just a `[[bin]]`-only internal module set.
+name = "rusty_prime_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "harness"
 path = "src/main.rs"
