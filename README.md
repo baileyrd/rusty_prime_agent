@@ -92,6 +92,15 @@ sibling of `session repl`'s own `/heartbeat`. `rlm_heartbeat(every="10m")`
 instead -- a real `session schedule` entry, listed/canceled the same way
 any other one is.
 
+The kernel also gets `rlm(task, name=None, model=None)`, parity with
+`prime-agent`'s kernel-callable recursive subagents: `await rlm("review
+the API")` admits a real child session (the same underlying mechanism as
+`session spawn`, just called from inside the kernel instead of the CLI)
+and returns immediately after admission -- `{"rlm_child_id", "name",
+"session_dir", "model"}` -- without waiting for the child's answer. No
+recursion-depth limit yet, and no `rlm.list_subagents()`/
+`rlm.delete_subagent()` registry yet.
+
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
 ```

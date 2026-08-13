@@ -579,6 +579,20 @@ impl AgentSession {
     /// `stdout` -- stripped from what the model sees and dispatched to
     /// `trigger_heartbeat` instead of shown as raw internal protocol
     /// noise.
+    ///
+    /// If the code instead calls `await host_request(...)` (directly, or
+    /// via `rlm(...)`), `ToolRuntime::execute` returns with
+    /// `pending_host_request` set instead of finishing -- this loops
+    /// calling [`handle_host_request`](Self::handle_host_request) and
+    /// `ToolRuntime::resume_execute` until the cell actually completes
+    /// (a cell may `await` more than one host request), concatenating
+    /// `stdout` across every pause the same way a single uninterrupted
+    /// `execute` call's own `stdout` would read. `result` always reflects
+    /// only the *last* resume, matching what `execute_result`/`error`
+    /// naturally does in the underlying Jupyter protocol -- an earlier
+    /// pause's own result, if it had one, was already an intermediate
+    /// value the cell's own code consumed, not something worth surfacing
+    /// to the model.
     async fn execute_python_tool_call(&mut self, arguments: &str) -> Result<String> {
         let value: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(v) => v,
@@ -588,13 +602,26 @@ impl AgentSession {
             Some(c) => c.to_string(),
             None => return Ok("error: missing required `code` argument".to_string()),
         };
-        let outcome = self.tool_runtime.execute(&code).await?;
-        let heartbeat = extract_heartbeat_marker(&outcome.stdout);
+        let mut outcome = self.tool_runtime.execute(&code).await?;
+        let mut stdout = outcome.stdout;
+        while let Some(request) = outcome.pending_host_request.take() {
+            let reply = self
+                .handle_host_request(&request.kind, request.payload)
+                .await?;
+            outcome = self
+                .tool_runtime
+                .resume_execute(&request.comm_id, reply)
+                .await?;
+            stdout.push_str(&outcome.stdout);
+        }
+        let result = outcome.result;
+
+        let heartbeat = extract_heartbeat_marker(&stdout);
         let mut text = match &heartbeat {
             Some((_, without_marker)) => without_marker.clone(),
-            None => outcome.stdout,
+            None => stdout,
         };
-        if let Some(result) = outcome.result {
+        if let Some(result) = result {
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -612,6 +639,113 @@ impl AgentSession {
             text = "(no output)".to_string();
         }
         Ok(text)
+    }
+
+    /// Dispatches one `HostRequest` the kernel is blocked awaiting a
+    /// reply to (see `tool_runtime::HostRequest`'s own doc comment) and
+    /// returns the JSON value to send back via `ToolRuntime::
+    /// resume_execute`. `rlm.run` is the only kind implemented so far;
+    /// an unrecognized `kind` gets an `{"error": ...}` reply rather than
+    /// a `HarnessError` -- the kernel-side caller is meant to see and
+    /// handle it, the same "surface it to the model, don't fail the
+    /// whole call" posture `execute_python_tool_call`'s own doc comment
+    /// already applies to a Python-level exception.
+    async fn handle_host_request(
+        &self,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match kind {
+            "rlm.run" => self.handle_rlm_run(payload).await,
+            other => Ok(serde_json::json!({
+                "error": format!("unknown host request kind {other:?}"),
+            })),
+        }
+    }
+
+    /// Handles a kernel-side `rlm(task, name=None, model=None)` call --
+    /// parity with `prime-agent`'s kernel-callable `rlm(...)`,
+    /// `packages/coding-agent/docs/rlm.md`. Admits a child session
+    /// through the exact same `SessionNew`/`ScheduleAdd` daemon round
+    /// trip `client::session_spawn` (`session spawn`) already uses --
+    /// this is that same underlying mechanism, just issued from inside
+    /// the worker process instead of an external CLI invocation, the
+    /// same "connect to this session's own `daemon.sock` like any other
+    /// client" pattern `trigger_heartbeat` already established. Returns
+    /// immediately after admission, never waiting for the child's own
+    /// reply -- parity with `rlm(...)` "returns immediately after task
+    /// admission... never waits for or returns the child's answer"
+    /// (`rlm-runtime.md`). No recursion-depth check yet (a later,
+    /// separate increment) and no parent-scoped registry of admitted
+    /// children yet (likewise) -- this covers exactly the admission call
+    /// itself.
+    async fn handle_rlm_run(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
+        let Some(task) = payload.get("task").and_then(|v| v.as_str()) else {
+            return Ok(serde_json::json!({"error": "rlm.run requires a \"task\" string"}));
+        };
+        let name = payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let model = payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.state.model.clone());
+
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(
+            Context::Daemon,
+            &Request::SessionNew {
+                name: name.clone(),
+                model: model.clone(),
+                goal: None,
+                parent_id: Some(self.state.session_id.clone()),
+                thinking: None,
+                tools: None,
+                runtime: None,
+            },
+        )
+        .await?;
+        let response = conn.read_response(Context::Daemon).await?;
+        let child_id = match response {
+            Some(crate::protocol::Response::SessionNew { session_id }) => session_id,
+            Some(crate::protocol::Response::Error { message, .. }) => {
+                return Ok(serde_json::json!({ "error": message }));
+            }
+            other => {
+                return Err(HarnessError::protocol(
+                    Context::Daemon,
+                    format!(
+                        "expected a session_new response to rlm.run's SessionNew, got {other:?}"
+                    ),
+                ));
+            }
+        };
+
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(
+            Context::Daemon,
+            &Request::ScheduleAdd {
+                session_id: child_id.clone(),
+                text: task.to_string(),
+                kind: ScheduleKind::Once { at_ms: now_ms() },
+            },
+        )
+        .await?;
+        let _ =
+            rusty_tokio::time::timeout(Duration::from_secs(5), conn.read_response(Context::Daemon))
+                .await;
+
+        let session_dir = paths::session_dir(&self.state_root, &child_id);
+        Ok(serde_json::json!({
+            "rlm_child_id": child_id,
+            "name": name,
+            "session_dir": session_dir.display().to_string(),
+            "model": model,
+        }))
     }
 
     /// Handles a kernel-side `rlm_heartbeat()` call -- parity with

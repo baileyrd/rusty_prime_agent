@@ -451,25 +451,24 @@ impl ToolRuntime for IpythonKernelRuntime {
             });
 
             // The kernel process needs a moment after spawn before its
-            // sockets are actually listening -- retry the connect (not
-            // just the ZMTP handshake) until `STARTUP_TIMEOUT` elapses,
-            // the same "poll until ready" shape as `rp_server::
-            // wait_for_health`.
+            // sockets are actually listening -- retry each connect (not
+            // just the initial TCP handshake) until `STARTUP_TIMEOUT`
+            // elapses, the same "poll until ready" shape as `rp_server::
+            // wait_for_health`. Each attempt itself is also individually
+            // bounded (`connect_with_retry`'s own doc comment) -- direct
+            // testing found `ZmtpSocket::connect`'s ZMTP handshake reads
+            // (`read_exact`/`read_frame` in `zmtp.rs`) have no timeout of
+            // their own, so a kernel that's merely slow to answer (not
+            // refusing the connection outright) can hang a single
+            // un-timed attempt indefinitely -- observed as an
+            // intermittent multi-minute test hang before this fix, not a
+            // hypothetical. Applies to all three sockets equally, not
+            // just the one that happened to be hit first.
             let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-            let shell = loop {
-                match ZmtpSocket::connect("127.0.0.1", shell_port, "DEALER").await {
-                    Ok(shell) => break shell,
-                    Err(err) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(err);
-                        }
-                        rusty_tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            };
-            self.shell = Some(shell);
+            self.shell =
+                Some(connect_with_retry("127.0.0.1", shell_port, "DEALER", deadline).await?);
 
-            let mut iopub = ZmtpSocket::connect("127.0.0.1", iopub_port, "SUB").await?;
+            let mut iopub = connect_with_retry("127.0.0.1", iopub_port, "SUB", deadline).await?;
             iopub.subscribe_all().await?;
             // Best-effort: the kernel answers a fresh SUB subscription
             // with an unsolicited `iopub_welcome` message -- reading it
@@ -479,11 +478,8 @@ impl ToolRuntime for IpythonKernelRuntime {
             let _ = rusty_tokio::time::timeout(IOPUB_WELCOME_TIMEOUT, iopub.recv_multipart()).await;
             self.iopub = Some(iopub);
 
-            // By this point `shell`'s own connect-retry loop above already
-            // proved the kernel process is fully up, so a single attempt
-            // (no retry loop) is enough here.
-            let control = ZmtpSocket::connect("127.0.0.1", control_port, "DEALER").await?;
-            self.control = Some(control);
+            self.control =
+                Some(connect_with_retry("127.0.0.1", control_port, "DEALER", deadline).await?);
 
             let (msg_type, _parent_header, _content) =
                 rusty_tokio::time::timeout(STARTUP_TIMEOUT, async {
@@ -628,6 +624,56 @@ fn build_signed_message(
         meta_b,
         content_b,
     ])
+}
+
+/// How long one [`connect_with_retry`] attempt (TCP connect plus the
+/// full ZMTP handshake) is allowed to take before it's treated as failed
+/// and retried. `ZmtpSocket::connect`'s handshake reads have no timeout
+/// of their own (`zmtp.rs`'s `read_exact`/`read_frame`), so without this
+/// bound a kernel that's merely slow to answer -- not refusing the
+/// connection outright -- can hang a single attempt indefinitely; a
+/// refused connection fails in microseconds, so 5s is generous purely
+/// for the "kernel is momentarily busy" case, not the fast-failure one.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connects and completes the ZMTP handshake for one of the kernel's
+/// three sockets this module opens, retrying (after
+/// [`CONNECT_ATTEMPT_TIMEOUT`], or an immediate connection-refused
+/// error) until `deadline` -- shared by `shell`/`iopub`/`control` in
+/// [`IpythonKernelRuntime::start`] rather than only applied to `shell`
+/// the way an earlier revision of this function did. See
+/// [`CONNECT_ATTEMPT_TIMEOUT`]'s own doc comment for why a per-attempt
+/// timeout is necessary at all, not just a connect-refused retry.
+async fn connect_with_retry(
+    host: &str,
+    port: u16,
+    socket_type: &str,
+    deadline: std::time::Instant,
+) -> Result<ZmtpSocket> {
+    loop {
+        match rusty_tokio::time::timeout(
+            CONNECT_ATTEMPT_TIMEOUT,
+            ZmtpSocket::connect(host, port, socket_type),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(err)) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err);
+                }
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(HarnessError::conflict(
+                        Context::Runtime,
+                        format!("connecting to kernel {socket_type} socket timed out repeatedly"),
+                    ));
+                }
+            }
+        }
+        rusty_tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn paths_ensure_dir(dir: &std::path::Path) -> Result<()> {
@@ -1122,6 +1168,112 @@ def host_request(kind, payload=None):
             resumed.result.as_deref(),
             Some("{'echo': 'pong'}"),
             "the awaited call should have returned the exact reply this test sent"
+        );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    /// Real end-to-end coverage that `rlm(task, name=None, model=None)`
+    /// (`worker::bootstrap_kernel`'s thin wrapper over `host_request`) is
+    /// wired correctly on the kernel side: `await rlm("do the thing",
+    /// name="x", model="y")` must pause on a `pending_host_request` whose
+    /// `kind` is exactly `"rlm.run"` and whose `payload` carries
+    /// `task`/`name`/`model` -- the shape `session::AgentSession::
+    /// handle_rlm_run` on the other end expects. Deliberately doesn't
+    /// exercise `handle_rlm_run` itself (that needs a real daemon, not
+    /// just a real kernel, and its own `SessionNew`/`ScheduleAdd` daemon
+    /// calls are the identical shape `tests/subagents.rs`'s `session
+    /// spawn` tests already cover end to end) -- this test's job is
+    /// proving the kernel *produces* the right request, not that the
+    /// daemon admits it correctly. `#[ignore]`d for the same
+    /// real-`ipykernel`-install reason as its siblings.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_rlm_call_opens_an_rlm_run_host_request() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-rlm-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the code `worker::bootstrap_kernel` sends for
+        // `host_request`/`rlm`.
+        let setup_code = "\
+import asyncio
+from ipykernel.comm import Comm
+_host_request_kernel = get_ipython().kernel
+_host_request_kernel.control_handlers['comm_msg'] = _host_request_kernel.comm_manager.comm_msg
+_host_request_kernel.control_handlers['comm_close'] = _host_request_kernel.comm_manager.comm_close
+_host_request_loop = asyncio.get_event_loop()
+def host_request(kind, payload=None):
+    comm = Comm(target_name='host.request', data={'kind': kind, **(payload or {})})
+    fut = _host_request_loop.create_future()
+    def _on_msg(msg):
+        def _resolve():
+            if not fut.done():
+                fut.set_result(msg['content']['data'])
+        _host_request_loop.call_soon_threadsafe(_resolve)
+    comm.on_msg(_on_msg)
+    return fut
+
+async def rlm(task, name=None, model=None):
+    payload = {'task': task}
+    if name is not None:
+        payload['name'] = name
+    if model is not None:
+        payload['model'] = model
+    return await host_request('rlm.run', payload)
+";
+        runtime
+            .execute(setup_code)
+            .await
+            .expect("rlm/host_request setup code should round-trip");
+
+        let outcome = runtime
+            .execute("result = await rlm('do the thing', name='x', model='y')\nresult")
+            .await
+            .expect("the rlm(...) call should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting rlm.run's reply");
+        assert_eq!(pending.kind, "rlm.run");
+        assert_eq!(
+            pending.payload.get("task").and_then(|v| v.as_str()),
+            Some("do the thing")
+        );
+        assert_eq!(
+            pending.payload.get("name").and_then(|v| v.as_str()),
+            Some("x")
+        );
+        assert_eq!(
+            pending.payload.get("model").and_then(|v| v.as_str()),
+            Some("y")
+        );
+
+        let resumed = runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"rlm_child_id": "child-123"}),
+            )
+            .await
+            .expect("resume_execute should deliver the reply and let rlm(...) return it");
+        assert!(resumed.pending_host_request.is_none());
+        assert_eq!(
+            resumed.result.as_deref(),
+            Some("{'rlm_child_id': 'child-123'}"),
+            "rlm(...) should return exactly whatever the host replied with"
         );
 
         runtime.shutdown().await.expect("shutdown should succeed");

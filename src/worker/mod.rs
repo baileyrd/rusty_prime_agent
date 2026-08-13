@@ -168,9 +168,7 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// process -- `session::execute_python_tool_call`'s marker parsing
 /// splits it back out. `rlm_heartbeat` itself is *not* migrated onto
 /// `host_request` here: it works today, and the marker hack costs
-/// nothing extra to keep running alongside the new channel until a real
-/// second host-request kind (`rlm(...)`, the next increment) makes the
-/// migration worth doing at the same time.
+/// nothing extra to keep running alongside the new channel.
 ///
 /// `host_request(kind, payload=None)` opens a Jupyter comm targeting
 /// `"host.request"` and returns an `asyncio.Future` that resolves with
@@ -183,6 +181,16 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// host-request replies travel) and resolving the future via
 /// `loop.call_soon_threadsafe` (`rlm-runtime.md`'s own stated reason:
 /// "the control handler may run on another thread").
+///
+/// `rlm(task, name=None, model=None)` -- parity with `prime-agent`'s
+/// kernel-callable `rlm(...)`, `packages/coding-agent/docs/rlm.md` --
+/// is the first (and so far only) real `host_request` kind,
+/// `session::AgentSession::handle_rlm_run` on the other end. Deliberately
+/// a thin wrapper, not a distinct comm target of its own: `rlm("task")`
+/// is exactly `await host_request("rlm.run", {"task": "task"})`, matching
+/// the "one comm target, typed request kinds" shape `rlm-runtime.md`
+/// itself describes ("Bundled Python skills such as `goal` call
+/// `rlm.host_request("goal.get", ...)`").
 async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
     let mut code = format!(
         "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n\n\
@@ -201,7 +209,14 @@ async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime)
          \x20               fut.set_result(msg['content']['data'])\n\
          \x20       _host_request_loop.call_soon_threadsafe(_resolve)\n\
          \x20   comm.on_msg(_on_msg)\n\
-         \x20   return fut\n",
+         \x20   return fut\n\n\
+         async def rlm(task, name=None, model=None):\n\
+         \x20   payload = {{'task': task}}\n\
+         \x20   if name is not None:\n\
+         \x20       payload['name'] = name\n\
+         \x20   if model is not None:\n\
+         \x20       payload['model'] = model\n\
+         \x20   return await host_request('rlm.run', payload)\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 

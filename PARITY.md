@@ -804,14 +804,83 @@ daemon/worker split rather than requiring the Python control environment:
   end-to-end (`execute` pausing, `resume_execute` delivering a reply and
   finishing the cell) as a new `#[ignore]`d real-kernel test in
   `ipython_runtime.rs`'s own test module, same discipline as its
-  siblings. Explicitly not done yet: no request `kind` is dispatched to
-  anything -- `session.rs`'s tool-calling loop doesn't call `resume_
-  execute` at all, so this is proven machinery with no live caller
-  inside a real session. `rlm_heartbeat` was deliberately *not*
-  migrated onto this channel either: it already works via the stdout
+  siblings. Explicitly not done yet (at that point): no request `kind`
+  was dispatched to anything -- `session.rs`'s tool-calling loop didn't
+  call `resume_execute` at all, so this was proven machinery with no
+  live caller inside a real session. `rlm_heartbeat` was deliberately
+  *not* migrated onto this channel: it already works via the stdout
   marker, migrating it isn't free, and doing so alongside the first real
-  consumer (a kernel-callable `rlm(...)`, the next increment) is more
-  useful than migrating it in isolation.
+  consumer was judged more useful than migrating it in isolation -- it
+  remains unmigrated even now that a real consumer exists.
+
+  **Later increment: a kernel-callable `rlm(...)`.** `session::
+  execute_python_tool_call` now actually loops on `pending_host_request`
+  (the missing piece the prior paragraph flagged): it calls a new
+  `AgentSession::handle_host_request` dispatcher, then `ToolRuntime::
+  resume_execute`, repeating until the cell finishes -- a cell may
+  `await` more than one host request, and `stdout` is concatenated
+  across every pause the same way one uninterrupted `execute` call's own
+  `stdout` would read. `handle_host_request` currently recognizes exactly
+  one `kind`, `"rlm.run"`, dispatched to `handle_rlm_run`; an
+  unrecognized `kind` gets `{"error": ...}` back rather than a
+  `HarnessError` -- the kernel-side caller is meant to see and handle it,
+  same posture as a Python-level exception elsewhere in this same
+  method. `bootstrap_kernel` defines `rlm(task, name=None, model=None)`
+  as a thin wrapper -- `await rlm("do the thing")` is exactly `await
+  host_request("rlm.run", {"task": "do the thing"})` -- matching
+  `rlm-runtime.md`'s own "one comm target, typed request kinds" shape
+  (its example: "Bundled Python skills such as `goal` call `rlm.
+  host_request("goal.get", ...)`").
+
+  `handle_rlm_run` admits the child through the *exact same*
+  `Request::SessionNew`/`Request::ScheduleAdd` daemon round trip
+  `client::session_spawn` (`session spawn`) already uses -- this is that
+  same underlying mechanism, just issued from inside the worker process
+  instead of an external CLI invocation, the same "connect to this
+  session's own `daemon.sock` like any other client" pattern
+  `trigger_heartbeat` already established for `rlm_heartbeat`. Returns
+  immediately after admission (an `{"rlm_child_id", "name",
+  "session_dir", "model"}` dict, `rlm_child_id` currently just the new
+  session id -- there's no separate child-slot-id concept here the way
+  `rlm-runtime.md` describes), never waiting for the child's own reply --
+  parity with `rlm(...)` "returns immediately after task admission...
+  never waits for or returns the child's answer." No recursion-depth
+  check yet and no parent-scoped registry of admitted children yet --
+  both explicitly separate, later increments (see below), not silently
+  skipped.
+
+  Real end-to-end coverage of the *kernel* side (a new `#[ignore]`d test,
+  `real_kernel_rlm_call_opens_an_rlm_run_host_request`) proves `rlm(...)`
+  produces the right `pending_host_request` (`kind: "rlm.run"`, `payload`
+  carrying `task`/`name`/`model`) and returns exactly whatever the host
+  replies with. The *daemon* side (`handle_rlm_run`'s `SessionNew`/
+  `ScheduleAdd` calls) is deliberately not independently re-tested here:
+  it reuses request types and handlers `tests/subagents.rs`'s `session
+  spawn` coverage already exercises end to end, and combining a real
+  kernel with a real daemon in one test needs the compiled binary's path
+  (`CARGO_BIN_EXE_harness`), which Cargo only provides to integration
+  tests (`tests/*.rs`), not to a lib crate's own `#[cfg(test)]` modules
+  where `handle_rlm_run` (crate-private) is reachable -- a real
+  infrastructure gap, not an oversight, recorded here rather than glossed
+  over.
+
+  **A real bug found and fixed along the way, not part of `rlm(...)`
+  itself:** re-running the real-kernel test suite repeatedly while
+  building this increment surfaced an intermittent multi-minute hang,
+  reproducing roughly every other run. Root cause, confirmed by reading
+  `zmtp.rs` directly: `ZmtpSocket::connect`'s ZMTP handshake reads
+  (`read_exact`/`read_frame`) have no timeout of their own -- a kernel
+  that's merely slow to answer a socket (not refusing the connection
+  outright) can hang a single connect attempt indefinitely. `shell`'s
+  own connect already retried on outright failure, but that retry loop
+  never helps against a hang (the attempt never returns to be retried),
+  and `iopub`/`control` had no retry logic at all. Fixed with a new
+  `connect_with_retry` helper wrapping each attempt in a
+  `CONNECT_ATTEMPT_TIMEOUT` (5s) before retrying, shared by all three
+  sockets, bounded by the same overall `STARTUP_TIMEOUT` deadline shell's
+  retry loop already used. Confirmed fixed by five consecutive real-kernel
+  test runs with zero hangs, after two reproductions of the hang without
+  it.
 
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:

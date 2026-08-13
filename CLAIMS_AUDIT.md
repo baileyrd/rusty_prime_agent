@@ -45,14 +45,18 @@ conditioned differently than the claim implies), **N/A**.
   summarize, or recurse into -- was never implemented. This project only
   has the execution half.
 - **"Subagents are built in: `rlm(...)` spawns real child agents ... as
-  function calls."** -- **False as described, true underneath.**
-  Subagents are real (`session spawn`/`session children`/`session
-  message`, `src/cli.rs`, `src/client.rs`), but `rlm(...)` itself --
-  a Python function callable from inside kernel code -- does not exist.
-  `session spawn` is a CLI/daemon-level command, not something the model
-  invokes from Python. The code's own doc comments already say this:
-  "bounded, non-Python parity with `rlm(...)`" (`src/client.rs`,
-  `src/cli.rs`).
+  function calls."** -- **Now True (was False as described, true only
+  underneath).** Originally: subagents were real (`session spawn`/
+  `session children`/`session message`) but `rlm(...)` itself -- a
+  Python function callable from inside kernel code -- did not exist;
+  `session spawn` was CLI/daemon-level only. **Closed**: `rlm(task,
+  name=None, model=None)` is now a real kernel-callable coroutine
+  (`worker::bootstrap_kernel`), admitting a child session through the
+  same `SessionNew`/`ScheduleAdd` daemon round trip `session spawn`
+  already used, just callable as `await rlm("task")` from kernel code
+  instead of the CLI. See the RLM Runtime Architecture section below for
+  the mechanism and what's still not done (recursion depth limits,
+  `rlm.list_subagents()`/`delete_subagent()`, usage attribution).
 - **"Everything is programmatic: file operations, shell commands, tool
   use, subagents, and context management happen through code."** --
   **False.** `--tools read|mcp` is a separate, independent model-facing
@@ -175,12 +179,11 @@ worker/session code.
   bootstrap_kernel`) -- `IpythonKernelRuntime::execute` pauses with
   `pending_host_request` set when the kernel opens a `host.request` comm
   and blocks awaiting a reply, and `resume_execute` delivers one over
-  `control` and lets the cell finish. Still Partial, not True: nothing
-  yet calls this from `session.rs`'s own `execute_python_tool_call` loop
-  (no dispatcher wired to a real request `kind`) -- the mechanism is
-  proven end-to-end against a real kernel, but has no live caller inside
-  a real session yet. That's the next increment (a kernel-callable
-  `rlm(...)` using it).
+  `control` and lets the cell finish. **Fully closed now**:
+  `execute_python_tool_call` loops on `pending_host_request`, dispatching
+  to `AgentSession::handle_host_request`; `"rlm.run"` is the first real
+  request `kind`, backing a kernel-callable `rlm(task, ...)` -- see
+  the marketing-copy section above and RLM Runtime Architecture below.
 - **"Workers and kernels are separate processes for lifecycle and
   failure containment, not security sandboxes. They normally run with
   the same operating-system permissions as the client."** -- **True.**
@@ -319,12 +322,18 @@ worker/session code.
 
 ## RLM Runtime Architecture (`rlm-runtime.md`)
 
-Mostly **False/N/A**, consistent with the RLM findings above -- `rlm(...)`
-as a kernel-callable function does not exist, so most of this document's
-claims (comm target `host.request`, `RLMSpawnHandle`, `RLM_DEPTH`/
-`RLM_MAX_DEPTH`, `rlm.list_subagents()`/`rlm.delete_subagent()`, model
-search via `rlm.find_models()`) have no analog to check. The specific
-points worth calling out individually:
+**Originally mostly False/N/A** -- `rlm(...)` as a kernel-callable
+function didn't exist, so most of this document's claims had no analog
+to check. **Since closed in part**: `rlm(task, name=None, model=None)`
+is now real (a kernel-callable coroutine over the `host.request` comm
+protocol, admitting a child session through the same daemon round trip
+`session spawn` uses) -- see the marketing-copy section above for the
+mechanism. Still genuinely absent: `RLMSpawnHandle` as a typed object
+(the reply is a plain dict, not an attribute-access object), `RLM_DEPTH`/
+`RLM_MAX_DEPTH` recursion limits, `rlm.list_subagents()`/
+`rlm.delete_subagent()` (no parent-scoped registry yet), model search via
+`rlm.find_models()`, and usage/cost attribution -- each tracked
+separately below. The specific points worth calling out individually:
 
 - **Persistent kernel, Jupyter protocol over ZeroMQ, HMAC-SHA256 signed
   frames.** -- **True.** `zmtp.rs`/`sha256.rs`, hand-rolled and verified
@@ -992,12 +1001,16 @@ From the recursive doc-tree pass:
       `SessionPrompt` calls -- no protocol change needed.
 
 Not candidates -- structurally out of scope, same reasoning as
-`PARITY.md`'s "Needs a new subsystem" section: prompt-as-a-variable,
-`rlm(...)` as an in-kernel Python callable, and routing all tool use/
-subagent orchestration through kernel code. Each would require the
-Python-first control environment this project has deliberately not
-built (see `PARITY.md`'s "RLM programming model" and "Recursive
-subagents" entries for why). Also not a candidate: restructuring the
+`PARITY.md`'s "Needs a new subsystem" section: prompt-as-a-variable
+(context itself exposed as a slice-able Python object, distinct from
+`rlm(...)` -- see the RLM Runtime Architecture section above, since
+`rlm(...)` itself is no longer in this "not a candidate" bucket, it
+shipped) and routing *all* tool use/subagent orchestration through
+kernel code (only `rlm(...)` does, `--tools read|mcp` still doesn't).
+Each of those two would require the Python-first control environment
+this project has deliberately not built (see `PARITY.md`'s "RLM
+programming model" and "Recursive subagents" entries for why). Also not
+a candidate: restructuring the
 worker model so a parent process hosts child runtimes in-process
 ("one root session tree") instead of today's one-process-per-session
 design -- that's a foundational rewrite of the daemon/worker

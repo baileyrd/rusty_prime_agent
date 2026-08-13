@@ -246,6 +246,24 @@ boxed-future shape is exactly why `IpythonKernelRuntime::start`/`execute`
 being real, `.await`-heavy subprocess-and-socket I/O needed no trait
 redesign to land.
 
+Each of the three ZMTP sockets connects (and completes the ZMTP
+handshake) via a shared `connect_with_retry` helper -- not a bare
+`ZmtpSocket::connect` call -- because the handshake's own reads have no
+timeout, and a kernel that's merely slow to answer one socket (not
+refusing the connection) can hang a single attempt indefinitely; direct
+testing surfaced this as an intermittent multi-minute real-kernel test
+hang before the fix. `ToolRuntime::execute` can now also pause mid-cell
+with `ExecutionOutcome.pending_host_request` when kernel code opens a
+Jupyter comm targeting `"host.request"` over `control` -- `resume_execute`
+delivers the caller's reply and continues draining. `AgentSession::
+handle_host_request`/`handle_rlm_run` (`session.rs`) is the one live
+consumer so far: a kernel-callable `rlm(task, ...)` that admits a child
+session through the same `SessionNew`/`ScheduleAdd` daemon round trip
+`session spawn` already uses, just issued from inside the worker process.
+See `PARITY.md`'s RLM programming model entry for the full mechanism
+(why `control`, why the `ipykernel` monkeypatch is necessary, what still
+isn't wired up).
+
 **Not the same thing as the real tool-calling loop** (`provider`/`tools`
 modules, `session new --tools read|mcp`, see `PARITY.md`): that's
 `rp-server` answering `ChatRequest.tools`/`tool_calls` over the same HTTP
