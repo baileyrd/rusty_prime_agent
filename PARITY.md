@@ -9,8 +9,8 @@ much larger TypeScript project: a persistent-IPython RLM control
 environment, a Continual Harness, recursive subagents, skills/extensions,
 scheduling, goals, autonomous mode, and a full TUI, wired to real model
 providers. This document tracks that gap honestly and records what's
-tractable to close incrementally versus what's out of scope for this
-project's current shape.
+tractable to close incrementally versus what's not yet implemented in
+this project's current shape.
 
 See `ARCHITECTURE.md` for how this project's own pieces fit together, and
 `packages/coding-agent/docs/architecture.md` in the `prime-agent` repo for
@@ -276,7 +276,7 @@ daemon/worker split rather than requiring the Python control environment:
   attach` would. None of the TUI's own editor/message-queue features
   (file reference, image paste, steering vs. follow-up queuing,
   `/tree`/`/fork`/`/clone`/`/compact`/`/export`/`/share`) -- those stay
-  out of scope below; this is the bare loop underneath all of that, the
+  unimplemented below; this is the bare loop underneath all of that, the
   same "extract the tractable session-level mechanism, leave the rich
   surface out" move as `session spawn`/prompt templates above.
 - [x] **Model/provider catalog listing** (`harness model list`), the
@@ -292,7 +292,7 @@ daemon/worker split rather than requiring the Python control environment:
   this provider-tier-only view; see the next entry for the real
   per-model catalog.
 - [x] **Real per-model catalog** (`harness model list --detailed`).
-  Last revision of this file marked this "out of scope" on the
+  Last revision of this file marked this "not implemented" on the
   assumption that real model IDs need "a live query against each
   provider's own API" -- untestable in CI, unattemptable without keys.
   Reading `rusty_provider`'s actual source (`crates/server/src/
@@ -340,7 +340,7 @@ daemon/worker split rather than requiring the Python control environment:
   otherwise wouldn't have a home for.
 - [x] **`--thinking <level>`** (`session new --thinking low|medium|
   high`), parity with `prime-agent --thinking <level>`. Last revision of
-  this file marked this "genuinely out of scope" on the assumption that
+  this file marked this "genuinely not implemented" on the assumption that
   `rp-server`'s wire contract for it was unknown/unverifiable -- reading
   `rusty_provider`'s actual source (`crates/core/src/types.rs`) showed
   `ChatRequest.reasoning: Option<ReasoningConfig>` already exists,
@@ -355,7 +355,7 @@ daemon/worker split rather than requiring the Python control environment:
 - [x] **Real tool-calling loop** (`session new --tools read`, built-in
   `read_file`/`list_dir` tools). Last revision of this file lumped this
   in with the RLM programming model's IPython-kernel boundary as
-  Python-bound and out of scope -- reading `rusty_provider`'s actual
+  Python-bound and not implemented -- reading `rusty_provider`'s actual
   source (`crates/core/src/types.rs`) showed that conflated two
   different things: `tool_runtime::ToolRuntime` really is that boundary
   (still `NoopToolRuntime` as of this entry, untouched by it -- see the
@@ -388,7 +388,7 @@ daemon/worker split rather than requiring the Python control environment:
   own real-tool-call test is written to tolerate that.
 - [x] **MCP integration** (`session new --tools mcp`), parity with
   `prime-agent`'s MCP support. Last revision of this file lumped this in
-  with "Skills, extensions, themes" as out of scope -- `rp-server`
+  with "Skills, extensions, themes" as not implemented -- `rp-server`
   already ships its own built-in MCP gateway (`crates/mcp/`): its native
   tools (`chat_completion`/`list_models`/`embeddings`) merged with
   every tool proxied from a configured `[[mcp.upstreams]]` entry
@@ -436,7 +436,7 @@ daemon/worker split rather than requiring the Python control environment:
 - [x] **The RLM programming model's IPython-kernel boundary** (`session
   new --runtime ipython`, `execute_python` tool), parity with
   `prime-agent`'s persistent-IPython RLM control environment. Every prior
-  revision of this file marked this "genuinely out of scope" as
+  revision of this file marked this "genuinely not implemented" as
   architecturally Python-bound; that held for the actual code-execution
   half, but not for the reason assumed. `tool_runtime::ToolRuntime` was
   always the right boundary (still true) -- what changed is that backing
@@ -495,7 +495,7 @@ daemon/worker split rather than requiring the Python control environment:
   client performs, to tell a request's own iopub traffic apart from
   everything else on the same broadcast socket. Only `shell`+`iopub` are
   opened; `stdin` (kernel-side `input()`), `control` (interrupt/
-  `shutdown_request`), and `heartbeat` are out of scope for this pass, so
+  `shutdown_request`), and `heartbeat` aren't implemented for this pass, so
   `shutdown` tears the kernel down with a plain process kill rather than a
   graceful control-channel request. The kernel subprocess is deliberately
   left un-detached (unlike every other spawned process this project
@@ -526,7 +526,7 @@ daemon/worker split rather than requiring the Python control environment:
   pointing `RUSTY_PRIME_AGENT_IPYTHON_BIN` at a binary name that can't
   exist.
 
-  Explicitly still out of scope: interrupt/cancel (needs `control`),
+  Explicitly still not implemented: interrupt/cancel (needs `control`),
   kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
   `execute_result`'s `data` only ever reads `text/plain` here), and
   multi-kernel pooling beyond one kernel per session. Real `prime-agent`
@@ -596,7 +596,7 @@ daemon/worker split rather than requiring the Python control environment:
   (`tests/skills.rs`) proves discovery/listing/CLI wiring without a real
   kernel.
 
-  Explicitly still out of scope: the project-local tier above, a `skill
+  Explicitly still not implemented: the project-local tier above, a `skill
   install`/packaging-and-distribution command (drop-a-directory-in stays
   manual, same as prompt templates always have), skill versioning or
   dependency management, and skill-provided *tools* of their own -- a
@@ -658,18 +658,99 @@ daemon/worker split rather than requiring the Python control environment:
   `send_prompt` every other REPL line already uses, immediately, no
   scheduling latency.
 
-  Explicitly out of scope: rate-limiting/deduplicating rapid repeated
+  Explicitly not implemented: rate-limiting/deduplicating rapid repeated
   `rlm_heartbeat()` calls (same "no sandboxing for a single local user"
   trust model already accepted elsewhere), arguments to either trigger
   (both parameterless, matching `prime-agent`'s own simplest form), and
   any change to `session_autonomous`'s own bounded loop -- these are two
   more manual entry points into the same mechanism, not a third
   continuation policy.
+- [x] **Automatic context compaction** (`session compact <id>
+  [instructions...]`, `/compact [instructions]` in `session_repl`, plus
+  an automatic trigger inside `AgentSession::prompt`'s own loop), parity
+  with `prime-agent`'s `compaction.md`. Previously listed here as an
+  identified-but-unstarted gap: "a real omission specifically because
+  `session_autonomous`, `session schedule --every`, and `rlm_heartbeat()`/
+  `/heartbeat` all exist to keep a session running indefinitely... none of
+  them has any mitigation for the context eventually overflowing the
+  provider's own window". `prime-agent`'s own trigger compares real
+  tracked token usage against a real per-model context window; this
+  project has neither (`provider::parse_response` never reads
+  `rp-server`'s `usage` field, and no per-model context-window catalog
+  exists), so `maybe_compact` uses a single fixed, deliberately
+  approximate token estimate instead (`text.len() / 4`, overridable via
+  `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`/
+  `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS`) -- exact enough to
+  decide "should compaction fire", not exact enough to enforce a hard
+  budget a real token-aware client would. `EchoProvider` sessions
+  (`state.model.is_none()`) never trigger it automatically and treat a
+  manual `session compact`/`/compact` as a plain, honest no-op ("nothing
+  to compact") -- there's no real model to ask for a summary, and
+  `EchoProvider` never risks a real context-window overflow anyway.
 
-## Out of scope for this project's current shape
+  `transcript.jsonl` is never rewritten, truncated, or replayed
+  differently -- compaction only changes what `build_turns` sends to the
+  provider on the *next* prompt (a synthetic `TurnRole::System` turn
+  carrying the running summary, replacing everything at or before the
+  compacted boundary); `session attach`/`session repl` still show every
+  turn that ever happened, preserving `session.rs`'s own "full JSONL
+  replay, single source of truth" load-bearing decision untouched. A
+  fresh `Role::System` transcript entry ("(compacted N turns into a
+  running summary)") is appended each time compaction actually fires, so
+  it's visible in the durable record too, not just inferred from the
+  provider-facing turns. Re-summarized, not appended, on each fire: the
+  summarization call is given the previous summary (if any) plus the
+  newly-old turns, so `CompactionState::summary` always covers everything
+  up through its boundary in one piece.
+
+  Verified against a real model in this sandbox
+  (`ollama_provider_compacts_after_crossing_the_trigger_threshold`,
+  `#[ignore]`d for the same real-infra reasons as this file's other
+  `ollama_provider.rs` tests): with the trigger/keep-recent thresholds set
+  tiny via the env-var overrides above, two real prompts against
+  `qwen2.5:0.5b` produced a genuine model-written summary and the expected
+  transcript marker.
+
+  Explicitly not implemented: real per-provider token accounting (would
+  need `rp-server`'s `usage` field parsed and a per-model context-window
+  catalog neither exists today), a growing chain of separate summaries
+  (deliberately re-summarized into one running summary instead, see
+  above), and any interaction with `session_autonomous`'s own turn/time
+  budget (compaction is orthogonal to that loop, not a third stop
+  condition).
+
+## Identified gaps, not yet started
+
+Surfaced by a documentation-level review of `prime-agent`'s real docs
+(`packages/coding-agent/docs/*.md`, 35 files) rather than source
+reading -- unlike "Needs a new subsystem" below, each of these fits this
+project's existing shape without a new subsystem. None has been scoped
+or implemented yet.
+
+- **RPC mode** (`--mode rpc`). `prime-agent`'s `rpc.md` describes a
+  bidirectional JSON-RPC channel over stdin/stdout (`set_model`,
+  `cycle_model`, `steer`, `follow_up`, `abort`, `bash`, `compact`, ...)
+  for embedding `prime-agent` inside another program. This project's
+  `--mode json` is one-way: it dumps the wire-protocol event stream, but
+  there's no single command channel a client can write back through
+  besides the ordinary `Request`/`Response` calls `client.rs` already
+  makes over `daemon.sock`. Same transport this project already has
+  (JSONL over a socket) -- the gap is a designed command surface, not new
+  plumbing.
+- **Interval-repeating heartbeats.** `prime-agent`'s heartbeats
+  (`long-running-agents.md`) support `every <interval>` with a label,
+  plus list/pause/resume/clear. This project's `rlm_heartbeat()`/
+  `/heartbeat` (see "Medium-effort" above) fire exactly once per manual
+  call -- there's no repeating variant. `schedule.rs` already has
+  `ScheduleKind::Every { interval_ms }` for `session schedule add
+  --every`; `trigger_heartbeat` reusing that instead of always sending
+  `ScheduleKind::Once` is the shape of the fix, just not attempted yet.
+
+## Needs a new subsystem
 
 Architecturally significant `prime-agent` capabilities that would each
-require a genuinely new subsystem (a Python control environment) -- not
+require a genuinely new subsystem this project has no analog of (most a
+Python control environment, one an account/identity system) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
@@ -684,6 +765,59 @@ attempted here, and not silently implied by anything in
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
   read-a-line/send-a-prompt loop underneath the TUI itself is done --
   `session repl`, see the medium-effort section above.)
+- **`/login`**, an in-session OAuth-style flow to Prime Intellect's own
+  hosted account system. `prime-agent`'s own
+  [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md)
+  presents `/login` and setting an API key beforehand
+  (`export ANTHROPIC_API_KEY=...`) as two alternative paths to the same
+  destination -- a configured model backend. This project only ever had
+  the second path: `rp_server.rs` reads `OPENAI_API_KEY`/
+  `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GROQ_API_KEY` straight from the
+  environment (see the "Medium-effort" section's provider-selection
+  entry above). There's no Prime Intellect account for a local
+  single-user harness to log into, and no other identity/account system
+  this project has ever needed. Unlike the rest of this section, the
+  missing subsystem isn't a Python control environment -- it's an OAuth
+  client plus somewhere real to send it, and there's nothing on the
+  other end for this project to authenticate against.
+- **ACP mode** (Agent Client Protocol). `prime-agent`'s `--mode acp`
+  speaks JSON-RPC 2.0 to editor integrations (Zed, VS Code). This is an
+  editor-ecosystem integration surface this project has never targeted --
+  there's no editor plugin on the other end to talk to, the same
+  reasoning the `/login` bullet above uses for having no account to log
+  into.
+- **An embeddable SDK** (`createAgentSession()`, custom tools via
+  `defineTool()`, programmatic model/auth configuration). Would need this
+  project to become a library crate rather than a binary-only one --
+  `Cargo.toml` has no `[lib]` target today. A real, nameable architectural
+  change, not attempted.
+- **A tree-structured session data model** (`/tree`/`/fork`/`/clone`'s
+  underlying `id`/`parentId`/active-leaf JSONL structure, see
+  `session-format.md`). Deeper than the already-cut TUI commands
+  themselves: this project's session state (`state.json`/
+  `transcript.jsonl`) is linear, one worker owning one line of turns, and
+  branching would change that data model, not just add REPL commands on
+  top of it.
+- **Context files** (`AGENTS.md`/`CLAUDE.md` auto-loaded from a global
+  dir and walked up from the current directory, `SYSTEM.md`/
+  `APPEND_SYSTEM.md` system-prompt overrides). No equivalent exists here;
+  a session only ever gets the text passed to `session new`/`session
+  prompt`, plus whatever the Continual Harness accumulates on top.
+- **A `settings.json` config file** (project + global, merged). Every
+  knob in this project is a CLI flag or an env var, set fresh per
+  invocation -- there's no persistent, mergeable config file layer
+  underneath them.
+- **`auth.json` with shell-command key resolution** (e.g.
+  `"key": "!security find-generic-password ..."`). This project only
+  ever reads a key from a literal env var (`rp_server.rs`'s
+  `write_config`, see the "Medium-effort" section's provider-selection
+  entry above) -- there's no indirection layer for resolving a key via an
+  arbitrary shell command.
+- **Custom / arbitrary OpenAI-compatible provider registration.** No way
+  to point at an arbitrary base URL; `rp-server`'s own compiled-in
+  provider list is the only surface, and this project has no extension
+  mechanism (see the "Extensions" bullet above) to register a new one at
+  runtime.
 
 ## Process
 

@@ -17,6 +17,25 @@
 
 mod common;
 
+use std::process::Command;
+
+/// Like `common::run`, but with extra environment variables set on the
+/// child process only (no global `std::env::set_var`, which would race
+/// other tests in this same binary running concurrently) -- mirrors
+/// `tests/skills.rs`'s own identical helper.
+fn run_with_env(
+    state_dir: &std::path::Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut cmd = Command::new(common::bin());
+    cmd.args(args).env("RUSTY_PRIME_AGENT_HOME", state_dir);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run harness")
+}
+
 #[test]
 #[ignore]
 fn ollama_provider_answers_a_real_prompt_end_to_end() {
@@ -190,6 +209,62 @@ fn ollama_provider_can_round_trip_a_real_mcp_tool_call() {
     assert!(
         snapshot.contains("\"role\":\"tool\""),
         "expected a Role::Tool transcript entry (a real MCP tool call happened), got: {snapshot}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// Real end-to-end proof of `session::AgentSession::maybe_compact`/
+/// `compact_now` -- see `tests/compaction.rs` for the CI-safe no-op
+/// coverage (no `--model`, nothing to summarize with); this is the
+/// other half, a real model actually producing a summary. Deliberately
+/// `#[ignore]`d for the same infra reasons as this file's other tests.
+/// `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`/
+/// `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS` are set tiny (on
+/// `daemon start`, so the *worker* process -- not this CLI client --
+/// inherits them, same reasoning `tests/skills.rs`'s own
+/// `RUSTY_PRIME_AGENT_IPYTHON_BIN` override doc comment gives) so a
+/// single real exchange is already enough to cross the trigger, rather
+/// than needing thousands of tokens of real conversation first.
+#[test]
+#[ignore]
+fn ollama_provider_compacts_after_crossing_the_trigger_threshold() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-compaction-e2e");
+    let daemon_out = run_with_env(
+        state_dir.path(),
+        &["daemon", "start"],
+        &[
+            ("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS", "20"),
+            ("RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS", "5"),
+        ],
+    );
+    common::assert_success("daemon start", &daemon_out);
+
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+    common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "Say hello in one short sentence.",
+    );
+    common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "Now say goodbye in one short sentence.",
+    );
+
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let snapshot = lines.join("\n");
+    assert!(
+        snapshot.contains("(compacted") && snapshot.contains("into a running summary)"),
+        "expected a Role::System transcript entry documenting a real compaction, got: {snapshot}"
     );
 
     common::daemon_shutdown(state_dir.path());

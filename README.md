@@ -18,8 +18,8 @@ tool-calling/MCP integration, and a real persistent IPython kernel for
 its RLM programming model) -- without attempting to reimplement
 `prime-agent` itself. See
 [`PARITY.md`](PARITY.md) for exactly what's mirrored, what's a
-deliberate simplification, and what's out of scope for this project's
-current shape, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
+deliberate simplification, and what's not yet implemented in this
+project's current shape, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
 pieces fit together internally.
 
 ## Build
@@ -118,7 +118,18 @@ harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>
 harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
+harness session compact <id> [instructions...]   # force compaction now
 ```
+
+Sessions with a real `--model` automatically compact their own context
+once it grows past a size threshold -- older turns get folded into a
+running summary the model itself writes, without touching the durable
+transcript (`session attach` still shows everything). `session compact`
+forces it immediately instead of waiting for the automatic trigger,
+optionally focused with free-text `instructions` (parity with
+`prime-agent /compact [instructions]`). A no-op, not an error, on a
+session with no `--model` set (nothing to summarize with) or nothing old
+enough to fold away yet.
 
 ### Scheduling
 
@@ -231,7 +242,8 @@ EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
 existing transcript first. A line that's exactly `/heartbeat` manually
 re-enters the session's `Active` goal right away (`"Continue working
 toward the goal: ..."`) -- with no active goal, it prints an explanation
-and sends nothing.
+and sends nothing. A line that's `/compact` or `/compact <instructions>`
+forces context compaction immediately, same as `session compact`.
 
 ### Model providers
 
@@ -271,4 +283,4 @@ instead of the built-in echo provider.
   layout, dependency stack.
 - [`PARITY.md`](PARITY.md) -- what's mirrored from `prime-agent`, what's
   a bounded/simplified version of a larger feature, and what's
-  genuinely out of scope for this project's shape.
+  genuinely not yet implemented for this project's shape.

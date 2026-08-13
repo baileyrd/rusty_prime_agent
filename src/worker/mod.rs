@@ -311,6 +311,14 @@ async fn handle_private_connection(
             conn.write_response(Context::Worker, &Response::SessionRenameAck { name })
                 .await
         }
+        Request::SessionCompact { instructions, .. } => {
+            let (compacted, summary) = session.lock().await.compact_now(instructions).await?;
+            conn.write_response(
+                Context::Worker,
+                &Response::SessionCompactAck { compacted, summary },
+            )
+            .await
+        }
         Request::GoalUpdate { action, .. } => {
             let goal = session.lock().await.update_goal(action).await?;
             conn.write_response(Context::Worker, &Response::GoalUpdateAck { goal })

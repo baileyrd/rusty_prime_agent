@@ -83,6 +83,13 @@ pub enum Command {
         session_id: String,
         name: Option<String>,
     },
+    /// `harness session compact <id> [instructions...]` -- parity with
+    /// `prime-agent /compact [instructions]`. See
+    /// `protocol::Request::SessionCompact`'s own doc comment.
+    SessionCompact {
+        session_id: String,
+        instructions: Option<String>,
+    },
     /// `harness session schedule add <id> (--at TIME|--every DURATION)
     /// <text...>` -- parity with `prime-agent schedule add`.
     ScheduleAdd {
@@ -364,6 +371,21 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     name: Some(name),
                 })
             }
+            Some("compact") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session compact` requires a session id"))?;
+                let instructions: Vec<String> = it.cloned().collect();
+                Ok(Command::SessionCompact {
+                    session_id,
+                    instructions: if instructions.is_empty() {
+                        None
+                    } else {
+                        Some(instructions.join(" "))
+                    },
+                })
+            }
             Some("schedule") => parse_schedule(&mut it),
             Some("goal") => parse_goal(&mut it),
             Some("autonomous") => parse_autonomous(&mut it),
@@ -458,7 +480,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 Ok(Command::SessionRepl { session_id })
             }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -490,7 +512,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, `skill list`, `model list`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, `skill list`, `model list`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }

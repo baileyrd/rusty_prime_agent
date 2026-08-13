@@ -199,6 +199,10 @@ async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRename { session_id, name } => {
             client::session_rename(&state_root, session_id, name, output_mode).await
         }
+        cli::Command::SessionCompact {
+            session_id,
+            instructions,
+        } => client::session_compact(&state_root, session_id, instructions, output_mode).await,
         cli::Command::ScheduleAdd {
             session_id,
             text,
