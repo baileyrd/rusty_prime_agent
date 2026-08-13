@@ -741,18 +741,34 @@ daemon/worker split rather than requiring the Python control environment:
   rpc <id> </dev/null` could exit with no output whatsoever depending on
   scheduling. Doing the first attach round trip inline first, then
   handing the *already-connected* stream to the background task for
-  everything after, makes the initial snapshot deterministic; only
-  events after that point are genuinely concurrent with (and thus
-  best-effort relative to) the stdin loop, an honest limitation any
-  fire-and-forget background stream has. The foreground loop reads one
-  stdin line at a time, each wrapped in its own `spawn_blocking` call
-  (not one long-lived blocking task) so the loop stays `.await`-able
-  between reads, parses it as a `Request`, dispatches it over an
-  ordinary one-shot connection, and prints the `Response`.
-  `Request::SessionAttach` sent as a command is rejected locally with an
-  explanatory error rather than forwarded -- this mode already streams
-  that session's events automatically, and the one-shot dispatcher isn't
-  built to drain a second, redundant streaming connection. Ends at stdin
+  everything after, makes the initial snapshot deterministic. The
+  foreground loop reads one stdin line at a time, each wrapped in its
+  own `spawn_blocking` call (not one long-lived blocking task) so the
+  loop stays `.await`-able between reads, parses it as a `Request`,
+  dispatches it over an ordinary one-shot connection, and prints the
+  `Response`. `Request::SessionAttach` sent as a command is rejected
+  locally with an explanatory error rather than forwarded -- this mode
+  already streams that session's events automatically, and the one-shot
+  dispatcher isn't built to drain a second, redundant streaming
+  connection.
+
+  A second real race, this one caught by CI rather than manual testing
+  (macOS specifically): a single piped command's own `SessionEvent`s can
+  still be sitting unread on the background lane's socket when stdin
+  hits EOF and this function would otherwise return immediately --
+  `harness session rpc <id>` given exactly one command line could print
+  the command's `Response` but exit before ever printing the `turn`
+  events that same command produced. Not provider/network latency (by
+  the time a `Response` is printed, its `SessionEvent`s are already
+  broadcast -- see `session::AgentSession::append`), purely this
+  process's own task-scheduling latency -- so a bounded 300ms grace sleep
+  after the stdin loop ends, before actually returning, closes the
+  common single-command case deterministically (confirmed with 8
+  back-to-back local runs after the fix). An event from something other
+  than a just-dispatched command (a concurrent schedule firing, another
+  attached client's own prompt) can still race process exit -- an honest
+  limitation no fixed grace window fully closes, and the one genuinely
+  remaining best-effort edge in this design. Ends at stdin
   EOF, same convention `session_repl` already uses.
 
   Explicitly not implemented: everything in `rpc.md`'s much larger

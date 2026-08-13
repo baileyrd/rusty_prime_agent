@@ -501,9 +501,9 @@ pub async fn session_message(
 ///   the exact same event stream `--mode json session attach` produces,
 ///   just delivered automatically instead of requiring a second CLI
 ///   invocation. Anything after the initial snapshot is genuinely
-///   concurrent with (and thus best-effort relative to) the stdin loop
-///   below -- an event racing the process's own exit can be missed, the
-///   same honest limitation any fire-and-forget background stream has.
+///   concurrent with the stdin loop below -- see the grace-window
+///   comment at the end of this function for a real race CI caught here
+///   and how it's closed for the common case.
 /// - The foreground loop reads one line at a time from stdin (each read
 ///   wrapped in its own `spawn_blocking` call, not one long-lived
 ///   blocking task, so the loop stays fully `.await`-able between
@@ -578,6 +578,23 @@ pub async fn session_rpc(state_root: &Path, session_id: String) -> Result<()> {
         let _guard = stdout_lock.lock().await;
         print_json(&response);
     }
+
+    // A bounded grace window before actually exiting, real race caught
+    // in CI: by the time a command's own `Response` was printed above,
+    // any `SessionEvent`s it produced are already sitting on the
+    // background lane's own socket -- the worker broadcasts them
+    // synchronously as part of the very call that produced the response
+    // (see `session::AgentSession::append`). So the remaining race isn't
+    // provider/network latency, it's purely whether *this process's own*
+    // background task has been scheduled yet to read and print them --
+    // with a single piped command, stdin can hit EOF and this function
+    // can return before that ever happens. This sleep gives it a real
+    // chance to run first, closing the common single-command case
+    // deterministically; an event from something other than a
+    // just-dispatched command (a concurrent schedule firing, another
+    // attached client's own prompt) can still race process exit, an
+    // honest limitation no fixed grace window fully closes.
+    rusty_tokio::time::sleep(Duration::from_millis(300)).await;
     Ok(())
 }
 

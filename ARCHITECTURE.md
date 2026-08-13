@@ -282,8 +282,9 @@ plain no-op -- there's no real model to summarize with.
 ## RPC mode
 
 Parity with `prime-agent --mode rpc` -- see `PARITY.md` for the full
-story, including the initial-attach ordering fix a real concurrency race
-in manual testing forced. `client::session_rpc` (`session rpc <id>`)
+story, including two real concurrency races (one found in manual
+testing, one caught by CI on macOS) and how each was closed.
+`client::session_rpc` (`session rpc <id>`)
 reuses the wire protocol's own `Request`/`Response`/`SessionEvent` types
 directly as its command/event vocabulary rather than inventing a second
 schema the way `prime-agent`'s own ~30-command RPC surface is. Two
@@ -296,7 +297,11 @@ same connection moves into a background task that keeps streaming
 reads one stdin line at a time (each read its own `spawn_blocking` call,
 so the loop stays `.await`-able between reads), dispatches it as a
 `Request` over an ordinary one-shot connection, and prints the
-`Response`. Ends at stdin EOF, same convention `session_repl` uses.
+`Response`. Ends at stdin EOF (after a bounded 300ms grace sleep so the
+background lane gets one real chance to drain events the last command
+already produced -- see `PARITY.md` for why this is closing this
+process's own scheduling latency, not waiting on the provider), same
+convention `session_repl` uses.
 
 ## Known gaps
 
