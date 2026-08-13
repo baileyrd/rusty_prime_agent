@@ -61,6 +61,39 @@ fn rp_server_bin() -> std::ffi::OsString {
     std::env::var_os("RUSTY_PRIME_AGENT_RP_SERVER_BIN").unwrap_or_else(|| "rp-server".into())
 }
 
+/// Whether [`rp_server_bin`] can actually be found -- used by `harness
+/// doctor` to report a real, otherwise-silent gap ahead of time (today,
+/// a missing `rp-server` only ever surfaces as a spawn error the first
+/// time `ensure_running` needs it). Deliberately doesn't *run*
+/// `rp-server` to check (no `--version`/`--help` probe) -- this project
+/// doesn't control that binary's own CLI surface, so invoking it with an
+/// arbitrary flag on the strength of a guess would be unsafe; existence
+/// on disk is all a health check needs.
+///
+/// A bin name containing a path separator (an explicit path, e.g. via
+/// `RUSTY_PRIME_AGENT_RP_SERVER_BIN=/opt/rp-server/bin/rp-server`, the
+/// same override this whole module's own tests use to avoid depending
+/// on a real `rp-server` install) is checked directly, the same
+/// "used as-is, not `PATH`-searched" rule every shell already follows
+/// for a name that isn't bare. A bare name is searched across `PATH`
+/// (`std::env::split_paths`), trying the bare name and (on Windows,
+/// where executables conventionally carry an extension the bare name
+/// might omit) `<name>.exe` in each directory.
+pub(crate) fn rp_server_available() -> bool {
+    let bin = rp_server_bin();
+    let bin_path = Path::new(&bin);
+    if bin_path.components().count() > 1 {
+        return bin_path.is_file();
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        dir.join(&bin).is_file()
+            || (cfg!(windows) && dir.join(format!("{}.exe", bin.to_string_lossy())).is_file())
+    })
+}
+
 /// Where `[providers.ollama]` in the generated config points -- Ollama's
 /// own OpenAI-compatible endpoint, not `rp-server`'s. Configurable since
 /// a real deployment might run Ollama somewhere other than this same

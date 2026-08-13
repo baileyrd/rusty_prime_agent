@@ -315,6 +315,9 @@ impl Supervisor {
                 self.handle_session_compact(&mut conn, session_id, instructions)
                     .await
             }
+            Request::SessionInterrupt { session_id } => {
+                self.handle_session_interrupt(&mut conn, session_id).await
+            }
             Request::SessionExtensionCommand {
                 session_id,
                 command,
@@ -1184,6 +1187,38 @@ impl Supervisor {
                 HarnessError::protocol(
                     Context::Worker,
                     "worker closed before responding to compact",
+                )
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    /// Relays `Request::SessionInterrupt` to the owning worker unchanged
+    /// -- same `resolve_worker`/connect/forward/relay shape every other
+    /// session-scoped request here already has. See that request's own
+    /// doc comment for why the *worker's* own handler deliberately never
+    /// takes the session lock; nothing about this daemon-side relay
+    /// changes as a result -- it's a plain request/response round trip
+    /// like any other from this side.
+    async fn handle_session_interrupt(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(Context::Worker, &Request::SessionInterrupt { session_id })
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to interrupt",
                 )
             })?;
         conn.write_response(Context::Daemon, &response).await

@@ -263,6 +263,41 @@ pub enum Command {
     Update {
         force: bool,
     },
+    /// `harness doctor [--fix]` -- bounded, honest parity with
+    /// `prime-agent doctor [--fix]`. See `doctor`'s own module doc
+    /// comment for exactly what's checked and what `--fix` does and
+    /// doesn't do. Does not require a daemon first -- reachability is
+    /// one of the things it checks.
+    Doctor {
+        fix: bool,
+    },
+    /// `harness session heartbeat <id> [--every DURATION]` -- a
+    /// top-level CLI entry point into the same re-entry mechanism
+    /// `session_repl`'s own `/heartbeat`/`/heartbeat every <duration>`
+    /// already cover, for a caller who wants it without an interactive
+    /// REPL session (parity with `session compact`/`/compact` already
+    /// existing as both). See `client::session_heartbeat`'s own doc
+    /// comment for exactly how.
+    SessionHeartbeat {
+        session_id: String,
+        /// Already parsed to milliseconds at CLI-parse time (a bad
+        /// `--every` value is a usage error, exactly like `session
+        /// schedule add --every`'s own `parse_duration_ms(&e)?` --
+        /// unlike `session_repl`'s own tolerant `/heartbeat every
+        /// <duration>` line, which prints and keeps the REPL running on
+        /// a bad value instead of exiting).
+        every: Option<u64>,
+    },
+    /// `harness session interrupt <id>` -- bounded parity with a slice
+    /// of `prime-agent`'s "steering": requests that an in-flight
+    /// `session prompt`/`/heartbeat`-triggered multi-round tool-calling
+    /// loop stop *before its next round* rather than continuing to a
+    /// natural finish or the `MAX_TOOL_ROUNDS` cap. See
+    /// `protocol::Request::SessionInterrupt`'s own doc comment for
+    /// exactly what this can and can't cancel.
+    SessionInterrupt {
+        session_id: String,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -466,6 +501,24 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     },
                 })
             }
+            Some("heartbeat") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session heartbeat` requires a session id"))?;
+                let rest: Vec<&String> = it.collect();
+                let every = scan_named_flag(&rest, "--every")?
+                    .map(|v| parse_duration_ms(&v))
+                    .transpose()?;
+                Ok(Command::SessionHeartbeat { session_id, every })
+            }
+            Some("interrupt") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session interrupt` requires a session id"))?;
+                Ok(Command::SessionInterrupt { session_id })
+            }
             Some("fork") => {
                 let session_id = it
                     .next()
@@ -625,7 +678,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 Ok(Command::SessionRpc { session_id })
             }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -659,10 +712,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
             let force = rest.iter().any(|a| a.as_str() == "--force");
             Ok(Command::Update { force })
         }
+        Some("doctor") => {
+            let rest: Vec<&String> = it.collect();
+            let fix = rest.iter().any(|a| a.as_str() == "--fix");
+            Ok(Command::Doctor { fix })
+        }
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, `doctor [--fix]`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }

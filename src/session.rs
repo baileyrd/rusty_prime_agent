@@ -281,6 +281,14 @@ pub struct AgentSession {
     /// ordinary session with no extensions (or none using this hook)
     /// never pays anything for a feature it doesn't use.
     has_pre_tool_call_hook: bool,
+    /// Bounded parity with a slice of `prime-agent`'s "steering" -- see
+    /// `protocol::Request::SessionInterrupt`'s own doc comment for the
+    /// full design and [`cancel_flag`](Self::cancel_flag) for why this
+    /// is an `Arc` rather than a plain `bool`. Cleared at the start of
+    /// every [`prompt_with_images_inner`](Self::prompt_with_images_inner)
+    /// call so a flag set (or left set) after one turn already finished
+    /// can never leak into cancelling an unrelated later one.
+    cancel_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Creation-time-only metadata for a brand-new session -- bundled so
@@ -399,6 +407,7 @@ impl AgentSession {
             pending_recovery_marker: None,
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
+            cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         session.write_state().await?;
         // Opt-in, local-only telemetry -- see `telemetry`'s own module
@@ -463,6 +472,7 @@ impl AgentSession {
             pending_recovery_marker: None,
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
+            cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         session.write_state().await?;
         Ok(session)
@@ -579,11 +589,39 @@ impl AgentSession {
         images: Option<Vec<String>>,
         tool_rounds: &mut u32,
     ) -> Result<TranscriptEntry> {
+        // Cleared here, not just relied on to already be `false` -- see
+        // `cancel_requested`'s own doc comment for why a flag left set
+        // after a prior, already-finished turn must never leak into
+        // cancelling this new one.
+        self.cancel_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.append_user_turn_with_images(text, images).await?;
         let tools = self.enabled_tool_defs().await?;
 
         const MAX_TOOL_ROUNDS: usize = 8;
         for _ in 0..MAX_TOOL_ROUNDS {
+            // Bounded parity with a slice of `prime-agent`'s "steering"
+            // -- see `protocol::Request::SessionInterrupt`'s own doc
+            // comment for exactly what this can and can't stop. Checked
+            // once per round, before any work for that round starts, so
+            // a session already generating its final text reply for this
+            // round still finishes it -- there's no round boundary left
+            // to check at until the *next* one.
+            if self
+                .cancel_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return self
+                    .append(
+                        Role::Assistant,
+                        "(cancelled -- `session interrupt` stopped this turn before its next tool-call round)".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
             *tool_rounds += 1;
             self.maybe_compact().await?;
             let turns = self.build_turns();
@@ -709,6 +747,17 @@ impl AgentSession {
     pub fn install_extension_registry(&mut self, registry: crate::extensions::ExtensionRegistry) {
         self.registered_commands = registry.commands;
         self.has_pre_tool_call_hook = registry.has_pre_tool_call_hook;
+    }
+
+    /// A clone of this session's own cancel flag -- an `Arc`, not a
+    /// plain `bool`, specifically so `worker::run` can hand a copy to
+    /// `Request::SessionInterrupt`'s own handler *before* wrapping this
+    /// session in its `Arc<Mutex<_>>`, letting that handler set the flag
+    /// without ever taking the session lock (which an in-flight prompt
+    /// already holds for its whole duration -- see `protocol::Request::
+    /// SessionInterrupt`'s own doc comment).
+    pub fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.cancel_requested.clone()
     }
 
     /// Runs every registered `pi.on("pre_tool_call", handler)` hook (in
@@ -3479,6 +3528,125 @@ mod tests {
             .find(|e| e.role == Role::User)
             .expect("a user entry should exist");
         assert_eq!(user_entry.images, None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A `ModelProvider` test double that always requests a real,
+    /// harmless tool call (`list_dir`) instead of ever replying with
+    /// plain text -- unlike `EchoProvider` (which never emits
+    /// `ToolCalls` at all, see that type's own doc comment), this exists
+    /// specifically to drive `prompt_with_images_inner`'s multi-round
+    /// loop for real, so the cancel primitive
+    /// (`protocol::Request::SessionInterrupt`'s own doc comment) has an
+    /// actual second round to be caught before. `cancel_flag` starts
+    /// empty and is filled in by the test itself right after session
+    /// creation (the flag doesn't exist yet at provider-construction
+    /// time -- `AgentSession::create` is what allocates it); the first
+    /// `respond` call sets it, simulating an interrupt landing while
+    /// that round's provider call was in flight, so it's the *second*
+    /// round's own pre-round check that has to catch it -- the same
+    /// sequencing a real `session interrupt` racing a real in-flight
+    /// call would have.
+    struct AlwaysToolCallsProvider {
+        cancel_flag:
+            std::sync::Arc<std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ModelProvider for AlwaysToolCallsProvider {
+        fn respond<'a>(
+            &'a mut self,
+            _turns: &'a [ChatTurn],
+            _tools: &'a [ToolDef],
+        ) -> crate::tool_runtime::BoxFuture<'a, Result<ProviderResponse>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(flag) = self.cancel_flag.get() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Box::pin(async move {
+                Ok(ProviderResponse {
+                    reply: ProviderReply::ToolCalls(vec![ToolCallRequest {
+                        id: "call-1".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments: r#"{"path": "."}"#.to_string(),
+                    }]),
+                    usage: None,
+                })
+            })
+        }
+    }
+
+    #[rusty_tokio::test]
+    async fn an_interrupt_requested_mid_turn_stops_before_the_next_round() {
+        let root = temp_state_root("interrupt-mid-turn");
+        let cancel_cell = std::sync::Arc::new(std::sync::OnceLock::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = AlwaysToolCallsProvider {
+            cancel_flag: cancel_cell.clone(),
+            calls: calls.clone(),
+        };
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-interrupt-mid-turn".to_string(),
+            NewSessionMeta::default(),
+            Box::new(provider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+        cancel_cell
+            .set(session.cancel_flag())
+            .expect("cell should still be empty");
+
+        let entry = session.prompt("do something".to_string()).await.unwrap();
+
+        assert!(
+            entry.text.contains("cancelled"),
+            "expected a cancellation notice, got: {entry:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the provider should only have been called once -- the second round should have been \
+             stopped by the cancel check before ever calling it"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A cancel flag left `true` from some earlier context (a prior,
+    /// already-finished turn's own cancellation; a `session interrupt`
+    /// that raced a turn which finished before the check ever ran) must
+    /// not leak into cancelling an unrelated *new* turn -- proven here
+    /// with plain `EchoProvider`, no custom test double needed: the flag
+    /// is set by hand before calling `prompt`, and since `EchoProvider`
+    /// always replies with plain text on its very first call, a leaked
+    /// cancellation would be visible immediately as a "cancelled" reply
+    /// instead of the real echoed one.
+    #[rusty_tokio::test]
+    async fn a_flag_left_set_before_a_new_turn_starts_does_not_cancel_it() {
+        let root = temp_state_root("interrupt-no-leak");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-interrupt-no-leak".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session
+            .cancel_flag()
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let entry = session.prompt("hello".to_string()).await.unwrap();
+        assert!(
+            entry.text.contains("echo: hello"),
+            "a stale pre-set flag should have been cleared at the start of this new turn, got: {entry:?}"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
