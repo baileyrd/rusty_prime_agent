@@ -475,6 +475,33 @@ it happened without needing to inspect `state.json` directly.
 and treat a manual `session compact`/`session_repl`'s `/compact` as a
 plain no-op -- there's no real model to summarize with.
 
+**Bounded candidates batch 2** closed three more gaps here directly
+(see `PARITY.md`'s own entry for the full story):
+
+- **Turn-boundary-aware cut points.** `find_compaction_fold_count`'s own
+  backward token-budget walk computes a naive cut index, then hands it
+  to `adjust_fold_count_to_turn_boundary`: if the entry right at that
+  index is a `Role::Tool` result, the cut is pushed forward past every
+  remaining `Role::Tool` entry to the next real `Role::User`/`Role::
+  Assistant` boundary (or all the way to the end of the candidate list,
+  if the tail past the cut turns out to be nothing but trailing tool
+  results). This never separates a tool-call request from its own
+  result -- previously the naive walk had no role awareness at all.
+- **Persisted `instructions`.** `CompactionState` now has a third field,
+  `instructions: Option<String>`, set directly from `compact_now`'s own
+  parameter -- previously received and folded into the summarization
+  prompt but never actually stored, so neither a caller nor a later
+  compaction round re-summarizing on top of this one had any way to see
+  what focus (if any) produced the current `summary`.
+- **`compaction_enabled` settings toggle.** A new `compaction_enabled`
+  function (same `env var -> settings::load -> hardcoded default`
+  precedence shape `compact_trigger_tokens`/`compact_keep_recent_tokens`
+  already have, new `RUSTY_PRIME_AGENT_COMPACTION_ENABLED` env var) is
+  checked as `maybe_compact`'s second early-return, right after the
+  existing `state.model.is_none()` check -- `compact_now` itself never
+  consults it, so an explicit `session compact`/`/compact` still runs
+  even with the automatic trigger turned off.
+
 ## RPC mode
 
 Parity with `prime-agent --mode rpc` -- see `PARITY.md` for the full

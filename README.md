@@ -184,12 +184,19 @@ it.
 Sessions with a real `--model` automatically compact their own context
 once it grows past a size threshold -- older turns get folded into a
 running summary the model itself writes, without touching the durable
-transcript (`session attach` still shows everything). `session compact`
-forces it immediately instead of waiting for the automatic trigger,
-optionally focused with free-text `instructions` (parity with
-`prime-agent /compact [instructions]`). A no-op, not an error, on a
-session with no `--model` set (nothing to summarize with) or nothing old
-enough to fold away yet.
+transcript (`session attach` still shows everything). The cut point
+never lands between a tool call and its own result: if the naive
+token-budget boundary would land there, it's pushed forward to the next
+real turn boundary instead. `session compact` forces it immediately
+instead of waiting for the automatic trigger, optionally focused with
+free-text `instructions` (parity with `prime-agent /compact
+[instructions]`) -- persisted alongside the running summary, so it's
+still visible after the fact, not just folded into the model call that
+produced it. A no-op, not an error, on a session with no `--model` set
+(nothing to summarize with) or nothing old enough to fold away yet.
+Set `"compaction_enabled": false` in `settings.json` to turn off the
+*automatic* trigger entirely (see below) -- `session compact`/`/compact`
+still work on demand either way.
 
 `session fork` creates a brand-new, fully independent session whose
 starting transcript is a copy of `<id>`'s own transcript up through
@@ -358,19 +365,24 @@ on every read (no restart needed):
 {
   "compact_trigger_tokens": 4000,
   "compact_keep_recent_tokens": 1500,
+  "compaction_enabled": true,
   "theme": "dark",
   "telemetry_enabled": false
 }
 ```
 
-Covers the two automatic-compaction thresholds, `theme`, and
-`telemetry_enabled` (parity with `prime-agent`'s own `settings.json`,
-narrower today). An env var still wins when both are set; a missing or
-malformed file is treated as "no settings" rather than an error. Global
-only, same cwd-visibility reason `--runtime ipython` skills and context
-files don't have a project-local tier either. Unlike the two compaction
-fields (checked fresh on every read), `theme` is read once at `session
-repl` startup -- no live reload.
+Covers the two automatic-compaction thresholds, `compaction_enabled`,
+`theme`, and `telemetry_enabled` (parity with `prime-agent`'s own
+`settings.json`, narrower today). An env var still wins when both are
+set; a missing or malformed file is treated as "no settings" rather than
+an error. Global only, same cwd-visibility reason `--runtime ipython`
+skills and context files don't have a project-local tier either. Unlike
+the two compaction fields (checked fresh on every read), `theme` is read
+once at `session repl` startup -- no live reload.
+
+`compaction_enabled` defaults to `true`; set it to `false` to suppress
+only the *automatic* per-round compaction trigger -- `session compact`/
+`/compact` still work on demand regardless.
 
 `telemetry_enabled` is opt-in: absent or `false` (the default) means
 nothing is ever recorded. Set it to `true` and this project appends one

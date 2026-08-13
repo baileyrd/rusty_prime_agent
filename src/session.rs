@@ -167,6 +167,21 @@ fn compact_keep_recent_tokens(state_root: &Path) -> usize {
         .unwrap_or(DEFAULT_COMPACT_KEEP_RECENT_TOKENS)
 }
 
+/// Parity with `prime-agent`'s own `compaction.enabled` settings key --
+/// gates only the *automatic* trigger `maybe_compact` checks every
+/// prompt round, following the exact env-var-then-`settings.json`-then-
+/// default precedence the two functions above already establish.
+/// Manual compaction (`compact_now`, `session compact`/`/compact`) never
+/// consults this -- an explicit request should still be honored
+/// regardless of whether the automatic trigger is turned off.
+fn compaction_enabled(state_root: &Path) -> bool {
+    std::env::var("RUSTY_PRIME_AGENT_COMPACTION_ENABLED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| crate::settings::load(state_root).compaction_enabled)
+        .unwrap_or(true)
+}
+
 /// A deliberately approximate token count: roughly 4 characters per
 /// token, the same rough English-text heuristic used when no real
 /// tokenizer is available. This project has no tokenizer dependency --
@@ -191,10 +206,39 @@ fn find_compaction_fold_count(candidates: &[TranscriptEntry], keep_recent_tokens
     for (i, entry) in candidates.iter().enumerate().rev() {
         recent_tokens += estimate_tokens(&entry.text);
         if recent_tokens > keep_recent_tokens {
-            return i + 1;
+            return adjust_fold_count_to_turn_boundary(candidates, i + 1);
         }
     }
     0
+}
+
+/// Never cut mid-turn or between a tool call and its own result -- the
+/// naive token-budget walk above treats every transcript entry
+/// identically regardless of role, so it can land a cut immediately
+/// after a `Role::Assistant` tool-call-request entry (or between two of
+/// its own `Role::Tool` results), splitting a request from a response
+/// that only make sense read together. If the entry right at
+/// `naive_fold_count` (the first entry that would stay in the "kept,
+/// recent" tail) is a `Role::Tool` result, that's exactly this case --
+/// walk forward past every remaining `Role::Tool` entry to the next real
+/// turn boundary (a `Role::User`/`Role::Assistant` entry, or the end of
+/// `candidates` if the tail is nothing but trailing tool results with no
+/// boundary left to land on). Folding a few extra, already-token-over-
+/// budget entries is the honest tradeoff for never producing a split
+/// that reads as an orphaned tool result with no visible request behind
+/// it.
+fn adjust_fold_count_to_turn_boundary(
+    candidates: &[TranscriptEntry],
+    naive_fold_count: usize,
+) -> usize {
+    let mut fold_count = naive_fold_count;
+    while candidates
+        .get(fold_count)
+        .is_some_and(|e| e.role == Role::Tool)
+    {
+        fold_count += 1;
+    }
+    fold_count
 }
 
 /// Generates a session id unique enough for this project's needs: not
@@ -1682,10 +1726,19 @@ impl AgentSession {
     /// before building the turns that go to the provider. A no-op for
     /// `EchoProvider` sessions (`state.model.is_none()` -- there's no
     /// real model to ask for a summary, and `EchoProvider` never risks a
-    /// real context-window overflow anyway) and for a session whose
-    /// current turns are still under `compact_trigger_tokens()`.
+    /// real context-window overflow anyway), for a session whose current
+    /// turns are still under `compact_trigger_tokens()`, and now for any
+    /// session at all when `compaction_enabled(&self.state_root)` is
+    /// `false` -- a real, explicit off switch where previously the only
+    /// way to suppress automatic compaction was to never configure a
+    /// real model in the first place. Manual compaction (`compact_now`)
+    /// doesn't check this -- a caller explicitly asking for it should
+    /// still get it.
     async fn maybe_compact(&mut self) -> Result<()> {
         if self.state.model.is_none() {
+            return Ok(());
+        }
+        if !compaction_enabled(&self.state_root) {
             return Ok(());
         }
         let turns = self.build_turns();
@@ -1795,6 +1848,7 @@ impl AgentSession {
             compacted_up_to_sequence: new_boundary_seq,
             summary: summary.clone(),
             compacted_at_ms: now_ms(),
+            instructions,
         });
         self.write_state().await?;
         self.append(
@@ -2933,6 +2987,163 @@ mod tests {
     #[test]
     fn find_compaction_fold_count_empty_candidates_folds_nothing() {
         assert_eq!(find_compaction_fold_count(&[], 100), 0);
+    }
+
+    fn entry_with_role(sequence: u64, role: Role, text: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            role,
+            ..entry(sequence, text)
+        }
+    }
+
+    #[test]
+    fn find_compaction_fold_count_never_lands_between_a_tool_call_and_its_result() {
+        let candidates = vec![
+            entry_with_role(1, Role::User, "abcd"),
+            entry_with_role(2, Role::Assistant, ""),
+            entry_with_role(3, Role::Tool, "abcd"),
+            entry_with_role(4, Role::Tool, "abcd"),
+            entry_with_role(5, Role::Assistant, "abcd"),
+        ];
+        // The naive backward walk alone would cut at index 3, right
+        // between the two `Role::Tool` results -- pushed forward to 4,
+        // the next real `Role::Assistant` boundary, instead.
+        assert_eq!(find_compaction_fold_count(&candidates, 2), 4);
+    }
+
+    #[test]
+    fn find_compaction_fold_count_folds_everything_when_the_tail_past_the_cut_is_all_tool_results()
+    {
+        // The naive cut lands inside the tool-call group again, but this
+        // time there's no `User`/`Assistant` entry left after it to land
+        // on -- folds everything rather than leaving a dangling,
+        // boundary-less tail.
+        let candidates = vec![
+            entry_with_role(1, Role::User, "abcd"),
+            entry_with_role(2, Role::Assistant, ""),
+            entry_with_role(3, Role::Tool, "abcd"),
+            entry_with_role(4, Role::Tool, "abcd"),
+        ];
+        assert_eq!(find_compaction_fold_count(&candidates, 1), 4);
+    }
+
+    /// A real, in-process `AgentSession` (no daemon/worker) with
+    /// `state.model` set so `compact_now`'s own early-return doesn't
+    /// short-circuit it, but still backed by `EchoProvider` -- the same
+    /// "construct the session directly, independent of which real
+    /// backend a `--model` flag would normally select" technique
+    /// `build_turns_prepends_the_context_file_as_a_system_turn` above
+    /// already uses. `compact_keep_recent_tokens: 0` (via `settings.
+    /// json`, not the env var this module's own tests below mutate --
+    /// no shared global state to guard here) forces a real fold so
+    /// `compact_now` actually reaches the branch that persists
+    /// `instructions`, not the "nothing old enough yet" no-op path.
+    #[rusty_tokio::test]
+    async fn compact_now_persists_the_supplied_instructions() {
+        let root = temp_state_root("compact-instructions");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compact_keep_recent_tokens": 0}"#,
+        )
+        .unwrap();
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-compact-instructions".to_string(),
+            NewSessionMeta {
+                model: Some("test/model".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session.prompt("hello".to_string()).await.unwrap();
+        let (compacted, _) = session
+            .compact_now(Some("focus on the auth refactor".to_string()))
+            .await
+            .unwrap();
+        assert!(compacted, "expected compaction to actually fold something");
+        assert_eq!(
+            session
+                .state
+                .compaction
+                .as_ref()
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("focus on the auth refactor")
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn maybe_compact_is_a_no_op_when_compaction_is_disabled_even_over_the_trigger_threshold()
+    {
+        let root = temp_state_root("compaction-disabled");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compaction_enabled": false, "compact_trigger_tokens": 0, "compact_keep_recent_tokens": 0}"#,
+        )
+        .unwrap();
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-compaction-disabled".to_string(),
+            NewSessionMeta {
+                model: Some("test/model".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        // compact_trigger_tokens=0 means every prompt would normally
+        // cross the automatic threshold -- compaction_enabled=false
+        // should suppress it regardless.
+        session.prompt("hello".to_string()).await.unwrap();
+        assert!(
+            session.state.compaction.is_none(),
+            "automatic compaction should not have fired while disabled"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn maybe_compact_still_fires_automatically_when_left_enabled() {
+        let root = temp_state_root("compaction-enabled-auto");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compact_trigger_tokens": 0, "compact_keep_recent_tokens": 0}"#,
+        )
+        .unwrap();
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-compaction-enabled-auto".to_string(),
+            NewSessionMeta {
+                model: Some("test/model".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session.prompt("hello".to_string()).await.unwrap();
+        assert!(
+            session.state.compaction.is_some(),
+            "automatic compaction should have fired -- compaction_enabled defaults to on"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Guards the two tests below: both mutate the *same* process-wide

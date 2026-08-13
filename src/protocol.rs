@@ -937,6 +937,17 @@ pub struct CompactionState {
     pub compacted_up_to_sequence: u64,
     pub summary: String,
     pub compacted_at_ms: u64,
+    /// The free-text focus `compact_now`'s own caller supplied (`session
+    /// compact <id> [instructions...]`/`/compact [instructions]`), if
+    /// any -- previously received as a parameter and folded into the
+    /// summarization prompt but never actually stored anywhere, so a
+    /// caller (or a later compaction round re-summarizing on top of this
+    /// one) had no way to see what focus, if any, produced the current
+    /// `summary`. `#[serde(default)]` so a `state.json` persisted before
+    /// this field existed still deserializes -- reads as `None`, the
+    /// same as if no instructions were ever given, not a hard error.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
