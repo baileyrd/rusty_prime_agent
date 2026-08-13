@@ -116,6 +116,9 @@ pub async fn run(args: &[String]) -> Result<()> {
                     // SessionState`.
                     rlm_depth: None,
                     rlm_max_depth: None,
+                    // `session new` (this command) is a plain top-level
+                    // session, never `rlm(...)`-admitted.
+                    spawned_from_sequence: None,
                 },
                 output_mode,
             )
@@ -240,6 +243,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             runtime,
             rlm_depth,
             rlm_max_depth,
+            spawned_from_sequence,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -254,6 +258,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                 runtime,
                 rlm_depth,
                 rlm_max_depth,
+                spawned_from_sequence,
             })
             .await
         }

@@ -29,7 +29,7 @@
 
 use crate::error::{Context, HarnessError, Result};
 use crate::http_client;
-use crate::protocol::ToolCallRequest;
+use crate::protocol::{ToolCallRequest, Usage};
 use crate::tool_runtime::BoxFuture;
 
 /// One turn of the conversation sent to a provider, independent of how
@@ -83,6 +83,18 @@ pub enum ProviderReply {
     ToolCalls(Vec<ToolCallRequest>),
 }
 
+/// One `ModelProvider::respond` call's full result: the reply itself,
+/// plus that same call's own real token accounting when the backend has
+/// one to report. `usage` covers the whole call regardless of which
+/// `ProviderReply` variant came back -- an OpenAI-shaped `usage` object
+/// accounts for the request/response pair, not specifically a text vs.
+/// tool-calls shape.
+#[derive(Debug, Clone)]
+pub struct ProviderResponse {
+    pub reply: ProviderReply,
+    pub usage: Option<Usage>,
+}
+
 /// `Send + Sync`, like `ToolRuntime`: `AgentSession` holds this behind a
 /// `rusty_tokio::sync::Mutex` shared across every connection handler
 /// task the worker spawns, so the compiler needs `&AgentSession`
@@ -94,14 +106,15 @@ pub trait ModelProvider: Send + Sync {
         &'a mut self,
         turns: &'a [ChatTurn],
         tools: &'a [ToolDef],
-    ) -> BoxFuture<'a, Result<ProviderReply>>;
+    ) -> BoxFuture<'a, Result<ProviderResponse>>;
 }
 
 /// Echoes the latest user turn back verbatim, prefixed so a transcript
 /// reader can tell an echoed reply from a real model response at a
 /// glance. Ignores `tools` entirely (never emits `ProviderReply::
 /// ToolCalls`) -- proves the tool-calling plumbing doesn't regress the
-/// default, tool-less path rather than exercising it.
+/// default, tool-less path rather than exercising it. Never reports
+/// `usage` -- there's no real model call to account for.
 #[derive(Debug, Default)]
 pub struct EchoProvider;
 
@@ -110,14 +123,19 @@ impl ModelProvider for EchoProvider {
         &'a mut self,
         turns: &'a [ChatTurn],
         _tools: &'a [ToolDef],
-    ) -> BoxFuture<'a, Result<ProviderReply>> {
+    ) -> BoxFuture<'a, Result<ProviderResponse>> {
         let last_user_text = turns
             .iter()
             .rev()
             .find(|t| t.role == TurnRole::User)
             .and_then(|t| t.content.clone())
             .unwrap_or_default();
-        Box::pin(async move { Ok(ProviderReply::Text(format!("echo: {last_user_text}"))) })
+        Box::pin(async move {
+            Ok(ProviderResponse {
+                reply: ProviderReply::Text(format!("echo: {last_user_text}")),
+                usage: None,
+            })
+        })
     }
 }
 
@@ -221,13 +239,26 @@ impl RustyProviderModel {
 }
 
 /// Parses `rp-server`'s `/v1/chat/completions` response body into a
-/// [`ProviderReply`] -- separated from `respond` for the same
+/// [`ProviderResponse`] -- separated from `respond` for the same
 /// unit-testability reason as `build_request_body`. A `tool_calls` array
 /// on the message (non-empty) wins over `content`, matching OpenAI's own
 /// convention that a tool-calling turn's `content` is typically absent.
-fn parse_response(body: &str) -> Result<ProviderReply> {
+/// `usage` is a top-level sibling of `choices` in the same body
+/// (`rp-server`'s own `core::types::ChatResponse.usage`, an OpenAI-shaped
+/// `{prompt_tokens, completion_tokens, total_tokens, ...}` object) --
+/// `None` when the key is absent entirely; a present-but-malformed
+/// sub-field defaults to `0` rather than failing the whole parse, the
+/// same "don't fail an otherwise-successful reply over a telemetry
+/// nicety" leniency this parser already has for individual `tool_calls`
+/// fields above.
+fn parse_response(body: &str) -> Result<ProviderResponse> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| HarnessError::json(Context::Provider, None, e))?;
+    let usage = value.get("usage").map(|u| Usage {
+        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+    });
     let message = &value["choices"][0]["message"];
     if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
         if !tool_calls.is_empty() {
@@ -245,12 +276,18 @@ fn parse_response(body: &str) -> Result<ProviderReply> {
                         .to_string(),
                 })
                 .collect();
-            return Ok(ProviderReply::ToolCalls(calls));
+            return Ok(ProviderResponse {
+                reply: ProviderReply::ToolCalls(calls),
+                usage,
+            });
         }
     }
     message["content"]
         .as_str()
-        .map(|s| ProviderReply::Text(s.to_string()))
+        .map(|s| ProviderResponse {
+            reply: ProviderReply::Text(s.to_string()),
+            usage,
+        })
         .ok_or_else(|| {
             HarnessError::protocol(
                 Context::Provider,
@@ -264,7 +301,7 @@ impl ModelProvider for RustyProviderModel {
         &'a mut self,
         turns: &'a [ChatTurn],
         tools: &'a [ToolDef],
-    ) -> BoxFuture<'a, Result<ProviderReply>> {
+    ) -> BoxFuture<'a, Result<ProviderResponse>> {
         Box::pin(async move {
             let body = self.build_request_body(turns, tools);
             let (status, body) =
@@ -376,10 +413,12 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "hi there"}}]
         })
         .to_string();
-        match parse_response(&body).unwrap() {
+        let response = parse_response(&body).unwrap();
+        match response.reply {
             ProviderReply::Text(text) => assert_eq!(text, "hi there"),
             other => panic!("expected Text, got {other:?}"),
         }
+        assert!(response.usage.is_none(), "got: {:?}", response.usage);
     }
 
     #[test]
@@ -395,7 +434,7 @@ mod tests {
             }}]
         })
         .to_string();
-        match parse_response(&body).unwrap() {
+        match parse_response(&body).unwrap().reply {
             ProviderReply::ToolCalls(calls) => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_1");
@@ -404,5 +443,18 @@ mod tests {
             }
             other => panic!("expected ToolCalls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_response_extracts_usage_when_present() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi there"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46},
+        })
+        .to_string();
+        let usage = parse_response(&body).unwrap().usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 34);
+        assert_eq!(usage.total_tokens, 46);
     }
 }

@@ -1004,6 +1004,138 @@ daemon/worker split rather than requiring the Python control environment:
   one test still needs `CARGO_BIN_EXE_harness`, still unavailable to a
   lib crate's own `#[cfg(test)]` modules.
 
+  **Later increment: child usage/cost attribution to the parent turn.**
+  Parity with `rlm-runtime.md`: "Prime Agent asynchronously folds the
+  child's assistant usage and cost into the parent assistant turn that
+  launched it," persisting "a `child_usage_attributed` entry containing:
+  the target parent assistant message ID; the child usage being
+  attributed; and the resulting aggregate usage." Closing this honestly
+  required a real foundation first, since it didn't exist anywhere in
+  this project: no `TranscriptEntry` had ever recorded a model call's own
+  token usage, even for the model's *own* turns, let alone a child's.
+  Checked directly against a real `rp-server`-fronted Ollama session
+  before assuming anything: `rp-server`'s own `/v1/chat/completions`
+  response already carries a top-level, OpenAI-shaped `usage:
+  {prompt_tokens, completion_tokens, total_tokens}` object (confirmed via
+  `crates/core/src/types.rs`'s own `Usage` struct in the `rusty_provider`
+  source, then reconfirmed with a live prompt against a real Ollama
+  model) -- this project's own `provider::parse_response` was simply
+  discarding it, not missing a subsystem that didn't exist upstream. So
+  the honest scope here was: read the data that was already there, not
+  invent a token-accounting subsystem from scratch.
+
+  `protocol::Usage { prompt_tokens, completion_tokens, total_tokens }`
+  (with a `+` impl for summing) is the new shared type. `provider::
+  ModelProvider::respond` now returns a `ProviderResponse { reply, usage:
+  Option<Usage> }` instead of a bare `ProviderReply` -- `parse_response`
+  extracts `usage` as a sibling of `choices`, `None` when the key is
+  absent (`EchoProvider` always reports `None`, having made no real
+  call), a malformed sub-field defaulting to `0` rather than failing an
+  otherwise-successful reply over a telemetry nicety. `TranscriptEntry`
+  gains `usage: Option<Usage>`, set on every `Role::Assistant` entry
+  backed by a real model call (`session::AgentSession::prompt`'s tool-
+  calling loop now destructures `ProviderResponse` and threads `usage`
+  through both its `Text`- and `ToolCalls`-reply branches -- one real
+  call's usage covers the whole call either way). The compaction-summary
+  call (`compact_now`) deliberately does *not* record its own usage
+  anywhere: it produces a `Role::System` entry, not the `Role::Assistant`
+  "parent assistant message" this whole mechanism targets, and tracking
+  meta-call usage is a separate concern left untouched here.
+
+  "The target parent assistant message ID" is this project's own
+  `sequence`, not a separate message-id concept: `SessionState` gains
+  `spawned_from_sequence: Option<u64>`, set once, at admission, by
+  `handle_rlm_run` capturing `self.state.last_sequence` -- at that exact
+  point in `prompt`'s tool loop, that's the sequence of the `Role::
+  Assistant` tool-calls entry whose `execute_python` call invoked
+  `rlm(...)`. Unlike `rlm_depth`/`rlm_max_depth`, this can't be resolved
+  server-side by the daemon (only the spawning worker knows its own
+  `last_sequence`), so it travels over the wire as a new `Request::
+  SessionNew::spawned_from_sequence` field, and (since `AgentSession::
+  create`, not `::recover`, is the only place that reads `NewSessionMeta`
+  at all) as a new `--spawned-from-sequence` `__worker-main` flag,
+  `WorkerArgs` field, and `NewSessionMeta` field -- the same cross-
+  process-boundary plumbing `model`/`goal`/`thinking` already established,
+  not the "needed before `bootstrap_kernel` runs" urgency `rlm_depth`/
+  `rlm_max_depth` had. Every other admission path (`session new`,
+  `session spawn`, a fork) leaves it `None`.
+
+  `session::AgentSession::attribute_child_usage(child_id)` is the
+  mechanism itself, called via a new private-transport-only `Request::
+  AttributeChildUsage { child_id }`/`Response::AttributeChildUsageAck {
+  attributed }` pair. No separate registry data structure holds "which
+  children still need attributing" -- idempotency comes entirely from
+  scanning *this session's own* transcript for an existing attribution of
+  `child_id` first (`Ok(false)`, no new entry, if found), the same "check
+  my own durable state" pattern that makes a redundant delivery safe
+  rather than a double-count. `Ok(false)` (not an error) also covers
+  `child_id` not actually being a direct child of this session, or having
+  no `spawned_from_sequence` at all (admitted via `session spawn`, not
+  `rlm(...)` -- nothing to attribute). Otherwise: `child_usage` sums every
+  `usage` in the child's own `transcript.jsonl` (a plain, already-durable
+  read -- "the admission handle does not contain usage or completion
+  data," so this always happens after the fact, never incrementally
+  tracked in memory); `aggregate_usage` adds every *prior* attribution
+  already recorded against the same `parent_message_sequence` (more than
+  one child can be admitted from a single Python cell's assistant turn).
+  A new `Role::System` entry with `child_usage_attributed: Some(...)` set
+  (`TranscriptEntry::child_usage_attributed`, the new "flat struct,
+  optional field per new capability" pattern `tool_calls`/`tool_call_id`
+  already established) is the persisted record -- there's no separate
+  tombstone concept.
+
+  What triggers a delivery: `rlm-runtime.md` itself is vague here ("the
+  specific trigger is not explicitly detailed," only that it's
+  "asynchronous" and happens "after child completion"). This project's
+  own RLM children are ordinary long-running sessions, not a bounded
+  one-shot subprocess the way `rlm-runtime.md`'s own runtime treats them
+  -- there is no "child task finished" event anywhere to hook. The
+  closest real analog this architecture has is "the child's own worker
+  stopped" (whether via `rlm.delete_subagent()`, a direct `session stop`,
+  or a crash), so `daemon::Supervisor::attribute_pending_child_usage`
+  polls for exactly that on the same cadence and in the same loop as
+  `fire_due_schedules` (`SCHEDULE_POLL_INTERVAL`, 5s): for every session
+  with a `parent_id` whose own worker just isn't alive, if that parent is
+  itself `Active` right now, forward `Request::AttributeChildUsage` to
+  the *parent's* own private worker socket (never write to the parent's
+  `transcript.jsonl`/`state.json` directly -- same "only a session's own
+  worker owns its persisted state" invariant `trigger_heartbeat` already
+  established a workaround pattern for). An inactive parent is simply
+  left for a later poll once it's running again, rather than logged as a
+  failure every cycle forever. **A known, accepted inefficiency, recorded
+  rather than glossed over:** there's no separate "already attempted"
+  bookkeeping, so a long-stopped child of a continuously-`Active` parent
+  keeps getting a harmless redundant delivery attempt every cycle for as
+  long as that parent stays up, even after the one real attribution has
+  already landed -- `attribute_child_usage`'s own idempotency check
+  absorbs it every time, at the cost of a cheap, wasted round trip.
+
+  Coverage: two new CI-safe unit tests
+  (`attribute_child_usage_folds_the_childs_usage_into_a_new_parent_entry`,
+  `attribute_child_usage_is_a_no_op_for_a_non_rlm_admitted_child`) prove
+  the mechanism directly -- no daemon or kernel needed, since
+  `attribute_child_usage` only ever touches this session's own in-memory
+  transcript plus plain reads of another (directly-constructed, real)
+  session's already-durable `state.json`/`transcript.jsonl` -- covering
+  real aggregation math (two child turns' usage summed correctly),
+  idempotency (a second call is a safe no-op, not a duplicate entry), and
+  the non-`rlm`-admitted no-op case. A new `parse_response` unit test
+  (`parse_response_extracts_usage_when_present`) proves the wire-parsing
+  half. The daemon-side poll/relay (`attribute_pending_child_usage`/
+  `attribute_one_child_usage`) is not independently re-tested: it reuses
+  `catalog::scan` and the same `transport::connect`/`Request`/`Response`
+  round trip `fire_one_schedule`/`handle_session_stop` already exercise
+  end to end, and (like `handle_rlm_run`/`handle_list_subagents`/
+  `handle_delete_subagent` before it) a genuine end-to-end proof would
+  need a session actually admitted via `rlm(...)` -- the one thing this
+  project's test infrastructure still can't combine with a real daemon in
+  one test, the same documented gap as always. Manually verified in this
+  sandbox instead: a real `session new --model ollama/qwen2.5:0.5b`
+  prompt against a real running `rp-server`/Ollama produced a transcript
+  entry with `"usage":{"prompt_tokens":36,"completion_tokens":8,
+  "total_tokens":44}`, confirming the wire-parsing half end to end
+  against real infrastructure, not just a hand-built fixture.
+
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:
   `session new --runtime ipython` offers an `execute_python` tool
@@ -1204,10 +1336,15 @@ daemon/worker split rather than requiring the Python control environment:
   them has any mitigation for the context eventually overflowing the
   provider's own window". `prime-agent`'s own trigger compares real
   tracked token usage against a real per-model context window; this
-  project has neither (`provider::parse_response` never reads
-  `rp-server`'s `usage` field, and no per-model context-window catalog
-  exists), so `maybe_compact` uses a single fixed, deliberately
-  approximate token estimate instead (`text.len() / 4`, overridable via
+  project originally had neither. **Partially closed since, as a side
+  effect of the RLM child-usage-attribution work (see that entry
+  below):** `provider::parse_response` now reads `rp-server`'s `usage`
+  field and `TranscriptEntry::usage` persists it on every real assistant
+  turn -- but `maybe_compact`'s own trigger still isn't wired to consume
+  it (a separate change, not attempted here), and no per-model context-
+  window catalog exists either, so `maybe_compact` still uses a single
+  fixed, deliberately approximate token estimate instead (`text.len() /
+  4`, overridable via
   `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`/
   `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS`) -- exact enough to
   decide "should compaction fire", not exact enough to enforce a hard
@@ -1240,13 +1377,14 @@ daemon/worker split rather than requiring the Python control environment:
   `qwen2.5:0.5b` produced a genuine model-written summary and the expected
   transcript marker.
 
-  Explicitly not implemented: real per-provider token accounting (would
-  need `rp-server`'s `usage` field parsed and a per-model context-window
-  catalog neither exists today), a growing chain of separate summaries
-  (deliberately re-summarized into one running summary instead, see
-  above), and any interaction with `session_autonomous`'s own turn/time
-  budget (compaction is orthogonal to that loop, not a third stop
-  condition).
+  Explicitly not implemented: wiring `maybe_compact`'s own trigger to the
+  now-real `TranscriptEntry::usage` data instead of the `text.len() / 4`
+  estimate (the data exists now; the trigger logic itself is untouched),
+  a per-model context-window catalog (still doesn't exist), a growing
+  chain of separate summaries (deliberately re-summarized into one
+  running summary instead, see above), and any interaction with
+  `session_autonomous`'s own turn/time budget (compaction is orthogonal
+  to that loop, not a third stop condition).
 - [x] **RPC mode** (`session rpc <id>`), parity with `prime-agent --mode
   rpc`. `prime-agent`'s `rpc.md` describes its own ~30-command custom
   protocol (by its own words, "not JSON-RPC 2.0") over stdin/stdout for

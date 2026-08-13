@@ -8,6 +8,7 @@
 //! -- it only decides *which* worker a request goes to, spawning or
 //! recovering one first when needed, then relays bytes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,9 @@ use crate::catalog;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
-use crate::protocol::{ForkedFrom, Request, Response, SessionEvent, SessionState, SessionStatus};
+use crate::protocol::{
+    ForkedFrom, Request, Response, SessionEvent, SessionState, SessionStatus, SessionSummary,
+};
 use crate::transport::{self, LineStream};
 use crate::worker::{self, WorkerMode};
 
@@ -87,6 +90,10 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
             loop {
                 rusty_tokio::time::sleep(SCHEDULE_POLL_INTERVAL).await;
                 supervisor.fire_due_schedules().await;
+                // Same cadence, same loop -- parity with `rlm-runtime.md`'s
+                // "asynchronously folds the child's ... usage" (see
+                // `attribute_pending_child_usage`'s own doc comment).
+                supervisor.attribute_pending_child_usage().await;
             }
         });
     }
@@ -223,6 +230,10 @@ impl Supervisor {
                 // respawn.
                 rlm_depth: Some(state.rlm_depth),
                 rlm_max_depth: Some(state.rlm_max_depth),
+                // Same "re-read from persisted state, not re-seeded"
+                // treatment -- whether/where this session was `rlm(...)`-
+                // admitted from doesn't change across a respawn either.
+                spawned_from_sequence: state.spawned_from_sequence,
             },
         )
         .await?;
@@ -244,6 +255,7 @@ impl Supervisor {
                 model,
                 goal,
                 parent_id,
+                spawned_from_sequence,
                 thinking,
                 tools,
                 runtime,
@@ -265,6 +277,14 @@ impl Supervisor {
                         // directly.
                         rlm_depth: None,
                         rlm_max_depth: None,
+                        // Unlike `rlm_depth`/`rlm_max_depth`, this one IS
+                        // part of the wire shape -- only the spawning
+                        // worker knows it, the daemon can't derive it
+                        // (see `protocol::SessionState::
+                        // spawned_from_sequence`'s own doc comment) --
+                        // so it's forwarded straight through, not
+                        // resolved here.
+                        spawned_from_sequence,
                     },
                 )
                 .await
@@ -333,6 +353,18 @@ impl Supervisor {
                     Context::Daemon,
                     &Response::Error {
                         message: "WorkerShutdown is only valid on the private worker transport"
+                            .into(),
+                        conflict: false,
+                    },
+                )
+                .await
+            }
+            Request::AttributeChildUsage { .. } => {
+                conn.write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: "AttributeChildUsage is only valid on the private worker \
+                                  transport"
                             .into(),
                         conflict: false,
                     },
@@ -605,6 +637,10 @@ impl Supervisor {
                 // than inheriting `source_state`'s.
                 rlm_depth: None,
                 rlm_max_depth: None,
+                // Same reasoning as `rlm_depth`/`rlm_max_depth` above --
+                // a fork isn't a child `rlm(...)` admitted, so it has no
+                // parent message to ever attribute usage back to.
+                spawned_from_sequence: None,
             },
         )
         .await
@@ -745,6 +781,86 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Parity with `rlm-runtime.md`'s "Prime Agent asynchronously folds
+    /// the child's assistant usage and cost into the parent assistant
+    /// turn that launched it" -- background, automatic, no explicit user
+    /// action needed, mirroring `fire_due_schedules`'s own cadence and
+    /// "scan, act, log-and-continue on a per-item failure" shape. For
+    /// every session with a `parent_id` whose own worker is no longer
+    /// alive (the closest real "the child's task is done" signal this
+    /// project's architecture has -- see `session::AgentSession::
+    /// attribute_child_usage`'s own doc comment), forwards `Request::
+    /// AttributeChildUsage` to the *parent's* own worker, but only when
+    /// that parent is itself `Active` right now -- an inactive parent is
+    /// left for a later poll to catch once it's running again, rather
+    /// than attempted and logged as a failure every cycle forever.
+    ///
+    /// A known, accepted inefficiency, not a correctness bug: there's no
+    /// separate "already attempted" bookkeeping here, so a long-stopped
+    /// child of a continuously-`Active` parent gets a harmless redundant
+    /// delivery attempt every cycle for as long as the parent stays up,
+    /// even after `attribute_child_usage`'s own idempotency check has
+    /// already absorbed the real attribution -- see `PARITY.md`'s own
+    /// entry for why this was accepted rather than engineered around.
+    async fn attribute_pending_child_usage(&self) {
+        let summaries = match catalog::scan(&self.state_root) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("daemon: child-usage-attribution scan failed: {err}");
+                return;
+            }
+        };
+        let by_id: HashMap<&str, &SessionSummary> = summaries
+            .iter()
+            .map(|s| (s.session_id.as_str(), s))
+            .collect();
+        for child in &summaries {
+            let Some(parent_id) = &child.parent_id else {
+                continue;
+            };
+            if child.status == SessionStatus::Active {
+                continue;
+            }
+            let Some(parent) = by_id.get(parent_id.as_str()) else {
+                continue;
+            };
+            if parent.status != SessionStatus::Active {
+                continue;
+            }
+            if let Err(err) = self
+                .attribute_one_child_usage(parent_id, &child.session_id)
+                .await
+            {
+                eprintln!(
+                    "daemon: child-usage attribution for child {} (parent {parent_id}) \
+                     failed: {err}",
+                    child.session_id
+                );
+            }
+        }
+    }
+
+    /// Forwards one `Request::AttributeChildUsage` to `parent_id`'s own
+    /// private worker socket -- the daemon never writes to a session's
+    /// `transcript.jsonl`/`state.json` itself (see `ARCHITECTURE.md`'s
+    /// "only a session's own worker owns its persisted state"
+    /// invariant); this is that same relay pattern `fire_one_schedule`
+    /// already uses for `SessionPrompt`.
+    async fn attribute_one_child_usage(&self, parent_id: &str, child_id: &str) -> Result<()> {
+        let socket_path = paths::worker_socket_path(&self.state_root, parent_id);
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::AttributeChildUsage {
+                    child_id: child_id.to_string(),
+                },
+            )
+            .await?;
+        private.read_response(Context::Worker).await?;
+        Ok(())
     }
 
     /// Fires one due schedule entry as an ordinary internal

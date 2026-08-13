@@ -38,11 +38,13 @@ use rusty_tokio::sync::broadcast;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
-    CompactionState, ForkedFrom, GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote,
-    HarnessSnapshot, HarnessState, Request, Role, ScheduleKind, SessionEvent, SessionState,
-    SessionStatus, ToolCallRequest, TranscriptEntry,
+    ChildUsageAttribution, CompactionState, ForkedFrom, GoalAction, GoalState, GoalStatus,
+    HarnessAction, HarnessNote, HarnessSnapshot, HarnessState, Request, Role, ScheduleKind,
+    SessionEvent, SessionState, SessionStatus, ToolCallRequest, TranscriptEntry, Usage,
 };
-use crate::provider::{ChatTurn, ModelProvider, ProviderReply, ToolDef, TurnRole};
+use crate::provider::{
+    ChatTurn, ModelProvider, ProviderReply, ProviderResponse, ToolDef, TurnRole,
+};
 use crate::tool_runtime::ToolRuntime;
 use crate::transport;
 
@@ -266,6 +268,11 @@ pub struct NewSessionMeta {
     /// `None` defaults to `1` in [`AgentSession::create`], same
     /// resolved-server-side treatment as `rlm_depth`.
     pub rlm_max_depth: Option<u32>,
+    /// See `protocol::SessionState::spawned_from_sequence`'s own doc
+    /// comment. Set only by `handle_rlm_run`'s own composition; every
+    /// other caller leaves this `None`, same as `NewSessionMeta::
+    /// default()`'s blanket default.
+    pub spawned_from_sequence: Option<u64>,
 }
 
 /// `rlm-runtime.md`'s own stated default for `RLM_MAX_DEPTH`: a root
@@ -295,6 +302,7 @@ impl AgentSession {
             runtime,
             rlm_depth,
             rlm_max_depth,
+            spawned_from_sequence,
         } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -329,6 +337,7 @@ impl AgentSession {
             forked_from: None,
             rlm_depth: rlm_depth.unwrap_or(0),
             rlm_max_depth: rlm_max_depth.unwrap_or(DEFAULT_RLM_MAX_DEPTH),
+            spawned_from_sequence,
         };
         let session = AgentSession {
             state,
@@ -456,16 +465,20 @@ impl AgentSession {
     /// assistant note instead of erroring, so the client still gets a
     /// coherent ack.
     pub async fn prompt(&mut self, text: String) -> Result<TranscriptEntry> {
-        self.append(Role::User, text, None, None, None).await?;
+        self.append(Role::User, text, None, None, None, None)
+            .await?;
         let tools = self.enabled_tool_defs().await?;
 
         const MAX_TOOL_ROUNDS: usize = 8;
         for _ in 0..MAX_TOOL_ROUNDS {
             self.maybe_compact().await?;
             let turns = self.build_turns();
-            match self.provider.respond(&turns, &tools).await? {
+            let ProviderResponse { reply, usage } = self.provider.respond(&turns, &tools).await?;
+            match reply {
                 ProviderReply::Text(reply) => {
-                    return self.append(Role::Assistant, reply, None, None, None).await;
+                    return self
+                        .append(Role::Assistant, reply, None, None, None, usage)
+                        .await;
                 }
                 ProviderReply::ToolCalls(calls) => {
                     self.append(
@@ -474,12 +487,20 @@ impl AgentSession {
                         Some(calls.clone()),
                         None,
                         None,
+                        usage,
                     )
                     .await?;
                     for call in calls {
                         let result = self.execute_tool_call(&call.name, &call.arguments).await?;
-                        self.append(Role::Tool, result, None, Some(call.id), Some(call.name))
-                            .await?;
+                        self.append(
+                            Role::Tool,
+                            result,
+                            None,
+                            Some(call.id),
+                            Some(call.name),
+                            None,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -487,6 +508,7 @@ impl AgentSession {
         self.append(
             Role::Assistant,
             format!("(stopped after {MAX_TOOL_ROUNDS} tool-call rounds without a final reply)"),
+            None,
             None,
             None,
             None,
@@ -741,6 +763,14 @@ impl AgentSession {
                 model: model.clone(),
                 goal: None,
                 parent_id: Some(self.state.session_id.clone()),
+                // Parity with `rlm-runtime.md`'s "the target parent
+                // assistant message ID": `self.state.last_sequence`, at
+                // this exact point, is the sequence of the `Role::
+                // Assistant` tool-calls entry `prompt`'s own loop just
+                // appended before calling `execute_tool_call` -> ... ->
+                // `handle_rlm_run` -- see `protocol::SessionState::
+                // spawned_from_sequence`'s own doc comment.
+                spawned_from_sequence: Some(self.state.last_sequence),
                 thinking: None,
                 tools: None,
                 runtime: None,
@@ -932,6 +962,75 @@ impl AgentSession {
             "deleted": child_id,
             "name": name,
         }))
+    }
+
+    /// Parity with `rlm-runtime.md`'s asynchronous child-usage-
+    /// attribution mechanism: "Prime Agent asynchronously folds the
+    /// child's assistant usage and cost into the parent assistant turn
+    /// that launched it," persisting "a `child_usage_attributed` entry
+    /// containing: the target parent assistant message ID; the child
+    /// usage being attributed; and the resulting aggregate usage." Called
+    /// on this (the *parent's*) own worker via `Request::
+    /// AttributeChildUsage`, sent by `daemon::Supervisor`'s own
+    /// background poll once `child_id`'s own worker has stopped -- the
+    /// closest real "the child's task is done" signal this project's
+    /// architecture has, since RLM children are ordinary long-running
+    /// sessions here, not a bounded one-shot subprocess the way
+    /// `rlm-runtime.md`'s own runtime treats them. The daemon's own
+    /// eligibility check (child stopped, parent `Active`) is trusted
+    /// rather than re-verified here -- the same "the caller already
+    /// decided this was due" trust `Request::ScheduleAdd`-fired
+    /// continuation prompts already extend to `fire_due_schedules`.
+    ///
+    /// Idempotent and safe to call more than once for the same
+    /// `child_id`: delivery is at-least-once in spirit (a redelivered
+    /// poll, e.g. after a lost ack), so before doing anything else this
+    /// scans this session's own transcript for an existing attribution of
+    /// `child_id` and returns `Ok(false)` (no new entry) if one is
+    /// already there -- the same "check my own durable state first"
+    /// pattern that makes redundant delivery here safe rather than a
+    /// duplicate-counting bug. Also returns `Ok(false)` (not an error)
+    /// when `child_id` isn't actually a direct child of this session, or
+    /// was admitted some other way than `rlm(...)` (no `parent_message_
+    /// sequence` to attribute anything to) -- both are "nothing to do"
+    /// outcomes, not failures, matching `Response::
+    /// AttributeChildUsageAck`'s own doc comment.
+    pub(crate) async fn attribute_child_usage(&mut self, child_id: &str) -> Result<bool> {
+        if self.transcript.iter().any(|e| {
+            e.child_usage_attributed
+                .as_ref()
+                .is_some_and(|a| a.child_session_id == child_id)
+        }) {
+            return Ok(false);
+        }
+        let child_dir = paths::session_dir(&self.state_root, child_id);
+        let child_state = crate::catalog::read_session_state(Context::Session, &child_dir)?;
+        if child_state.parent_id.as_deref() != Some(self.state.session_id.as_str()) {
+            return Ok(false);
+        }
+        let Some(parent_message_sequence) = child_state.spawned_from_sequence else {
+            return Ok(false);
+        };
+        let child_usage = read_transcript(&child_dir)?
+            .into_iter()
+            .filter_map(|e| e.usage)
+            .fold(Usage::default(), |acc, u| acc + u);
+        // "The resulting aggregate usage": every attribution already
+        // recorded against this same parent message, plus this one.
+        let aggregate_usage = self
+            .transcript
+            .iter()
+            .filter_map(|e| e.child_usage_attributed.as_ref())
+            .filter(|a| a.parent_message_sequence == parent_message_sequence)
+            .fold(child_usage, |acc, a| acc + a.child_usage);
+        self.append_child_usage_attribution(ChildUsageAttribution {
+            child_session_id: child_id.to_string(),
+            parent_message_sequence,
+            child_usage,
+            aggregate_usage,
+        })
+        .await?;
+        Ok(true)
     }
 
     /// Handles a kernel-side `rlm_heartbeat()` call -- parity with
@@ -1202,7 +1301,14 @@ impl AgentSession {
             tool_call_id: None,
             name: None,
         }];
-        let summary = match self.provider.respond(&ask, &[]).await? {
+        // This call's own `usage` isn't recorded anywhere: it produces a
+        // `Role::System` compaction-summary entry, not a `Role::
+        // Assistant` reply to the user, and `TranscriptEntry::usage`/
+        // child-usage attribution are both scoped to the latter (the
+        // "parent assistant message" `rlm-runtime.md`'s own attribution
+        // mechanism targets) -- tracking meta-call usage like this one is
+        // a separate concern, not attempted here.
+        let summary = match self.provider.respond(&ask, &[]).await?.reply {
             ProviderReply::Text(text) => text,
             ProviderReply::ToolCalls(_) => {
                 "(compaction summary unavailable: model requested tools instead of summarizing)"
@@ -1226,6 +1332,7 @@ impl AgentSession {
             None,
             None,
             None,
+            None,
         )
         .await?;
         Ok((true, Some(summary)))
@@ -1238,8 +1345,9 @@ impl AgentSession {
         tool_calls: Option<Vec<ToolCallRequest>>,
         tool_call_id: Option<String>,
         name: Option<String>,
+        usage: Option<Usage>,
     ) -> Result<TranscriptEntry> {
-        let entry = TranscriptEntry {
+        self.append_entry(TranscriptEntry {
             sequence: self.state.last_sequence + 1,
             timestamp_ms: now_ms(),
             role,
@@ -1247,7 +1355,43 @@ impl AgentSession {
             tool_calls,
             tool_call_id,
             name,
-        };
+            usage,
+            child_usage_attributed: None,
+        })
+        .await
+    }
+
+    /// A synthetic `Role::System` entry recording a child session's usage
+    /// folded into one of this session's own assistant turns -- see
+    /// [`ChildUsageAttribution`] and
+    /// [`attribute_child_usage`](Self::attribute_child_usage).
+    async fn append_child_usage_attribution(
+        &mut self,
+        attribution: ChildUsageAttribution,
+    ) -> Result<TranscriptEntry> {
+        self.append_entry(TranscriptEntry {
+            sequence: self.state.last_sequence + 1,
+            timestamp_ms: now_ms(),
+            role: Role::System,
+            text: String::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            usage: None,
+            child_usage_attributed: Some(attribution),
+        })
+        .await
+    }
+
+    /// Shared persistence tail for [`append`](Self::append)/
+    /// [`append_child_usage_attribution`](Self::append_child_usage_attribution):
+    /// both build a complete [`TranscriptEntry`] themselves (their shapes
+    /// differ enough -- one keyed by `role`/`text`/tool-call fields, the
+    /// other by `child_usage_attributed` -- that a single one-size-fits-
+    /// all parameter list would need most of its parameters `None` on
+    /// every call from *some* caller) and hand it here for the actual
+    /// write.
+    async fn append_entry(&mut self, entry: TranscriptEntry) -> Result<TranscriptEntry> {
         append_transcript_line(&self.session_dir, &entry).await?;
         self.transcript.push(entry.clone());
         self.state.last_sequence = entry.sequence;
@@ -1481,6 +1625,10 @@ pub(crate) async fn seed_forked_session(
         // tied into the source's own recursion tree.
         rlm_depth: 0,
         rlm_max_depth: DEFAULT_RLM_MAX_DEPTH,
+        // Same reasoning as `rlm_depth`/`rlm_max_depth` above -- a fork
+        // isn't a child `rlm(...)` admitted, so it has no parent message
+        // to ever attribute usage back to.
+        spawned_from_sequence: None,
     };
     write_state(&session_dir, &state).await
 }
@@ -1564,6 +1712,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            usage: None,
+            child_usage_attributed: None,
         }
     }
 
@@ -1701,6 +1851,172 @@ mod tests {
         );
         assert!(error.contains("RLM_DEPTH=1"), "got: {error:?}");
         assert!(error.contains("RLM_MAX_DEPTH=1"), "got: {error:?}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Parity with `rlm-runtime.md`'s child-usage-attribution mechanism,
+    /// proven the same "no daemon/kernel needed" way as the depth-limit
+    /// test above: `attribute_child_usage` only ever touches this
+    /// session's own in-memory transcript plus plain reads of another
+    /// session's already-durable `state.json`/`transcript.jsonl`, so it's
+    /// fully exercisable with two directly-constructed `AgentSession`s.
+    #[rusty_tokio::test]
+    async fn attribute_child_usage_folds_the_childs_usage_into_a_new_parent_entry() {
+        let root = temp_state_root("attribute-child-usage");
+
+        let mut parent = AgentSession::create(
+            &root,
+            "parent-1".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("parent creation should succeed");
+        // Simulate the assistant tool-calls turn that admitted the child
+        // -- `handle_rlm_run` captures `self.state.last_sequence` at
+        // exactly this point.
+        let launching_entry = parent
+            .append(Role::Assistant, String::new(), None, None, None, None)
+            .await
+            .expect("seeding the launching assistant entry should succeed");
+
+        let mut child = AgentSession::create(
+            &root,
+            "child-1".to_string(),
+            NewSessionMeta {
+                parent_id: Some("parent-1".to_string()),
+                spawned_from_sequence: Some(launching_entry.sequence),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("child creation should succeed");
+        child
+            .append(
+                Role::Assistant,
+                "first".to_string(),
+                None,
+                None,
+                None,
+                Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                }),
+            )
+            .await
+            .unwrap();
+        child
+            .append(
+                Role::Assistant,
+                "second".to_string(),
+                None,
+                None,
+                None,
+                Some(Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                }),
+            )
+            .await
+            .unwrap();
+        drop(child);
+
+        let attributed = parent
+            .attribute_child_usage("child-1")
+            .await
+            .expect("attribution should not error");
+        assert!(attributed);
+
+        let attribution_entry = parent
+            .transcript
+            .last()
+            .expect("an attribution entry should have been appended");
+        assert_eq!(attribution_entry.role, Role::System);
+        let attribution = attribution_entry
+            .child_usage_attributed
+            .as_ref()
+            .expect("the appended entry should carry a child_usage_attributed payload");
+        assert_eq!(attribution.child_session_id, "child-1");
+        assert_eq!(
+            attribution.parent_message_sequence,
+            launching_entry.sequence
+        );
+        assert_eq!(
+            attribution.child_usage,
+            Usage {
+                prompt_tokens: 13,
+                completion_tokens: 7,
+                total_tokens: 20,
+            }
+        );
+        assert_eq!(attribution.aggregate_usage, attribution.child_usage);
+
+        // Idempotent: a redelivered request is a safe no-op, not a
+        // second entry.
+        let attributed_again = parent
+            .attribute_child_usage("child-1")
+            .await
+            .expect("a redundant attribution attempt should not error");
+        assert!(!attributed_again);
+        assert_eq!(
+            parent
+                .transcript
+                .iter()
+                .filter(|e| e.child_usage_attributed.is_some())
+                .count(),
+            1,
+            "a redundant attribution attempt must not append a second entry"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A `session spawn`-admitted child (`parent_id` set, but never
+    /// `rlm(...)`-admitted, so no `spawned_from_sequence`) has no parent
+    /// message to attribute usage to -- a no-op, not an error.
+    #[rusty_tokio::test]
+    async fn attribute_child_usage_is_a_no_op_for_a_non_rlm_admitted_child() {
+        let root = temp_state_root("attribute-child-usage-non-rlm");
+
+        let mut parent = AgentSession::create(
+            &root,
+            "parent-2".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("parent creation should succeed");
+
+        AgentSession::create(
+            &root,
+            "child-2".to_string(),
+            NewSessionMeta {
+                parent_id: Some("parent-2".to_string()),
+                spawned_from_sequence: None,
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("child creation should succeed");
+
+        let attributed = parent
+            .attribute_child_usage("child-2")
+            .await
+            .expect("attribution should not error");
+        assert!(!attributed);
+        assert!(parent
+            .transcript
+            .iter()
+            .all(|e| e.child_usage_attributed.is_none()));
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -111,6 +111,15 @@ one, leaving its transcript and session directory on disk. Only a
 session's own direct children are visible/deletable this way, not
 grandchildren or unrelated sessions.
 
+With a real `--model`, every assistant turn's real token usage is
+recorded (`rp-server`'s own `usage` field, visible in `session attach`'s
+`--mode json` transcript entries). A child's own usage is automatically
+folded back into the parent turn that spawned it once the child stops
+(gracefully via `rlm_delete_subagent`/`session stop`, or a crash) --
+within a few seconds, no action needed on either side -- as a new system
+entry summing the child's total usage plus any prior attributions to
+that same turn.
+
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
 ```
