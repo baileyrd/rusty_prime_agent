@@ -829,17 +829,22 @@ above:
   is 2,000, and token counts use the same rough estimate, not a real
   tokenizer.
 - **Split-turn handling (never cut mid-turn or between a tool call and
-  its result; two-summary merge).** -- **False.** The fold walk treats
-  every transcript entry identically regardless of role -- a cut can
-  land immediately after a tool-call entry, separating it from its
-  result.
+  its result; two-summary merge).** -- **Partial.** The "never cut
+  between a tool call and its result" half is now real:
+  `adjust_fold_count_to_turn_boundary` pushes a naive cut forward past
+  any `Role::Tool` entries to the next real `Role::User`/`Role::
+  Assistant` boundary (see `PARITY.md`'s "Bounded candidates batch 2"
+  entry). Two-summary merge (a distinct concept from this project's own
+  single-running-summary re-summarization model) is still False.
 - **Structured summary format (`## Goal`/`## Progress`/etc. sections,
   `<read-files>`/`<modified-files>` tags).** -- **False.** The
   summarization prompt just asks for "an updated, concise summary... no
   preamble" -- no structured template, no file-tracking tags.
-- **`compaction.enabled` settings toggle.** -- **False.** No toggle
-  exists; the only way to suppress auto-compaction is to never
-  configure a real model.
+- **`compaction.enabled` settings toggle.** -- **Closed.** `Settings`
+  now has a `compaction_enabled: Option<bool>` field (default on;
+  `Some(false)` suppresses the automatic trigger only, not manual
+  `session compact`/`/compact`) -- see `PARITY.md`'s "Bounded candidates
+  batch 2" entry.
 - **Kernel-callable `compact.status()`/`compact.run(...)`.** --
   **False**, already settled, reconfirmed against `bootstrap_kernel`
   directly (defines nothing named `compact`).
@@ -1016,8 +1021,11 @@ tables:
 - **`compaction.keepRecentTokens`.** -- **Partial/True.** Real, direct
   match in semantics, different default (2,000 vs. 20,000) and flat
   instead of nested.
-- **`compaction.reserveTokens`/`compaction.enabled`.** -- **False**,
-  both -- no reserve concept, no toggle.
+- **`compaction.reserveTokens`/`compaction.enabled`.** -- **Partial.**
+  `reserveTokens` stays False -- no separate reserve concept, one flat
+  threshold plays both roles. `compaction.enabled` is now Closed:
+  `Settings` has `compaction_enabled: Option<bool>` -- see `PARITY.md`'s
+  "Bounded candidates batch 2" entry.
 - **`theme`.** -- **Closed.** `Settings` now has a `theme: Option<String>`
   field (`"dark"`/`"light"`, or a path to a custom theme JSON file) --
   see `PARITY.md`'s "Themes: token spec + TUI renderer" entry.
@@ -1191,20 +1199,21 @@ From the recursive doc-tree pass:
       the `execute_python` tool description, and a `/skill:name [args]`
       `session_repl` command in the same shape as the existing `/fork`/
       `/export` commands.
-- [ ] **Turn-boundary-aware compaction cut points.** `find_compaction_
-      fold_count` folds by raw entry count with no role awareness --
-      a cut can land immediately after a tool-call entry, separating it
-      from its result. Bounded fix: after computing the naive cut index,
-      walk to the nearest `User`/`Assistant`-role boundary instead.
-- [ ] **Persist compaction `instructions` on `CompactionState`.**
-      `compact_now` already receives `instructions` as a parameter but
-      never stores it -- one more `Option<String>` field alongside
-      `summary`/`compacted_at_ms` closes this.
-- [ ] **A `compaction.enabled` settings toggle.** Today the only way to
-      suppress automatic compaction is to never configure a real model.
-      One more `Option<bool>` field on `Settings` plus one check in
-      `maybe_compact`, following the exact precedent the two existing
-      compaction fields already set.
+- [x] **Turn-boundary-aware compaction cut points** -- shipped as
+      `adjust_fold_count_to_turn_boundary` (see `PARITY.md`'s "Bounded
+      candidates batch 2" entry), exactly the bounded fix this bullet
+      sketched: after computing the naive cut index, walk forward to the
+      next `Role::User`/`Role::Assistant` boundary if it would otherwise
+      land on (or between) `Role::Tool` entries.
+- [x] **Persist compaction `instructions` on `CompactionState`** --
+      shipped: a third `instructions: Option<String>` field, set from
+      `compact_now`'s own parameter, `#[serde(default)]` for backward
+      compatibility with an already-persisted `state.json`.
+- [x] **A `compaction.enabled` settings toggle** -- shipped: `Settings::
+      compaction_enabled: Option<bool>`, checked in `maybe_compact`
+      (the automatic trigger only, not manual `compact_now`), following
+      the exact env-var/`settings.json`/default precedence the two
+      existing compaction fields already set.
 - [ ] **An interactive session browser (`prime-agent agents`-style).**
       `session list` already returns the right data (every status
       tier); a bounded slice adds a simple filter/select-to-attach text

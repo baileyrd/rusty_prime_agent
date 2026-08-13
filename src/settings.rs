@@ -21,13 +21,14 @@
 //! rather than copying `prime-agent`'s own camelCase verbatim -- a
 //! deliberate consistency choice, not an oversight.
 //!
-//! Fields today: the two compaction thresholds, `theme` (see `theme`'s
-//! own module doc comment), and `telemetry_enabled` (see `telemetry`'s
-//! own module doc comment). `prime-agent`'s own `settings.json` still
-//! covers real estate this project has no equivalent knob for at all
-//! (retry policy, `branchSummary.*`, ...) and isn't attempted here; more
-//! fields can be added the same way these were, as this project grows
-//! more tunables worth persisting.
+//! Fields today: the two compaction thresholds, `compaction_enabled`,
+//! `theme` (see `theme`'s own module doc comment), and
+//! `telemetry_enabled` (see `telemetry`'s own module doc comment).
+//! `prime-agent`'s own `settings.json` still covers real estate this
+//! project has no equivalent knob for at all (retry policy,
+//! `branchSummary.*`, ...) and isn't attempted here; more fields can be
+//! added the same way these were, as this project grows more tunables
+//! worth persisting.
 
 use std::path::Path;
 
@@ -39,6 +40,17 @@ pub struct Settings {
     pub compact_trigger_tokens: Option<usize>,
     #[serde(default)]
     pub compact_keep_recent_tokens: Option<usize>,
+    /// Parity with `prime-agent`'s own `compaction.enabled` settings
+    /// key. `None`/`Some(true)` (the default) leaves automatic
+    /// compaction on; only an explicit `Some(false)` suppresses the
+    /// trigger `AgentSession::maybe_compact` checks every prompt round.
+    /// Manual compaction (`session compact`/`/compact`) is unaffected --
+    /// a caller explicitly asking for it should still get it regardless
+    /// of whether the automatic trigger is disabled. Before this field
+    /// existed, the only way to suppress automatic compaction at all was
+    /// to never configure a real `--model` in the first place.
+    #[serde(default)]
+    pub compaction_enabled: Option<bool>,
     /// `"dark"`/`"light"` (this project's two built-in themes) or a
     /// path to a custom theme JSON file -- parity with `prime-agent`'s
     /// own `theme` settings key. See `theme::resolve`'s own doc
@@ -134,6 +146,26 @@ mod tests {
         let root = temp_state_root("telemetry-field-absent");
         std::fs::write(root.join("settings.json"), "{}").unwrap();
         assert_eq!(load(&root).telemetry_enabled, None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parses_the_compaction_enabled_field() {
+        let root = temp_state_root("compaction-enabled-field");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compaction_enabled": false}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&root).compaction_enabled, Some(false));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compaction_enabled_defaults_to_none_when_absent() {
+        let root = temp_state_root("compaction-enabled-field-absent");
+        std::fs::write(root.join("settings.json"), "{}").unwrap();
+        assert_eq!(load(&root).compaction_enabled, None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

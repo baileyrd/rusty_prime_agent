@@ -2699,6 +2699,81 @@ daemon/worker split rather than requiring the Python control environment:
   primitive can't abort a model call already in flight to a real
   provider's HTTP endpoint, and REPL-integrated steering (see the
   narrowed "Steering" entry) is still not attempted.
+- [x] **Bounded candidates batch 2: compaction fixes.** Three small,
+  independent gaps closed together, all named directly in
+  `CLAIMS_AUDIT.md`'s own `compaction.md` audit and recommendations
+  checklist rather than newly discovered here.
+
+  **Turn-boundary-aware compaction cut points.** `find_compaction_
+  fold_count`'s backward token-budget walk previously treated every
+  transcript entry identically regardless of role, so a cut could land
+  immediately after a `Role::Assistant` tool-call-request entry (or
+  between two of its own `Role::Tool` results), splitting a request from
+  a response that only make sense read together -- `CLAIMS_AUDIT.md`
+  had already confirmed this exact gap ("a cut can land immediately
+  after a tool-call entry, separating it from its result"). New
+  `adjust_fold_count_to_turn_boundary`: if the entry right at the naive
+  cut index is a `Role::Tool` result, walk forward past every remaining
+  `Role::Tool` entry to the next real `Role::User`/`Role::Assistant`
+  boundary (or the end of the candidate list, if the tail past the cut
+  turns out to be nothing but trailing tool results with no boundary
+  left to land on -- folds everything rather than leaving a dangling
+  split). Folding a few extra, already-over-budget entries is the honest
+  tradeoff for never producing an orphaned tool result with no visible
+  request behind it.
+
+  **Persisted compaction `instructions`.** `compact_now` already
+  received `instructions` as a parameter (`session compact <id>
+  [instructions...]`/`/compact [instructions]`) and folded it into the
+  summarization prompt, but never stored it anywhere -- confirmed
+  directly against `CompactionState`'s own two-field shape before this
+  entry, not assumed. `CompactionState` gains a third field,
+  `instructions: Option<String>` (`#[serde(default)]`, so a `state.json`
+  persisted before this field existed still deserializes as `None`
+  rather than failing to load).
+
+  **A `compaction.enabled` settings toggle.** `Settings` gains
+  `compaction_enabled: Option<bool>` (`None`/`Some(true)`, the default,
+  leaves automatic compaction on; only an explicit `Some(false)`
+  suppresses it), following the exact env-var-then-`settings.json`-
+  then-hardcoded-default precedence `compact_trigger_tokens`/
+  `compact_keep_recent_tokens` already established (new
+  `RUSTY_PRIME_AGENT_COMPACTION_ENABLED` env var). Gates only
+  `AgentSession::maybe_compact` (the *automatic* per-round trigger) --
+  manual compaction (`session compact`/`/compact`, i.e. `compact_now`
+  called directly) never checks it, since a caller explicitly asking for
+  compaction right now should still get it regardless of whether the
+  automatic trigger is turned off. Before this field existed, the only
+  way to suppress automatic compaction at all was to never configure a
+  real `--model` in the first place.
+
+  Verified with new `session.rs` unit tests, all in-process (no daemon,
+  `AgentSession::create` called directly with a real `--model` string
+  but still backed by `EchoProvider` -- the same technique
+  `build_turns_prepends_the_context_file_as_a_system_turn` already uses,
+  since a genuine model-backed round trip needs `rp-server`/a real
+  backend and stays `#[ignore]`d elsewhere): two new
+  `find_compaction_fold_count` cases (a naive cut landing between two
+  tool results gets pushed forward to the next real boundary; a naive
+  cut with no boundary left in the tail folds everything), one proving
+  `compact_now` actually persists `instructions` when it folds something
+  for real (forced via a `compact_keep_recent_tokens: 0` `settings.json`
+  override, not the shared env var this file's own pre-existing
+  compaction tests already guard with a mutex -- no shared global state
+  to guard here), and two proving `compaction_enabled: false` genuinely
+  suppresses automatic compaction even with `compact_trigger_tokens: 0`
+  (every prompt would otherwise cross the threshold) while leaving it on
+  by default. Plus two `settings.rs` unit tests for the new field itself.
+
+  Not attempted, stated honestly: a CI-safe *integration* test (through
+  the real daemon/CLI) for `compaction_enabled` specifically -- automatic
+  compaction only ever runs at all once `state.model` is set, and a real
+  `--model` needs a real `rp-server`-backed provider at the daemon/worker
+  level (`worker::build_provider` never uses `EchoProvider` once a model
+  string is given), the same real-model requirement `tests/compaction.rs`'s
+  own module doc comment already states for testing compaction's actual
+  effect end-to-end. The in-process `session.rs` unit tests above are the
+  real, meaningful coverage instead.
 
 ## Needs a new subsystem
 
