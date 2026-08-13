@@ -658,13 +658,37 @@ daemon/worker split rather than requiring the Python control environment:
   `send_prompt` every other REPL line already uses, immediately, no
   scheduling latency.
 
+  **Interval-repeating form** (`rlm_heartbeat(every="10m")`,
+  `/heartbeat every <duration>`), parity with `prime-agent`'s
+  `rlm_heartbeat.create(interval=...)`/`/heartbeat every 10m`: both
+  triggers now optionally accept a duration string (`cli::
+  parse_duration_ms`, made `pub(crate)` and reused as-is -- the exact
+  same `30s`/`5m`/`2h`/`1d` shorthand `session schedule add --every`
+  already parses, not a second parser to keep in sync). The kernel side rides the
+  duration string along on the same printed marker line
+  (`worker::bootstrap_kernel`'s `rlm_heartbeat(every=None)` prints
+  `marker + (every or "")`, since a plain `print()` is the only channel
+  back to this process; `session::extract_heartbeat_marker` splits it
+  back out) and requests `ScheduleKind::Every { interval_ms }` instead of
+  `ScheduleKind::Once` from the same `Request::ScheduleAdd` round trip --
+  no new scheduling mechanism, `schedule.rs`'s existing recurring-fire
+  support already does the work. `session_repl`'s `/heartbeat every
+  <duration>` is different in kind from plain `/heartbeat`, not just in
+  degree: a repeating heartbeat is a standing re-entry into the session,
+  not a single "send it now" action, so it registers a real schedule
+  (`client::schedule_add`) rather than sending a prompt immediately.
+  Either trigger's resulting schedule is listed/canceled the same way
+  any other one is (`session schedule list`/`cancel <id> <schedule-id>`)
+  -- no separate heartbeat-specific list/pause/resume/clear surface
+  needed, unlike `prime-agent`'s own heartbeat-specific management
+  commands.
+
   Explicitly not implemented: rate-limiting/deduplicating rapid repeated
   `rlm_heartbeat()` calls (same "no sandboxing for a single local user"
-  trust model already accepted elsewhere), arguments to either trigger
-  (both parameterless, matching `prime-agent`'s own simplest form), and
-  any change to `session_autonomous`'s own bounded loop -- these are two
-  more manual entry points into the same mechanism, not a third
-  continuation policy.
+  trust model already accepted elsewhere), and any change to
+  `session_autonomous`'s own bounded loop -- these remain manual entry
+  points into the same re-entry mechanism, not a third continuation
+  policy.
 - [x] **Automatic context compaction** (`session compact <id>
   [instructions...]`, `/compact [instructions]` in `session_repl`, plus
   an automatic trigger inside `AgentSession::prompt`'s own loop), parity
@@ -780,23 +804,6 @@ daemon/worker split rather than requiring the Python control environment:
   Extension UI sub-protocol (`select`/`confirm`/`input`/`editor` dialogs)
   -- there is no extension system for it to serve (see "Needs a new
   subsystem" below).
-
-## Identified gaps, not yet started
-
-Surfaced by a documentation-level review of `prime-agent`'s real docs
-(`packages/coding-agent/docs/*.md`, 35 files) rather than source
-reading -- unlike "Needs a new subsystem" below, each of these fits this
-project's existing shape without a new subsystem. None has been scoped
-or implemented yet.
-
-- **Interval-repeating heartbeats.** `prime-agent`'s heartbeats
-  (`long-running-agents.md`) support `every <interval>` with a label,
-  plus list/pause/resume/clear. This project's `rlm_heartbeat()`/
-  `/heartbeat` (see "Medium-effort" above) fire exactly once per manual
-  call -- there's no repeating variant. `schedule.rs` already has
-  `ScheduleKind::Every { interval_ms }` for `session schedule add
-  --every`; `trigger_heartbeat` reusing that instead of always sending
-  `ScheduleKind::Once` is the shape of the fix, just not attempted yet.
 
 ## Needs a new subsystem
 

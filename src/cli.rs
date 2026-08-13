@@ -811,8 +811,11 @@ fn parse_autonomous<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Com
 /// `s`/`m`/`h`/`d`) -- deliberately not a full ISO 8601 duration parser;
 /// this project doesn't pull in a dependency for `--every`'s narrow
 /// needs (parity with `prime-agent`'s own shorthand-friendly CLI
-/// conventions, not with ISO 8601 itself).
-fn parse_duration_ms(s: &str) -> Result<u64> {
+/// conventions, not with ISO 8601 itself). `pub(crate)` since
+/// `session::trigger_heartbeat`/`client::session_repl` reuse it for
+/// `rlm_heartbeat(every=...)`/`/heartbeat every <duration>` -- the same
+/// shorthand, not a second parser to keep in sync.
+pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
     let (digits, unit) = s.split_at(s.len().saturating_sub(1));
     let n: u64 = digits.parse().map_err(|_| {
         usage(format!(

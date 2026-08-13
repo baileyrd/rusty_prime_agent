@@ -766,6 +766,46 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if let Some(duration_str) = text
+            .strip_prefix("/heartbeat every ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with `prime-agent /heartbeat every <duration>` --
+            // unlike the plain `/heartbeat` above, a repeating heartbeat
+            // is a real, standing re-entry into the session, not a single
+            // "send it now" action, so this registers an actual
+            // `ScheduleKind::Every` schedule (reusing `schedule_add`'s
+            // own plumbing/output shape) rather than sending anything
+            // immediately -- the same recurring-fire support `session
+            // schedule add --every` already has, not a second mechanism.
+            // Listed/canceled the same way any other schedule is
+            // (`session schedule list`/`cancel`), no bespoke management
+            // surface needed.
+            match fetch_goal(state_root, &session_id).await? {
+                Some(goal) if goal.status == GoalStatus::Active => {
+                    match crate::cli::parse_duration_ms(duration_str) {
+                        Ok(interval_ms) => {
+                            let continue_text =
+                                format!("Continue working toward the goal: {}", goal.text);
+                            schedule_add(
+                                state_root,
+                                session_id.clone(),
+                                continue_text,
+                                crate::protocol::ScheduleKind::Every { interval_ms },
+                                mode,
+                            )
+                            .await?;
+                        }
+                        Err(e) => println!("{e}"),
+                    }
+                }
+                _ => println!(
+                    "no active goal -- set one with `session goal set {session_id} <text...>` first"
+                ),
+            }
+            continue;
+        }
         if text == "/compact" || text.starts_with("/compact ") {
             // Parity with `prime-agent /compact [instructions]`. A fresh
             // top-level REPL action, same as `/heartbeat` above -- no

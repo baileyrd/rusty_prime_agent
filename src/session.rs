@@ -55,6 +55,24 @@ use crate::transport;
 /// real print() is likely to emit by accident.
 pub(crate) const HEARTBEAT_MARKER: &str = "___RPA_HEARTBEAT___";
 
+/// Finds `HEARTBEAT_MARKER` in `stdout` (if present) and returns
+/// `(every_argument, stdout_with_the_marker_line_removed)`.
+/// `worker::bootstrap_kernel`'s `rlm_heartbeat(every=None)` prints
+/// `marker + (every or "")` on one line -- a plain `print()` is the only
+/// channel from kernel code back to this process, so the optional
+/// `every` duration string rides along on the same line rather than
+/// needing a second signal. `every_argument` is empty for a plain
+/// `rlm_heartbeat()` call (the one-shot form).
+fn extract_heartbeat_marker(stdout: &str) -> Option<(String, String)> {
+    let start = stdout.find(HEARTBEAT_MARKER)?;
+    let after = &stdout[start + HEARTBEAT_MARKER.len()..];
+    let line_len = after.find('\n').unwrap_or(after.len());
+    let every = after[..line_len].trim().to_string();
+    let mut without_marker = stdout.to_string();
+    without_marker.replace_range(start..start + HEARTBEAT_MARKER.len() + line_len, "");
+    Some((every, without_marker))
+}
+
 /// Conservative, deliberately approximate context-length trigger for
 /// automatic compaction (`maybe_compact`, called every round of
 /// `prompt`'s tool-calling loop) -- parity with `prime-agent`'s
@@ -544,11 +562,10 @@ impl AgentSession {
             None => return Ok("error: missing required `code` argument".to_string()),
         };
         let outcome = self.tool_runtime.execute(&code).await?;
-        let heartbeat_requested = outcome.stdout.contains(HEARTBEAT_MARKER);
-        let mut text = if heartbeat_requested {
-            outcome.stdout.replace(HEARTBEAT_MARKER, "")
-        } else {
-            outcome.stdout
+        let heartbeat = extract_heartbeat_marker(&outcome.stdout);
+        let mut text = match &heartbeat {
+            Some((_, without_marker)) => without_marker.clone(),
+            None => outcome.stdout,
         };
         if let Some(result) = outcome.result {
             if !text.is_empty() {
@@ -556,8 +573,9 @@ impl AgentSession {
             }
             text.push_str(&result);
         }
-        if heartbeat_requested {
-            let status = self.trigger_heartbeat().await?;
+        if let Some((every, _)) = heartbeat {
+            let every = if every.is_empty() { None } else { Some(every) };
+            let status = self.trigger_heartbeat(every).await?;
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -577,20 +595,33 @@ impl AgentSession {
     /// process's own daemon -- an ordinary client connection to
     /// `daemon.sock`, the same `transport`/`Request`/`Response`
     /// primitives every `client.rs` function already uses -- and asks it
-    /// to fire a one-shot continuation prompt (`Request::ScheduleAdd`,
-    /// `ScheduleKind::Once { at_ms: now_ms() }`, the exact "near-
-    /// immediate one-shot" pattern `client::session_spawn` already
-    /// established) rather than calling `self.prompt()` directly (which
-    /// would recurse into this same in-flight `prompt()` call and
-    /// interleave transcript entries out of order) or writing
-    /// `schedules.json` directly (`schedule.rs`'s own doc comment: it has
-    /// exactly one safe writer, the daemon's own background firing loop
-    /// -- a second, unsynchronized writer racing that loop's own
-    /// read-modify-write could lose or resurrect entries). The response
-    /// read is best-effort: a request that's already been written and
-    /// accepted by the daemon has very likely already taken effect even
-    /// if this connection doesn't get to read the ack back.
-    async fn trigger_heartbeat(&self) -> Result<String> {
+    /// to fire a continuation prompt (`Request::ScheduleAdd`) rather than
+    /// calling `self.prompt()` directly (which would recurse into this
+    /// same in-flight `prompt()` call and interleave transcript entries
+    /// out of order) or writing `schedules.json` directly (`schedule.rs`'s
+    /// own doc comment: it has exactly one safe writer, the daemon's own
+    /// background firing loop -- a second, unsynchronized writer racing
+    /// that loop's own read-modify-write could lose or resurrect
+    /// entries). The response read is best-effort: a request that's
+    /// already been written and accepted by the daemon has very likely
+    /// already taken effect even if this connection doesn't get to read
+    /// the ack back.
+    ///
+    /// `every`, when `Some`, is parity with `prime-agent`'s
+    /// `rlm_heartbeat.create(interval=...)`/`/heartbeat every <duration>`:
+    /// a `ScheduleKind::Every { interval_ms }` instead of the default
+    /// `ScheduleKind::Once { at_ms: now_ms() }` -- the exact same
+    /// `ScheduleAdd` request either way, just a different `kind`, reusing
+    /// `schedule.rs`'s own recurring-fire support rather than this
+    /// project inventing a second, parallel "repeat this" mechanism. An
+    /// invalid duration string degrades to an explanatory string, the
+    /// same graceful "no goal"/"not active" shape the two checks above
+    /// already have, rather than propagating a hard error out of the
+    /// whole in-flight tool call. The resulting schedule is listed and
+    /// canceled the same way any other one is -- `session schedule
+    /// list`/`cancel <id> <schedule-id>` -- no separate heartbeat-specific
+    /// management surface needed.
+    async fn trigger_heartbeat(&self, every: Option<String>) -> Result<String> {
         let Some(goal) = &self.state.goal else {
             return Ok("(heartbeat ignored: no active goal set)".to_string());
         };
@@ -599,6 +630,18 @@ impl AgentSession {
         }
         let text = format!("Continue working toward the goal: {}", goal.text);
 
+        let kind = match &every {
+            Some(interval_str) => match crate::cli::parse_duration_ms(interval_str) {
+                Ok(interval_ms) => ScheduleKind::Every { interval_ms },
+                Err(e) => {
+                    return Ok(format!(
+                        "(heartbeat ignored: invalid every duration {interval_str:?}: {e})"
+                    ))
+                }
+            },
+            None => ScheduleKind::Once { at_ms: now_ms() },
+        };
+
         let socket_path = paths::daemon_socket_path(&self.state_root);
         let mut conn = transport::connect(Context::Daemon, socket_path).await?;
         conn.write_request(
@@ -606,14 +649,19 @@ impl AgentSession {
             &Request::ScheduleAdd {
                 session_id: self.state.session_id.clone(),
                 text,
-                kind: ScheduleKind::Once { at_ms: now_ms() },
+                kind,
             },
         )
         .await?;
         let _ =
             rusty_tokio::time::timeout(Duration::from_secs(5), conn.read_response(Context::Daemon))
                 .await;
-        Ok("(heartbeat scheduled: will continue toward the goal shortly)".to_string())
+        Ok(match every {
+            Some(interval_str) => {
+                format!("(heartbeat scheduled: will continue toward the goal every {interval_str})")
+            }
+            None => "(heartbeat scheduled: will continue toward the goal shortly)".to_string(),
+        })
     }
 
     /// Returns this session's cached `McpClient`, connecting one (against
@@ -1059,6 +1107,38 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    #[test]
+    fn extract_heartbeat_marker_returns_none_when_the_marker_is_absent() {
+        assert_eq!(
+            extract_heartbeat_marker("just some ordinary output\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_heartbeat_marker_finds_a_bare_one_shot_call() {
+        let stdout = format!("before\n{HEARTBEAT_MARKER}\nafter\n");
+        let (every, without_marker) = extract_heartbeat_marker(&stdout).unwrap();
+        assert_eq!(every, "");
+        assert_eq!(without_marker, "before\n\nafter\n");
+    }
+
+    #[test]
+    fn extract_heartbeat_marker_finds_an_every_argument() {
+        let stdout = format!("{HEARTBEAT_MARKER}10m\n");
+        let (every, without_marker) = extract_heartbeat_marker(&stdout).unwrap();
+        assert_eq!(every, "10m");
+        assert_eq!(without_marker, "\n");
+    }
+
+    #[test]
+    fn extract_heartbeat_marker_handles_a_marker_with_no_trailing_newline() {
+        let stdout = format!("{HEARTBEAT_MARKER}1h");
+        let (every, without_marker) = extract_heartbeat_marker(&stdout).unwrap();
+        assert_eq!(every, "1h");
+        assert_eq!(without_marker, "");
     }
 
     #[test]

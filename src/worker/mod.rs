@@ -158,9 +158,17 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// skills were installed); propagates a genuine execution failure via
 /// `?`, same "fail loudly on a broken startup precondition" convention
 /// as `build_provider`'s own callers.
+///
+/// `rlm_heartbeat(every=None)` -- the optional `every` argument (a
+/// duration string like `"10m"`, parity with `prime-agent`'s own
+/// `rlm_heartbeat.create(interval=...)`) rides along after the marker on
+/// the same printed line (`marker + (every or "")`), since a plain
+/// stdout `print()` is the only channel from kernel code back to this
+/// process -- `session::execute_python_tool_call`'s marker parsing
+/// splits it back out.
 async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
     let mut code = format!(
-        "def rlm_heartbeat():\n    print({marker:?})\n    return \"heartbeat requested\"\n",
+        "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 

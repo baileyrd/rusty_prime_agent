@@ -87,7 +87,10 @@ invoke it. Drop real Python packages into `<state-dir>/skills/` to make
 them `import`-able in the kernel -- see "Skills" below. The kernel also
 gets a built-in `rlm_heartbeat()` function: calling it (with an `Active`
 goal set) schedules an immediate continuation prompt, the kernel-callable
-sibling of `session repl`'s own `/heartbeat`.
+sibling of `session repl`'s own `/heartbeat`. `rlm_heartbeat(every="10m")`
+(or `/heartbeat every 10m` in the REPL) schedules a repeating one
+instead -- a real `session schedule` entry, listed/canceled the same way
+any other one is.
 
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
@@ -242,8 +245,12 @@ EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
 existing transcript first. A line that's exactly `/heartbeat` manually
 re-enters the session's `Active` goal right away (`"Continue working
 toward the goal: ..."`) -- with no active goal, it prints an explanation
-and sends nothing. A line that's `/compact` or `/compact <instructions>`
-forces context compaction immediately, same as `session compact`.
+and sends nothing. `/heartbeat every <duration>` (e.g. `/heartbeat every
+10m`) registers a real recurring `session schedule` entry instead of
+sending anything immediately -- list or cancel it with `session schedule
+list`/`cancel`, same as any other schedule. A line that's `/compact` or
+`/compact <instructions>` forces context compaction immediately, same as
+`session compact`.
 
 ### RPC mode
 
