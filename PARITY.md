@@ -147,7 +147,12 @@ daemon/worker split rather than requiring the Python control environment:
   entry for that same provider, which beats being unconfigured at all --
   the same "env var wins" order `settings.json`'s own overrides
   established, for a different pair of tiers (no hardcoded default to
-  fall back to for an API key). `rp_server::resolve_auth_env` computes,
+  fall back to for an API key). **Confirmed, not silently divergent:**
+  `prime-agent`'s own `providers.md` states the opposite order (`auth.json`
+  wins over an env var); this project deliberately keeps env-var-wins
+  instead -- a permanent, intentional divergence from that documented
+  upstream contract, not an open gap to close later (see `CLAIMS_AUDIT.md`'s
+  own now-closed checklist entry for this). `rp_server::resolve_auth_env` computes,
   for every `OPTIONAL_PROVIDERS` entry whose env var isn't already set,
   a resolved `(api_key_env, key)` pair from `auth.json`; `write_config`
   now activates a `[providers.*]` block when either condition holds, and
@@ -2875,6 +2880,84 @@ daemon/worker split rather than requiring the Python control environment:
   real piped file's contents get appended correctly, the other proves an
   explicitly-empty pipe (`common::run`'s new default) leaves the prompt
   text untouched rather than appending a stray blank line.
+- [x] **Bounded candidates batch 4: auth + skills.** Four small,
+  independent gaps closed together, all named directly in
+  `CLAIMS_AUDIT.md`'s own checklist.
+
+  **`auth.json`-vs-env-var precedence: confirmed, documented, not
+  changed.** `prime-agent`'s own `providers.md` states `auth.json` wins
+  over an env var; `auth::resolve_key`'s callers do the opposite (env var
+  always wins, `auth.json` never even consulted once it's set). This was
+  already a deliberate design choice, not a bug -- the fix here is purely
+  the one-line note the checklist itself asked for, added to this
+  project's own `auth.json` entry above, marking it a permanent,
+  intentional divergence from that documented upstream contract rather
+  than an open gap.
+
+  **Env-var-name indirection in `auth::resolve_key`.** `prime-agent`'s
+  own third `key` form (`{"key": "MY_KEY"}` meaning "read this env var,"
+  not "use the literal string `MY_KEY`") was silently treated as a
+  literal before this -- exactly the "ships a garbage literal credential"
+  risk the checklist named. New `looks_like_env_var_name` (`^[A-Za-z_]
+  [A-Za-z0-9_]*$`): a non-`!`-prefixed value with that shape is tried
+  against `std::env::var` first, falling back to the literal only if no
+  such env var is set. Deliberately conservative -- a real API key
+  (`sk-...`, `sk-ant-...`, ...) almost never has that exact shape (the
+  hyphen alone fails the check), and even a literal that happens to match
+  only changes behavior if an env var of that exact name is *also* set,
+  which was already true before this indirection existed (env var always
+  wins over `auth.json` regardless, per the entry above).
+
+  **Skill frontmatter validation beyond `description`.** `skills::
+  discover` previously only ever read `description`; `frontmatter::parse`
+  already returned the full field map, so `license`/`compatibility`
+  (both purely informational -- nothing here enforces either) and
+  `disable-model-invocation` (see below, a real behavioral flag) are now
+  read too. A `name:` field that doesn't match the skill's own directory
+  name produces a `Skill::warnings` entry (lenient -- warn, don't fail)
+  rather than a discovery failure or a second "display name" this module
+  reconciles: the directory name is what actually governs `import
+  <name>`. `harness skill list` surfaces all of it -- `license`/
+  `compatibility` lines, a tag when model-invocation is disabled, and any
+  warnings.
+
+  **`disable-model-invocation` + a `/skill:name [args]` explicit-invoke
+  command.** Two pieces, as the checklist scoped them. First:
+  `AgentSession::execute_python_tool_def_with_skills` now filters out
+  any skill flagged `disable-model-invocation: true` from the
+  `execute_python` tool's own description entirely -- the model never
+  learns it exists (still on the kernel's `sys.path` either way;
+  `worker::bootstrap_kernel` doesn't consult the flag, so `import` still
+  works if the model somehow already knew the name). Second: `client::
+  session_repl` gains `/skill:<name> [args...]`, the same REPL-command
+  shape `/fork`/`/export` already have -- looks the name up via
+  `skills::discover`, reports "no such skill" and sends nothing if it
+  isn't found, otherwise composes an instruction ("use the `<name>`
+  skill... ") and sends it as an ordinary prompt (same `send_prompt`
+  shape `/heartbeat` already uses). This is deliberately *not* a direct
+  Python-execution path -- the model still has to actually call
+  `execute_python` itself for anything to run; `/skill:` only ever makes
+  which skill to reach for explicit instead of leaving it to be noticed.
+  Works for any skill, disabled or not -- the whole point of the split is
+  that a human can always reach one on purpose even when the model can't
+  stumble onto it on its own.
+
+  Verified with new unit tests (`auth.rs`: `looks_like_env_var_name`'s
+  own shape check, an env var actually resolving, and falling back to
+  the literal when it's unset, guarded the same
+  set/clear-then-drop-before-`.await` way `rp_server.rs`'s own
+  `PROVIDER_ENV_GUARD` tests already are, to avoid an `await_holding_
+  lock` clippy failure; `skills.rs`: `license`/`compatibility`/
+  `disable-model-invocation` parsing including case-insensitivity, a
+  matching `name:` producing no warning and a mismatched one producing
+  exactly one; `session.rs`: `execute_python_tool_def_with_skills`
+  advertises an ordinary skill, omits a disabled one, and still
+  advertises the rest when only one of several is disabled) and new
+  integration tests (`tests/skills.rs`: `skill list` renders the new
+  fields/tag/warning; `tests/repl.rs`: `/skill:` sends the right
+  instruction for a known skill with and without args, rejects an
+  unknown one without sending anything, and still reaches a
+  `disable-model-invocation` skill).
 
 ## Needs a new subsystem
 

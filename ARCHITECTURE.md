@@ -330,13 +330,19 @@ Real, `import`-able Python packages for `session new --runtime ipython`
 (`prime-agent skills.md`'s Python-package half -- `prompt_template.rs`
 already covers the plain-text half) -- see `PARITY.md` for the full
 story. A skill is a directory under `paths::global_skills_dir`
-(`<state_dir>/skills/<name>/`): a `SKILL.md` (`description` frontmatter,
-parsed by the shared `frontmatter.rs` module) alongside a real Python
-package (`__init__.py`). `skills::discover` is a pure filesystem scan --
-it never inspects the Python itself; a broken package surfaces as an
-ordinary `ImportError` the model sees when it actually tries to `import`
-it, the same "let the callee reject malformed input" stance `tools::
-execute` already takes.
+(`<state_dir>/skills/<name>/`): a `SKILL.md` frontmatter block --
+`description`, `license`, `compatibility` (all three purely informational
+here, surfaced by `harness skill list` but not read anywhere else), and
+`disable-model-invocation` (a real behavioral flag, below), all parsed by
+the shared `frontmatter.rs` module -- alongside a real Python package
+(`__init__.py`). A `name:` field that doesn't match the skill's own
+directory name produces a `Skill::warnings` entry rather than a
+discovery failure or a second "display name" this module reconciles --
+the directory name is what actually governs `import <name>`.
+`skills::discover` never inspects the Python itself; a broken package
+surfaces as an ordinary `ImportError` the model sees when it actually
+tries to `import` it, the same "let the callee reject malformed input"
+stance `tools::execute` already takes.
 
 Global tier only -- deliberately no project-local tier the way
 `prompt_template::discover` has one, since the one place skill *loading*
@@ -344,11 +350,22 @@ needs to run (`worker::bootstrap_kernel`, right after `tool_runtime.
 start()` succeeds: one `execute_request` puts the skills directory on
 the kernel's own `sys.path`) is the worker process, which has no access
 to the CLI caller's own cwd the way `prompt_template::discover`'s
-always-client-side callers do. `session::enabled_tool_defs` appends
-every discovered skill's name/description to the `execute_python` tool's
-own description, so the model knows what it can `import` without being
-told in the prompt. `harness skill list` is the human-facing view, same
-shape as `prompt-template list`.
+always-client-side callers do. `session::execute_python_tool_def_with_
+skills` appends every discovered skill's name/description to the
+`execute_python` tool's own description, so the model knows what it can
+`import` without being told in the prompt -- except a skill flagged
+`disable-model-invocation: true`, filtered out of that list entirely
+(still on the kernel's `sys.path` either way; `bootstrap_kernel` doesn't
+consult the flag). `client::session_repl`'s `/skill:<name> [args...]`
+command is the one way a human can still reach a disabled skill on
+purpose: it composes an instruction ("use the `<name>` skill... ") and
+sends it as an ordinary prompt (same shape `/heartbeat` already uses),
+so the model still has to actually call `execute_python` for anything to
+run -- this only ever makes *which* skill to reach for explicit, it
+never executes Python directly. `harness skill list` is the human-facing
+view, same shape as `prompt-template list`, extended with `license`/
+`compatibility` lines, a `disable-model-invocation` tag (pointing at the
+matching `/skill:` command), and any `warnings`.
 
 ## `/heartbeat` and `rlm_heartbeat()`
 
@@ -592,11 +609,24 @@ Parity with `prime-agent`'s own `auth.json` -- see `PARITY.md` for the
 full story. `auth::load(state_root)` reads `<state_dir>/auth.json` into
 a `{provider name -> {"key": ...}}` map, same permissive-parse stance
 `settings::load` already takes. `auth::resolve_key` turns one entry's
-`key` into a real string: a literal value as-is, or (a `!`-prefixed
-value) the trimmed stdout of running the rest as a shell command
-(`sh -c`/`cmd /C`, bounded by a 10s timeout) -- the same trust model
-`session_autonomous --quality-gate` already accepts, no sandboxing,
-because there is exactly one local caller.
+`key` into a real string, tried in this order: a `!`-prefixed value
+runs the rest as a shell command (`sh -c`/`cmd /C`, bounded by a 10s
+timeout -- the same trust model `session_autonomous --quality-gate`
+already accepts, no sandboxing, because there is exactly one local
+caller) and uses its trimmed stdout; otherwise, a value shaped like a
+bare env-var-name identifier (`looks_like_env_var_name`,
+`^[A-Za-z_][A-Za-z0-9_]*$`) is looked up via `std::env::var` first --
+parity with `prime-agent`'s own named-env-var-lookup `key` form
+(`{"key": "MY_KEY"}`); otherwise the value is used as a literal string.
+The env-var-lookup form only ever changes behavior when that exact env
+var is actually set -- a literal key that happens to match the shape but
+has no such var configured falls straight through to being used
+literally, same as before this form existed. Precedence note: an
+already-set env var still always wins over `auth.json` entirely (see
+below), a permanent, deliberate divergence from `prime-agent`'s own
+`providers.md`, which documents the opposite order -- recorded as such
+rather than left as a silent inconsistency (`PARITY.md`'s own `auth.json`
+entry).
 
 `rp_server::resolve_auth_env(state_root)` is the only caller: for every
 provider `rp_server::all_providers` returns (see the next section) whose

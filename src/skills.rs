@@ -11,7 +11,8 @@
 //! ```text
 //! <state_dir>/skills/
 //!   weather/
-//!     SKILL.md       <- frontmatter: description: ...  (model-facing)
+//!     SKILL.md       <- frontmatter: description/license/compatibility/
+//!                        disable-model-invocation (model-facing/informational)
 //!     __init__.py     <- the actual importable Python package
 //!     fetch.py
 //! ```
@@ -23,9 +24,11 @@
 //! "let the callee reject malformed input" philosophy `tools::execute`'s
 //! own doc comment already establishes, not something worth validating
 //! twice). The skill's own directory name is its Python package name
-//! (`import weather`, not whatever `SKILL.md` might separately claim) --
-//! the two have to match for `import` to work at all, so there is no
-//! second "display name" to reconcile.
+//! (`import weather`, not whatever `SKILL.md`'s own optional `name:`
+//! field might separately claim) -- the two have to match for `import`
+//! to work at all, so a mismatched `name:` is a lenient warning
+//! ([`Skill::warnings`]), not a second "display name" this module
+//! reconciles or prefers.
 //!
 //! Global tier only, deliberately: unlike `prompt_template::discover`
 //! (always called client-side, where the real CLI caller's cwd is
@@ -47,6 +50,32 @@ use crate::paths;
 pub struct Skill {
     pub name: String,
     pub description: Option<String>,
+    /// `SKILL.md`'s own `license:` frontmatter field, informational
+    /// only -- nothing in this project reads or enforces it.
+    pub license: Option<String>,
+    /// `SKILL.md`'s own `compatibility:` frontmatter field, informational
+    /// only -- nothing in this project checks it against anything (no
+    /// real "compatible with which harness version" concept exists
+    /// here); surfaced purely so `harness skill list` shows what the
+    /// skill author claimed.
+    pub compatibility: Option<String>,
+    /// `SKILL.md`'s own `disable-model-invocation:` frontmatter field
+    /// (`"true"`, case-insensitive; anything else, including absent, is
+    /// `false`). `true` means `AgentSession::
+    /// execute_python_tool_def_with_skills` never advertises this skill
+    /// to the model at all -- a human can still reach it explicitly via
+    /// `session_repl`'s `/skill:<name>` command (see that command's own
+    /// doc comment), the same "the model won't stumble onto it, but a
+    /// caller who asks for it by name still can" split
+    /// `disable-model-invocation` is named for upstream.
+    pub disable_model_invocation: bool,
+    /// Lenient, non-fatal validation notes -- currently just a `name:`
+    /// frontmatter field that doesn't match the skill's own directory
+    /// name. Never turned into a discovery failure: the directory name
+    /// is what actually governs `import <name>` (see this module's own
+    /// doc comment), so a mismatched `name:` is worth flagging, not
+    /// worth refusing to load the skill over.
+    pub warnings: Vec<String>,
 }
 
 /// Scans [`paths::global_skills_dir`] for subdirectories containing a
@@ -81,9 +110,31 @@ pub fn discover(state_root: &Path) -> Result<Vec<Skill>> {
             Err(e) => return Err(HarnessError::io(Context::Runtime, Some(manifest_path), e)),
         };
         let (mut fields, _body) = crate::frontmatter::parse(&content);
+        let description = fields.remove("description");
+        let license = fields.remove("license");
+        let compatibility = fields.remove("compatibility");
+        let disable_model_invocation = fields
+            .remove("disable-model-invocation")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+        let mut warnings = Vec::new();
+        if let Some(declared_name) = fields.remove("name") {
+            if declared_name != name {
+                warnings.push(format!(
+                    "SKILL.md declares name `{declared_name}`, but the skill's own \
+                     directory is `{name}` -- `import {name}` is what actually works, \
+                     not this field"
+                ));
+            }
+        }
+
         skills.push(Skill {
             name: name.to_string(),
-            description: fields.remove("description"),
+            description,
+            license,
+            compatibility,
+            disable_model_invocation,
+            warnings,
         });
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -139,6 +190,83 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "weather");
         assert_eq!(skills[0].description.as_deref(), Some("fetch weather data"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parses_license_compatibility_and_disable_model_invocation() {
+        let root = temp_state_root("extra-fields");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\nlicense: MIT\n\
+             compatibility: >=1.0\ndisable-model-invocation: true\n---\n",
+        );
+        let skills = discover(&root).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].license.as_deref(), Some("MIT"));
+        assert_eq!(skills[0].compatibility.as_deref(), Some(">=1.0"));
+        assert!(skills[0].disable_model_invocation);
+        assert!(skills[0].warnings.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn disable_model_invocation_defaults_to_false_when_absent() {
+        let root = temp_state_root("disable-absent");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\n---\n",
+        );
+        let skills = discover(&root).unwrap();
+        assert!(!skills[0].disable_model_invocation);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn disable_model_invocation_is_case_insensitive() {
+        let root = temp_state_root("disable-case");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\ndisable-model-invocation: TRUE\n---\n",
+        );
+        let skills = discover(&root).unwrap();
+        assert!(skills[0].disable_model_invocation);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_name_field_matching_the_directory_produces_no_warning() {
+        let root = temp_state_root("name-matches");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\nname: weather\n---\n",
+        );
+        let skills = discover(&root).unwrap();
+        assert!(skills[0].warnings.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_name_field_mismatching_the_directory_produces_a_warning_not_a_failure() {
+        let root = temp_state_root("name-mismatch");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\nname: weather-forecaster\n---\n",
+        );
+        let skills = discover(&root).unwrap();
+        assert_eq!(
+            skills.len(),
+            1,
+            "a mismatched name: must not fail discovery"
+        );
+        assert_eq!(skills[0].name, "weather", "the directory name still wins");
+        assert_eq!(skills[0].warnings.len(), 1);
+        assert!(skills[0].warnings[0].contains("weather-forecaster"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

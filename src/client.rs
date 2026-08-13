@@ -1227,6 +1227,48 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             session_compact(state_root, session_id.clone(), instructions, mode).await?;
             continue;
         }
+        if let Some(rest) = text.strip_prefix("/skill:") {
+            // Parity with a bounded slice of `prime-agent`'s explicit
+            // skill invocation. `execute_python_tool_def_with_skills`
+            // never advertises a skill flagged `disable-model-
+            // invocation: true` to the model at all (see that method's
+            // own doc comment) -- this is the one way a human can still
+            // reach one on purpose, and it works for an ordinary
+            // (non-disabled) skill too, same as `/heartbeat` still being
+            // useful even though nothing stops the model from
+            // continuing toward the goal on its own. This never runs
+            // Python directly: it only composes an instruction and sends
+            // it as an ordinary prompt, same as `/heartbeat` above --
+            // the model still has to actually call `execute_python`
+            // itself for anything to run, this just makes which skill to
+            // reach for explicit instead of hoping the model notices.
+            let mut parts = rest.splitn(2, ' ');
+            let name = parts.next().unwrap_or("").trim();
+            let args = parts.next().unwrap_or("").trim();
+            if name.is_empty() {
+                println!("usage: /skill:<name> [args...]");
+                continue;
+            }
+            let skills = crate::skills::discover(state_root)?;
+            if !skills.iter().any(|s| s.name == name) {
+                println!("no such skill: {name} (see `skill list`)");
+                continue;
+            }
+            let instruction = if args.is_empty() {
+                format!(
+                    "Use the `{name}` skill (import it via execute_python) to help with \
+                     the current task."
+                )
+            } else {
+                format!("Use the `{name}` skill (import it via execute_python) to: {args}")
+            };
+            let entry = send_prompt(state_root, &session_id, instruction).await?;
+            match mode {
+                OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+                OutputMode::Text => print_entry(&entry),
+            }
+            continue;
+        }
         if let Some(path) = text
             .strip_prefix("/file ")
             .map(str::trim)
@@ -1848,6 +1890,7 @@ const REPL_SLASH_COMMANDS: &[&str] = &[
     "/quit",
     "/heartbeat",
     "/compact",
+    "/skill:",
     "/file",
     "/fork",
     "/tree",
@@ -2375,9 +2418,14 @@ pub async fn prompt_template_list(state_root: &Path, mode: OutputMode) -> Result
 }
 
 /// `harness skill list` -- lists every skill `skills::discover` finds
-/// (`<state-dir>/skills/*/SKILL.md`), with its description. Global-only,
-/// so no `cwd` needed -- see `skills.rs`'s own doc comment for why. A
-/// pure local directory scan, same as `prompt_template_list`, no daemon
+/// (`<state-dir>/skills/*/SKILL.md`), with its description, plus (when
+/// present) its `license`/`compatibility` frontmatter, a tag when
+/// `disable-model-invocation: true` (see `skills::Skill::
+/// disable_model_invocation`'s own doc comment for what that means), and
+/// any lenient validation warnings -- surfaced here rather than failing
+/// discovery over them (see `skills::Skill::warnings`). Global-only, so
+/// no `cwd` needed -- see `skills.rs`'s own doc comment for why. A pure
+/// local directory scan, same as `prompt_template_list`, no daemon
 /// connection.
 pub async fn skill_list(state_root: &Path, mode: OutputMode) -> Result<()> {
     let skills = crate::skills::discover(state_root)?;
@@ -2389,6 +2437,18 @@ pub async fn skill_list(state_root: &Path, mode: OutputMode) -> Result<()> {
             }
             for s in &skills {
                 println!("{}\t{}", s.name, s.description.as_deref().unwrap_or(""));
+                if let Some(license) = &s.license {
+                    println!("  license: {license}");
+                }
+                if let Some(compatibility) = &s.compatibility {
+                    println!("  compatibility: {compatibility}");
+                }
+                if s.disable_model_invocation {
+                    println!("  (disable-model-invocation: not offered to the model -- invoke explicitly with `/skill:{}`)", s.name);
+                }
+                for warning in &s.warnings {
+                    println!("  warning: {warning}");
+                }
             }
         }
     }

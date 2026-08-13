@@ -871,3 +871,116 @@ fn repl_login_wizard_cancels_on_a_blank_provider_answer() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+fn write_skill(state_dir: &std::path::Path, name: &str, manifest: &str) {
+    let dir = state_dir.join("skills").join(name);
+    std::fs::create_dir_all(&dir).expect("create skill dir");
+    std::fs::write(dir.join("SKILL.md"), manifest).expect("write SKILL.md");
+}
+
+/// Parity with a bounded slice of `prime-agent`'s explicit skill
+/// invocation -- see `client::session_repl`'s own `/skill:` doc comment.
+/// A known skill sends an ordinary prompt (`EchoProvider` throughout, so
+/// the assertion is just that the composed instruction reached the
+/// model, not that anything Python actually ran).
+#[test]
+fn repl_skill_command_sends_an_instruction_prompt_for_a_known_skill() {
+    let state_dir = common::TempDir::new("repl-skill-known");
+    write_skill(
+        state_dir.path(),
+        "weather",
+        "---\ndescription: fetch weather data\n---\n",
+    );
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        "/skill:weather what's the forecast\n",
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("weather"), "got: {stdout}");
+    assert!(stdout.contains("what's the forecast"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("turns=2"),
+        "a /skill: invocation should have sent exactly one prompt round, got: {listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// `/skill:<name>` with no args still sends a generic "use this skill"
+/// instruction rather than requiring args.
+#[test]
+fn repl_skill_command_works_with_no_args() {
+    let state_dir = common::TempDir::new("repl-skill-no-args");
+    write_skill(
+        state_dir.path(),
+        "weather",
+        "---\ndescription: fetch weather data\n---\n",
+    );
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/skill:weather\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("weather"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=2"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// An unknown skill name reports the problem and sends nothing, rather
+/// than composing an instruction the model has no way to act on.
+#[test]
+fn repl_skill_command_rejects_an_unknown_skill_without_prompting() {
+    let state_dir = common::TempDir::new("repl-skill-unknown");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/skill:does-not-exist\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no such skill"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains("turns=0"),
+        "an unknown skill must not send a prompt, got: {listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// A skill flagged `disable-model-invocation: true` (never advertised in
+/// the model's own `execute_python` tool description) is still reachable
+/// through `/skill:` -- the whole point of the split, see
+/// `skills::Skill::disable_model_invocation`'s own doc comment.
+#[test]
+fn repl_skill_command_still_reaches_a_disabled_skill() {
+    let state_dir = common::TempDir::new("repl-skill-disabled");
+    write_skill(
+        state_dir.path(),
+        "internal_only",
+        "---\ndescription: not for the model\ndisable-model-invocation: true\n---\n",
+    );
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/skill:internal_only\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("internal_only"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=2"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}

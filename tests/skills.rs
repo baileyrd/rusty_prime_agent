@@ -88,6 +88,55 @@ fn skill_list_json_mode_emits_structured_entries() {
     );
 }
 
+#[test]
+fn skill_list_shows_license_compatibility_and_the_disable_model_invocation_tag() {
+    let state_dir = common::TempDir::new("skill-extra-fields");
+    write_skill(
+        state_dir.path(),
+        "weather",
+        "---\ndescription: fetch weather data\nlicense: MIT\n\
+         compatibility: >=1.0\ndisable-model-invocation: true\n---\n",
+        "",
+    );
+
+    let out = common::run(state_dir.path(), &["skill", "list"]);
+    common::assert_success("skill list", &out);
+    let stdout = common::stdout_string(&out);
+    assert!(
+        stdout.contains("weather\tfetch weather data"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("license: MIT"), "got: {stdout}");
+    assert!(stdout.contains("compatibility: >=1.0"), "got: {stdout}");
+    assert!(
+        stdout.contains("disable-model-invocation") && stdout.contains("/skill:weather"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn skill_list_shows_a_name_mismatch_warning_without_failing() {
+    let state_dir = common::TempDir::new("skill-name-mismatch");
+    write_skill(
+        state_dir.path(),
+        "weather",
+        "---\ndescription: fetch weather data\nname: weather-forecaster\n---\n",
+        "",
+    );
+
+    let out = common::run(state_dir.path(), &["skill", "list"]);
+    common::assert_success("skill list", &out);
+    let stdout = common::stdout_string(&out);
+    assert!(
+        stdout.contains("weather\tfetch weather data"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("warning:") && stdout.contains("weather-forecaster"),
+        "got: {stdout}"
+    );
+}
+
 /// `session new --runtime ipython` fails loudly (not silently) before it
 /// ever gets far enough to install skills, when no real kernel is
 /// available -- same negative-path proof `tests/ipython_runtime.rs`'s own
