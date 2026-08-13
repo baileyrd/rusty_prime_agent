@@ -1105,12 +1105,40 @@ Python control environment, one an account/identity system) -- not
 attempted here, and not silently implied by anything in
 `ARCHITECTURE.md`'s "Known gaps" section:
 
-- **Extensions, themes.** Named in this bullet's original heading
-  alongside "skills" (now done, see the medium-effort section above) with
-  no further elaboration anywhere in this project's own docs or
-  `prime-agent`'s docs this project has read -- left here rather than
-  silently dropped, since scoping an undefined surface isn't this
-  document's job to invent.
+- **Extensions.** Named in this bullet's original heading alongside
+  "skills"/"themes" (skills now done, see the medium-effort section
+  above) with no further elaboration anywhere in this project's own docs
+  -- re-investigated closely rather than left as a bare assumption,
+  since every other item on this list turned out to have *some* real
+  spec to bound against once actually looked for. The search came up
+  with exactly one concrete trace anywhere in this codebase: RPC mode's
+  own "Explicitly not implemented" note (see that entry above) names an
+  "Extension UI sub-protocol (`select`/`confirm`/`input`/`editor`
+  dialogs)". That's real, but it describes a UI-facing dialog surface an
+  *already-registered* extension would call to prompt a human (pick from
+  a list, yes/no, free text, an editor buffer) -- structurally the
+  mirror image of everything "extension-shaped" this project has
+  actually built (`ToolRuntime`/`ModelProvider` trait implementability
+  for an embedding host, MCP tools the *model* invokes, skills the model
+  `import`s): all three of those are model- or embedder-initiated;
+  dialogs are UI-initiated, asking a human something. It is not itself a
+  specification of what an extension *is*, how one registers, or what
+  else besides dialogs it could add -- there's no manifest format, no
+  registration API, no capability list anywhere in this project's own
+  reach to bound a first increment against. Implementing just the four
+  dialog RPC verbs, with nothing in this codebase ever positioned to
+  invoke them, would be indistinguishable from the RPC mode entry's
+  already-tracked "rest of `rpc.md`'s command surface" gap under a
+  different heading -- double-counting one gap as two, not a genuine new
+  increment. Stays genuinely undefined, not silently dropped.
+- **Themes.** Same conclusion as Extensions, reached the same way: no
+  trace anywhere in this project's own docs beyond the same original
+  "Skills, extensions, themes" heading skills eventually got carved out
+  of. No format, no palette/token spec, no rendering surface this
+  project has (a plain-text CLI/REPL has no theming surface to begin
+  with; the interactive TUI a theme would apply to is itself a separate,
+  already-tracked, not-yet-attempted item, see below) -- nothing to
+  scope a bounded increment against.
 - **The interactive TUI**'s rich editor/message-queue features (file
   reference, image paste, steering vs. follow-up queuing, `/tree`,
   `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
