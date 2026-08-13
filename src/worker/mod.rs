@@ -112,6 +112,12 @@ pub struct WorkerArgs {
     /// See `protocol::SessionState::rlm_max_depth`'s own doc comment.
     /// Same treatment as `rlm_depth`.
     pub rlm_max_depth: Option<u32>,
+    /// See `protocol::SessionState::spawned_from_sequence`'s own doc
+    /// comment. Same "only meaningful for `WorkerMode::New`" treatment as
+    /// `goal`/`parent_id` (not `rlm_depth`/`rlm_max_depth`'s "needed
+    /// before `bootstrap_kernel` runs" reasoning) -- nothing at spawn
+    /// time other than `AgentSession::create` reads this.
+    pub spawned_from_sequence: Option<u64>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -296,6 +302,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     runtime: args.runtime.clone(),
                     rlm_depth: args.rlm_depth,
                     rlm_max_depth: args.rlm_max_depth,
+                    spawned_from_sequence: args.spawned_from_sequence,
                 },
                 provider,
                 tool_runtime,
@@ -445,6 +452,18 @@ async fn handle_private_connection(
                 Err(err) => Err(err),
             }
         }
+        Request::AttributeChildUsage { child_id } => {
+            let attributed = session
+                .lock()
+                .await
+                .attribute_child_usage(&child_id)
+                .await?;
+            conn.write_response(
+                Context::Worker,
+                &Response::AttributeChildUsageAck { attributed },
+            )
+            .await
+        }
         Request::WorkerShutdown => {
             session.lock().await.mark_stopped().await?;
             conn.write_response(Context::Worker, &Response::WorkerShutdownAck)
@@ -497,6 +516,7 @@ pub async fn spawn(
         runtime,
         rlm_depth,
         rlm_max_depth,
+        spawned_from_sequence,
     } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -536,6 +556,10 @@ pub async fn spawn(
     }
     if let Some(rlm_max_depth) = rlm_max_depth {
         cmd.arg("--rlm-max-depth").arg(rlm_max_depth.to_string());
+    }
+    if let Some(spawned_from_sequence) = spawned_from_sequence {
+        cmd.arg("--spawned-from-sequence")
+            .arg(spawned_from_sequence.to_string());
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

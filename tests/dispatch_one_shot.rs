@@ -27,6 +27,7 @@ async fn dispatch_one_shot_creates_a_session_against_a_real_running_daemon() {
             model: None,
             goal: None,
             parent_id: None,
+            spawned_from_sequence: None,
             thinking: None,
             tools: None,
             runtime: None,

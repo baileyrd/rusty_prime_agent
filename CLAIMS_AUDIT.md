@@ -55,10 +55,10 @@ conditioned differently than the claim implies), **N/A**.
   same `SessionNew`/`ScheduleAdd` daemon round trip `session spawn`
   already used, just callable as `await rlm("task")` from kernel code
   instead of the CLI. See the RLM Runtime Architecture section below for
-  the mechanism. Recursion depth limits (`RLM_DEPTH`/`RLM_MAX_DEPTH`) and
-  a parent-scoped child registry (`rlm_list_subagents()`/
-  `rlm_delete_subagent()`) are now also real -- see below; still not
-  done: usage attribution.
+  the mechanism. Recursion depth limits (`RLM_DEPTH`/`RLM_MAX_DEPTH`), a
+  parent-scoped child registry (`rlm_list_subagents()`/
+  `rlm_delete_subagent()`), and child usage/cost attribution to the
+  parent turn are now all real too -- see below.
 - **"Everything is programmatic: file operations, shell commands, tool
   use, subagents, and context management happen through code."** --
   **False.** `--tools read|mcp` is a separate, independent model-facing
@@ -336,13 +336,13 @@ mechanism. `RLM_DEPTH`/`RLM_MAX_DEPTH` recursion limits are now real too
 rlm_list_subagents()`/`await rlm_delete_subagent(id)`, backed by
 `Request::SessionList` filtered by `parent_id` and `Request::
 SessionStop` respectively, no separate registry data structure (see
-below). Still genuinely absent: `RLMSpawnHandle` as a typed object (the
-reply is a plain dict, not an attribute-access object), an `rlm`
+below). Child usage/cost attribution to the parent turn is real too now
+(see below). Still genuinely absent: `RLMSpawnHandle` as a typed object
+(the reply is a plain dict, not an attribute-access object), an `rlm`
 namespace object (`rlm_list_subagents`/`rlm_delete_subagent` are bare
 top-level functions, same simplification `rlm(...)` itself already
-made), model search via `rlm.find_models()`, and usage/cost attribution
--- each tracked separately below. The specific points worth calling out
-individually:
+made), and model search via `rlm.find_models()` -- each tracked
+separately below. The specific points worth calling out individually:
 
 - **Persistent kernel, Jupyter protocol over ZeroMQ, HMAC-SHA256 signed
   frames.** -- **True.** `zmtp.rs`/`sha256.rs`, hand-rolled and verified
@@ -400,10 +400,27 @@ individually:
   ID` collapse to the same concept here (no separate slot-id layer, same
   simplification `rlm_child_id` already made).
 - **Usage/cost attribution: child assistant usage folded into the parent
-  turn via a `child_usage_attributed` transcript entry.** -- **False.**
-  Confirmed absent by grep -- `session spawn` creates a fully independent
-  session with its own, separately-tracked usage; nothing links a
-  child's token usage back to the parent's turn.
+  turn via a `child_usage_attributed` transcript entry.** -- **Now True
+  (was False).** Originally found False, confirmed absent by grep: no
+  session anywhere recorded a model call's own token usage, not even for
+  its own turns, so there was nothing to fold into anything. **Closed in
+  two parts**: (1) real per-turn usage tracking, closing the underlying
+  gap first -- `provider::parse_response` now reads `rp-server`'s own
+  top-level `usage: {prompt_tokens, completion_tokens, total_tokens}`
+  object (confirmed already present in a real response body, not
+  invented -- this project was simply discarding it), and
+  `TranscriptEntry.usage` persists it on every real assistant turn; (2)
+  `session::AgentSession::attribute_child_usage`, triggered by a new
+  daemon background poll once a child's own worker stops (the closest
+  real "child task finished" signal this project's architecture has),
+  sums the child's own transcript usage and appends a `Role::System`
+  entry with `child_usage_attributed: Some(ChildUsageAttribution {
+  child_session_id, parent_message_sequence, child_usage, aggregate_usage
+  })` to the parent's own transcript -- idempotent via a scan of the
+  parent's own transcript, not a separate registry. `parent_message_
+  sequence` is this project's `sequence` field playing the role of "the
+  target parent assistant message ID," captured once at admission
+  (`SessionState.spawned_from_sequence`).
 - **Continual Harness storage: `harness/harness_state.json` per session
   artifact directory, plus an explicitly global scope under
   `~/.prime/agent/harness/`.** -- **False.** `HarnessState` lives inline
@@ -611,14 +628,24 @@ above:
 - **Message type union (`UserMessage`/`AssistantMessage`/
   `ToolResultMessage`/`BashExecutionMessage`/`BranchSummaryMessage`/
   `CompactionSummaryMessage`, typed content blocks, per-message `Usage`
-  with cost).** -- **Partial.** `TranscriptEntry` has a flat `role`
-  enum (plus an extra `System` role upstream doesn't have) and a single
-  `text: String` field -- no typed content-block array, no image
-  content, and no per-message usage/cost object anywhere.
+  with cost).** -- **Still Partial, one clause now closed.** `TranscriptEntry`
+  has a flat `role` enum (plus an extra `System` role upstream doesn't
+  have) and a single `text: String` field -- no typed content-block
+  array, no image content, still true. **Closed**: a per-message `usage`
+  object is no longer absent -- `TranscriptEntry.usage: Option<Usage>`
+  (`prompt_tokens`/`completion_tokens`/`total_tokens`, no dollar-cost
+  field) is real now, set on every real assistant turn.
 - **`BranchSummaryEntry`, `ChildUsageAttributionEntry`, `LabelEntry`,
-  `AgentStatusEntry`, `GitStateEntry`.** -- **False.** None exist --
-  each depends on the tree structure, an extension system, or child
-  usage attribution, all already confirmed absent.
+  `AgentStatusEntry`, `GitStateEntry`.** -- **`ChildUsageAttributionEntry`
+  now True in spirit (was False); the rest remain False.**
+  `TranscriptEntry.child_usage_attributed: Option<ChildUsageAttribution>`
+  is a flat optional field, not a separate typed entry class the way a
+  real message-type union would have it, but it carries exactly the data
+  `ChildUsageAttributionEntry` would -- `child_session_id`,
+  `parent_message_sequence`, `child_usage`, `aggregate_usage`.
+  `BranchSummaryEntry`/`LabelEntry`/`AgentStatusEntry`/`GitStateEntry`
+  still don't exist -- each still depends on the tree structure or an
+  extension system, both already confirmed absent.
 
 ## rlm.md
 
@@ -641,12 +668,12 @@ above:
   `rlm`/`rlm_list_subagents`/`rlm_delete_subagent`/`rlm_heartbeat`, but
   nothing calls it for `goal`/`agent_message`/`compact` yet.
 - **Child usage attribution, parent-scoped registry surviving
-  compaction/restart, recursion depth limits.** -- **Recursion depth
-  limits and a parent-scoped registry are now closed** (`SessionState.
-  rlm_depth`/`rlm_max_depth`; `rlm_list_subagents()`/
-  `rlm_delete_subagent()`, see the RLM Runtime Architecture section
-  above); child usage attribution remains **False/N/A**, reconfirmed with
-  no new evidence.
+  compaction/restart, recursion depth limits.** -- **All three now
+  closed.** Recursion depth limits (`SessionState.rlm_depth`/
+  `rlm_max_depth`), the parent-scoped registry (`rlm_list_subagents()`/
+  `rlm_delete_subagent()`), and child usage attribution
+  (`session::AgentSession::attribute_child_usage`) -- see the RLM Runtime
+  Architecture section above for all three mechanisms.
 - **Automatic compaction preserving kernel state.** -- **True.** The
   kernel process is untouched by compaction, which only changes
   `build_turns`'s provider-facing output.
@@ -783,9 +810,12 @@ future spike:
 - **New concrete blocker found:** `protocol::Request` has no
   cancel/abort primitive of any kind -- `session/cancel` (and rpc.md's
   `abort`) would need one added first, independent of ACP itself.
-  `max_tokens` as a stop reason also has no honest backing today, since
-  no token usage is tracked anywhere (the same root gap as autonomous
-  mode's missing token budget).
+  `max_tokens` as a stop reason still has no honest backing today: real
+  per-turn token usage is tracked now (`TranscriptEntry.usage`, see the
+  RLM Runtime Architecture section's child-usage-attribution entry), but
+  nothing consumes it as a stop condition anywhere -- `session_autonomous`
+  still only tracks turns/time, not a token budget, so this is now a
+  missing *policy*, not a missing data source.
 
 ## mcp-integrations.md
 

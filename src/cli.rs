@@ -259,6 +259,9 @@ pub enum Command {
         /// out of persisted state instead).
         rlm_depth: Option<u32>,
         rlm_max_depth: Option<u32>,
+        /// Only meaningful for `--mode new` (see `worker::WorkerArgs::
+        /// spawned_from_sequence`'s own doc comment).
+        spawned_from_sequence: Option<u64>,
     },
 }
 
@@ -895,6 +898,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut runtime = None;
     let mut rlm_depth = None;
     let mut rlm_max_depth = None;
+    let mut spawned_from_sequence = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -984,6 +988,14 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .map_err(|_| usage(format!("invalid --rlm-max-depth value {value:?}")))?,
                 )
             }
+            "--spawned-from-sequence" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| usage("--spawned-from-sequence requires a value"))?;
+                spawned_from_sequence = Some(value.parse::<u64>().map_err(|_| {
+                    usage(format!("invalid --spawned-from-sequence value {value:?}"))
+                })?)
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -1000,5 +1012,6 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         runtime,
         rlm_depth,
         rlm_max_depth,
+        spawned_from_sequence,
     })
 }

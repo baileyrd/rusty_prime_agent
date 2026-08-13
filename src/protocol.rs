@@ -63,6 +63,14 @@ pub enum Request {
         /// name. Fixed for this session's whole lifetime, same as
         /// `model`/`goal`.
         parent_id: Option<String>,
+        /// Set only by `session::AgentSession::handle_rlm_run` (a
+        /// kernel-callable `rlm(...)` admission), never by `client::
+        /// session_spawn`/`session_new`/a fork: see `protocol::
+        /// SessionState::spawned_from_sequence`'s own doc comment for
+        /// what this is and why it has to travel over the wire rather
+        /// than being resolved server-side the way `rlm_depth`/
+        /// `rlm_max_depth` are.
+        spawned_from_sequence: Option<u64>,
         /// Parity with `prime-agent --thinking <level>`: requests a
         /// visible reasoning/thinking trace from `model`, when set
         /// (`rp-server`'s `ChatRequest.reasoning.effort` -- see
@@ -223,6 +231,21 @@ pub enum Request {
     /// its final state and exit cleanly (used by `daemon shutdown` and
     /// `SessionStop`).
     WorkerShutdown,
+    /// Private transport only: supervisor -> a *parent's* own worker,
+    /// asking it to fold `child_id`'s usage into the parent turn that
+    /// admitted it (`session::AgentSession::attribute_child_usage`).
+    /// Sent by `daemon::Supervisor`'s own background poll (mirroring
+    /// `fire_due_schedules`'s cadence) once `child_id`'s worker has
+    /// stopped -- see `PARITY.md`'s child-usage-attribution entry for the
+    /// full mechanism, including why this is the daemon *forwarding* a
+    /// request rather than writing to the parent's `transcript.jsonl`
+    /// itself. Idempotent: the parent's own handler checks its own
+    /// transcript for an existing attribution of `child_id` first, so a
+    /// redundant delivery (a retried poll, at-least-once semantics) is a
+    /// safe no-op, not a duplicate entry.
+    AttributeChildUsage {
+        child_id: String,
+    },
 }
 
 /// When a [`ScheduleEntry`] fires. Parity with `prime-agent schedule
@@ -318,6 +341,15 @@ pub enum Response {
         state: HarnessState,
     },
     WorkerShutdownAck,
+    /// `attributed` is `false` for either idempotency reason
+    /// `attribute_child_usage` can return early on (already attributed;
+    /// `child_id` isn't actually this session's own child; `child_id` has
+    /// no `spawned_from_sequence`, i.e. wasn't `rlm(...)`-admitted) --
+    /// `daemon::Supervisor`'s poller logs but never treats `false` as an
+    /// error, since every one of those is an expected, harmless outcome.
+    AttributeChildUsageAck {
+        attributed: bool,
+    },
 }
 
 /// Parity with `prime-agent --goal`/`/goal`. `Clear` removes the goal
@@ -478,6 +510,55 @@ pub struct ToolCallRequest {
     pub arguments: String,
 }
 
+/// One model call's real token accounting, straight off `rp-server`'s
+/// own OpenAI-shaped `/v1/chat/completions` response body (`usage:
+/// {prompt_tokens, completion_tokens, total_tokens}` -- `rp-server`'s own
+/// `core::types::Usage` has two further cache-token fields this project
+/// has no use for and doesn't carry). `EchoProvider` never produces one
+/// (there's no real model call to account for). See `provider::
+/// parse_response` for where this gets read off the wire, and
+/// `TranscriptEntry::usage`/`ChildUsageAttribution` for where it's
+/// persisted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+impl std::ops::Add for Usage {
+    type Output = Usage;
+    fn add(self, other: Usage) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens + other.prompt_tokens,
+            completion_tokens: self.completion_tokens + other.completion_tokens,
+            total_tokens: self.total_tokens + other.total_tokens,
+        }
+    }
+}
+
+/// Parity with `rlm-runtime.md`'s child-usage-attribution mechanism: "the
+/// parent transcript persists a `child_usage_attributed` entry
+/// containing: the target parent assistant message ID; the child usage
+/// being attributed; and the resulting aggregate usage." This project
+/// addresses transcript entries by `sequence`, not a separate message-id
+/// concept, so `parent_message_sequence` is that document's "target
+/// parent assistant message ID" -- specifically, the `Role::Assistant`
+/// tool-call entry whose `execute_python` call invoked `rlm(...)` and
+/// admitted this child (see `session::AgentSession::handle_rlm_run`).
+/// `aggregate_usage` is the running total attributed to that same
+/// `parent_message_sequence` across every child admitted from it so far
+/// (there can be more than one, since one assistant turn's Python cell
+/// may call `rlm(...)` more than once) -- see `session::AgentSession::
+/// attribute_child_usage` for how it's computed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildUsageAttribution {
+    pub child_session_id: String,
+    pub parent_message_sequence: u64,
+    pub child_usage: Usage,
+    pub aggregate_usage: Usage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub sequence: u64,
@@ -500,6 +581,20 @@ pub struct TranscriptEntry {
     /// `#[serde(default)]` for the same reason.
     #[serde(default)]
     pub name: Option<String>,
+    /// Set only on a `Role::Assistant` entry backed by a real model call
+    /// (`provider::RustyProviderModel`, never `EchoProvider`): that
+    /// call's own token accounting, straight off `rp-server`'s response.
+    /// `#[serde(default)]` so transcripts written before this field
+    /// existed still parse.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+    /// Set only on a synthetic `Role::System` entry recording a child
+    /// session's usage folded into one of this session's own assistant
+    /// turns -- see [`ChildUsageAttribution`] and `session::AgentSession::
+    /// attribute_child_usage`. `#[serde(default)]` for the same
+    /// pre-existing-transcript reason as `usage`.
+    #[serde(default)]
+    pub child_usage_attributed: Option<ChildUsageAttribution>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +695,23 @@ pub struct SessionState {
     /// always resolves a real one before a worker is ever spawned.
     #[serde(default)]
     pub rlm_max_depth: u32,
+    /// Set only for a session admitted through `rlm(...)`
+    /// (`session::AgentSession::handle_rlm_run`): the `sequence` of the
+    /// parent's own `Role::Assistant` tool-call entry whose
+    /// `execute_python` call invoked `rlm(...)` and admitted this
+    /// session -- `rlm-runtime.md`'s "the target parent assistant message
+    /// ID," addressed by `sequence` rather than a separate message-id
+    /// concept the way this project already addresses every other
+    /// transcript entry. Unlike `rlm_depth`/`rlm_max_depth`, this can't be
+    /// computed server-side by the daemon: only the spawning worker knows
+    /// its own `last_sequence` at admission time, so it travels over the
+    /// wire on `Request::SessionNew` instead. `None` for every
+    /// non-`rlm`-admitted session (plain `session new`, `session spawn`,
+    /// a fork). See `session::AgentSession::attribute_child_usage` for
+    /// how this is later read back to fold this child's own usage into
+    /// that parent message.
+    #[serde(default)]
+    pub spawned_from_sequence: Option<u64>,
 }
 
 /// Provenance for a session created by `session fork <id> [--at N]`

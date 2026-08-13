@@ -137,6 +137,7 @@ pub async fn print_once(
             model,
             goal: None,
             parent_id: None,
+            spawned_from_sequence: None,
             thinking: None,
             tools: None,
             runtime: None,
@@ -244,6 +245,11 @@ async fn create_session(state_root: &Path, meta: crate::session::NewSessionMeta)
         // doc comment on `protocol::SessionState`.
         rlm_depth: _,
         rlm_max_depth: _,
+        // No `client.rs` caller ever sets this (only `session::
+        // AgentSession::handle_rlm_run`'s own, separate `Request::
+        // SessionNew` composition does) -- forwarded rather than
+        // hardcoded so this stays correct if that ever changes.
+        spawned_from_sequence,
     } = meta;
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -253,6 +259,7 @@ async fn create_session(state_root: &Path, meta: crate::session::NewSessionMeta)
             model,
             goal,
             parent_id,
+            spawned_from_sequence,
             thinking,
             tools,
             runtime,
@@ -389,6 +396,11 @@ pub async fn session_spawn(
             runtime: None,
             rlm_depth: None,
             rlm_max_depth: None,
+            // `session spawn` (this function) is CLI-level admission, not
+            // `rlm(...)` -- see `protocol::SessionState::
+            // spawned_from_sequence`'s own doc comment for why only the
+            // latter ever sets this.
+            spawned_from_sequence: None,
         },
     )
     .await?;

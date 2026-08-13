@@ -271,9 +271,29 @@ recursion-depth check (`RLM_DEPTH >= RLM_MAX_DEPTH`) held in
 even starts; the daemon itself is the one place that *computes* those two
 values (`daemon::handle_session_new`, inheriting `rlm_max_depth` from the
 parent unchanged and incrementing `rlm_depth` by one, or resolving both
-from scratch for a root session), never a client. See `PARITY.md`'s RLM
-programming model entry for the full mechanism (why `control`, why the
-`ipykernel` monkeypatch is necessary, what still isn't wired up).
+from scratch for a root session), never a client.
+
+A child admitted via `rlm(...)` records which of the parent's own
+transcript entries launched it (`SessionState::spawned_from_sequence`,
+set once at admission -- unlike `rlm_depth`/`rlm_max_depth` this travels
+over the wire on `Request::SessionNew`, since only the spawning worker
+knows its own `last_sequence`, not something the daemon can derive). A
+new background poll in `daemon::Supervisor::run` (same loop, same
+`SCHEDULE_POLL_INTERVAL` cadence as `fire_due_schedules`) watches for a
+child whose own worker has stopped and, if the parent is `Active`,
+forwards a private-transport-only `Request::AttributeChildUsage` to the
+*parent's* own worker socket -- the daemon never writes a session's
+`transcript.jsonl`/`state.json` itself, so this is a relay, the same
+shape `fire_one_schedule` already uses for `SessionPrompt`. The parent's
+own `AgentSession::attribute_child_usage` does the actual work: sums the
+child's own `TranscriptEntry::usage` (now real, parsed straight off
+`rp-server`'s OpenAI-shaped `usage` field, previously discarded
+entirely) and appends a `Role::System` entry carrying a
+`ChildUsageAttribution` -- idempotent via a scan of the parent's own
+transcript for an existing attribution of that child, not a separate
+registry. See `PARITY.md`'s RLM programming model entry for the full
+mechanism (why `control`, why the `ipykernel` monkeypatch is necessary,
+what still isn't wired up).
 
 **Not the same thing as the real tool-calling loop** (`provider`/`tools`
 modules, `session new --tools read|mcp`, see `PARITY.md`): that's
