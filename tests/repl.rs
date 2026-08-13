@@ -690,3 +690,91 @@ fn repl_file_command_on_an_image_path_queues_it_as_an_image() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Parity with a bounded slice of `prime-agent`'s theme system -- see
+/// `PARITY.md`'s "Themes: token spec + TUI renderer" entry. Every one
+/// of this project's own tests pipes stdio, so `termctl::is_tty()`
+/// reports `false` and no ANSI escape ever appears in captured output
+/// (confirmed separately with a real pty pass, per that same entry) --
+/// what *is* observable here, piped or not, is `settings.json`'s
+/// `theme` field being read at all and a bad value degrading
+/// gracefully rather than crashing the REPL.
+#[test]
+fn repl_falls_back_to_the_dark_theme_and_warns_when_the_configured_theme_path_is_unreadable() {
+    let state_dir = common::TempDir::new("repl-theme-missing");
+    std::fs::write(
+        state_dir.path().join("settings.json"),
+        r#"{"theme": "/no/such/theme.json"}"#,
+    )
+    .unwrap();
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hello\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("failed to load theme") && stdout.contains("falling back"),
+        "got: {stdout}"
+    );
+    // The REPL still works normally after falling back.
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_falls_back_and_warns_when_a_custom_theme_file_is_missing_required_tokens() {
+    let state_dir = common::TempDir::new("repl-theme-incomplete");
+    let theme_path = state_dir.path().join("incomplete-theme.json");
+    std::fs::write(
+        &theme_path,
+        r##"{"name": "incomplete", "colors": {"accent": "#ffffff"}}"##,
+    )
+    .unwrap();
+    std::fs::write(
+        state_dir.path().join("settings.json"),
+        format!(r#"{{"theme": {:?}}}"#, theme_path.to_str().unwrap()),
+    )
+    .unwrap();
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hello\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("missing required color token"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// A valid theme selection (a built-in name) produces no warning at
+/// all -- the REPL just proceeds normally, the same as with no `theme`
+/// setting configured.
+#[test]
+fn repl_accepts_a_builtin_theme_name_with_no_warning() {
+    let state_dir = common::TempDir::new("repl-theme-builtin");
+    std::fs::write(
+        state_dir.path().join("settings.json"),
+        r#"{"theme": "light"}"#,
+    )
+    .unwrap();
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hello\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("failed to load theme"), "got: {stdout}");
+    assert!(
+        !stdout.contains("missing required color token"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}

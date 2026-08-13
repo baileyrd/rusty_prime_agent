@@ -317,16 +317,30 @@ on every read (no restart needed):
 ```json
 {
   "compact_trigger_tokens": 4000,
-  "compact_keep_recent_tokens": 1500
+  "compact_keep_recent_tokens": 1500,
+  "theme": "dark"
 }
 ```
 
-Currently covers just the two automatic-compaction thresholds above
-(parity with `prime-agent`'s own `settings.json`, narrower today). An env
-var still wins when both are set; a missing or malformed file is treated
-as "no settings" rather than an error. Global only, same cwd-visibility
-reason `--runtime ipython` skills and context files don't have a
-project-local tier either.
+Covers the two automatic-compaction thresholds plus `theme` (parity with
+`prime-agent`'s own `settings.json`, narrower today). An env var still
+wins when both are set; a missing or malformed file is treated as "no
+settings" rather than an error. Global only, same cwd-visibility reason
+`--runtime ipython` skills and context files don't have a project-local
+tier either. Unlike the two compaction fields (checked fresh on every
+read), `theme` is read once at `session repl` startup -- no live reload.
+
+`theme` is `"dark"`/`"light"` (this project's two built-ins) or a path to
+a custom theme JSON file (`{"name", "vars", "colors"}`, every one of a
+fixed set of required color tokens defined -- see `src/theme.rs`'s own
+`REQUIRED_TOKENS` for the full list, and `ARCHITECTURE.md`'s "Themes"
+section for exactly which of them this project's own output actually
+uses). An unreadable path, invalid JSON, or a theme missing required
+tokens falls back to the built-in `dark` theme with a printed
+explanation, rather than failing the REPL. Colored output only appears
+in a real interactive terminal (respecting the `NO_COLOR` convention,
+<https://no-color.org>) -- every piped/non-interactive run (including
+this project's own tests) sees plain, uncolored text either way.
 
 ### Provider keys (`auth.json`)
 

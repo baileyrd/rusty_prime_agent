@@ -1039,6 +1039,87 @@ daemon/worker split rather than requiring the Python control environment:
   deliberately exercises -- split into two separate REPL runs (an idle
   REPL's own first line never races anything) once the cause was
   understood, rather than loosening the guard to make the test pass.
+- [x] **Themes: token spec + TUI renderer.** Previously blocked on "no
+  renderer to apply tokens to" -- raw mode was the input side only, no
+  colored/positioned output existed anywhere. That's still mostly true
+  (no cursor positioning, no boxed panels, no markdown/syntax/diff
+  rendering -- this project has none of those *features* at all, so
+  there'd be nothing honest for most of the real token spec to color),
+  but a real renderer for the output this project actually produces
+  (plain text lines) is a genuinely different, much smaller thing, and
+  turned out buildable now.
+
+  **A real verification gap surfaced while scoping this, not glossed
+  over**: this sandbox has no checkout of `prime-agent`'s own source,
+  only this project's own second-hand characterization of
+  `docs/themes.md` ("51 required color tokens across 6 categories, 4
+  value formats"). A live fetch of that file was attempted -- it
+  returned detailed, plausible-looking token lists, but three separate
+  calls disagreed with each other on category counts (6, 7, then 8) and,
+  added up, totaled 52 tokens against the claimed 51: signs of an
+  unreliable extraction, not a verified source. `src/theme.rs`'s
+  `REQUIRED_TOKENS` is the 52-token, 7-category list that recurred
+  consistently across those attempts, kept as-is rather than silently
+  trimmed to force-fit an unverified round number, and documented
+  honestly in that module's own doc comment as "closely modeled on,"
+  not "byte-for-byte verified against," `prime-agent`'s real spec --
+  the same distinction this file already draws elsewhere between a real
+  gap and an unverifiable claim.
+
+  Design: a theme is `{"name", "vars", "colors"}` JSON (parity with the
+  one structural detail every fetch attempt agreed on), `colors` mapping
+  each of the 52 required token names to a `#rrggbb` hex literal, a bare
+  `0`-`255` xterm palette index, a `vars` reference, or an empty string
+  (terminal default) -- all four of `prime-agent`'s own claimed value
+  formats. `Theme::from_file` enforces "every token required, none
+  optional" (rejecting an incomplete theme outright, not padding it with
+  defaults) the same way the real spec is described as working. Two
+  built-in themes, `dark`/`light` (the one other detail every fetch
+  attempt agreed on), are the only themes this increment actually ships
+  with real colors -- both parse and validate the full 52-token set (so
+  a hand-written custom theme file has to as well) but only assign a
+  real color to the handful of tokens ([`success`]/[`error`]/[`warning`]/
+  [`muted`]/[`dim`]/[`accent`]/[`text`]) anything in this project's own
+  output actually uses; the rest resolve to
+  [`ColorValue::Default`](../src/theme.rs) (no ANSI escape emitted) on
+  both built-ins, an honest reflection of "this token exists in the
+  schema but nothing renders it yet" rather than a plausible-looking but
+  meaningless color choice.
+
+  `settings.json` gains a `theme` field (`"dark"`/`"light"`, or a path
+  to a custom theme JSON file), read once at `session repl` startup --
+  no live reload, the same stance the file's two existing fields already
+  have. An unreadable path, invalid JSON, or a theme missing required
+  tokens all fall back to the built-in `dark` theme with a printed,
+  colorized-as-`warning` explanation -- the same "an unparseable
+  override degrades to the default, non-fatal" stance `settings::load`
+  itself already takes for a bad value, not a new failure mode invented
+  for this increment. Colorizing is gated on `termctl::is_tty()` (the
+  exact check raw mode already uses) *and* the `NO_COLOR` convention
+  (<https://no-color.org>) -- both confirmed with a real pty pass, not
+  just unit tests: colors render correctly (confirmed byte-for-byte
+  against the expected `\x1b[38;2;R;G;Bm...\x1b[0m` sequences) under a
+  genuine terminal, and `NO_COLOR=1` suppresses every one of them,
+  including the "(theme: dark)" startup note that only ever prints when
+  colors are actually active in the first place.
+
+  Wired into a deliberately small, honest set of `session_repl`'s own
+  output: the "(queued -- ...)" follow-up notice (`muted`), the `/new`/
+  `/resume` busy-guard refusal (`warning`), `/new`/`/resume` success
+  confirmations (`success`), and their failure messages (`error`) --
+  not `print_entry`/`print_json`/etc., which are shared with every
+  other, non-REPL caller in `client.rs` and stay untouched. Verified
+  with 20 new CI-safe unit tests directly on `theme.rs`'s pure functions
+  (hex/256-color/`vars`/empty-string parsing, ANSI SGR sequence
+  generation, both built-in themes defining every required token,
+  `resolve`'s three outcomes: unset → `dark`, a built-in name, a custom
+  file) plus 3 new `tests/repl.rs` integration tests exercising
+  `settings.json`'s own `theme` field end to end (an unreadable custom
+  theme path, a custom theme file missing required tokens, and a valid
+  built-in name producing no warning) -- these stay CI-safe despite the
+  real pty verification above, since the *warning* text itself prints
+  unconditionally (only its *color* depends on a real terminal), so the
+  fallback behavior is observable through ordinary piped stdio.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
@@ -2306,21 +2387,6 @@ attempted here, and not silently implied by anything in
   justice would mean picking a real subset rather than a first,
   necessarily-incomplete slice masquerading as "extensions support" --
   a deliberate scope decision now, not an absence-of-spec one.
-- **Themes.** Same correction as Extensions, same source: `prime-agent`'s
-  own `docs/themes.md` documents a full, concrete JSON token spec (51
-  required color tokens across 6 categories, 4 value formats: hex,
-  256-color, a `vars` reference, or an empty-string default) -- the
-  earlier "no format, no palette/token spec... nothing to scope a
-  bounded increment against" framing was wrong about spec *existence*.
-  It's right about there being nothing to build *first*, though, for a
-  different reason than originally stated: this project has no theming
-  surface to apply tokens to at all. Raw mode itself now exists (see the
-  medium-effort section's own "Interactive TUI: raw-mode rendering
-  foundation" entry), but that's the *input* side only -- no styled
-  output rendering, no colored/positioned text, nothing a token would
-  actually color yet. A theme spec is inert without that renderer to
-  consume it, so this stays blocked on a later TUI increment, not on
-  missing spec.
 - **"Steering"** -- interrupting an already-in-flight prompt instead of
   queuing a follow-up behind it (the other half of `prime-agent`'s
   "steering vs. follow-up queuing" surface; the follow-up-queuing half

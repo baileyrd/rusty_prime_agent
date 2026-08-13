@@ -980,6 +980,49 @@ up active once the switch completes -- surprising, and specifically the
 kind of cross-increment interaction worth guarding against explicitly
 rather than leaving as an accident of evaluation order.
 
+## Themes
+
+`src/theme.rs` -- a bounded, self-contained module, no new dependency
+(ANSI SGR escapes are plain string literals; `libc`/`windows-sys` are
+already dependencies via `termctl.rs`, and none of that FFI is even
+needed here since terminal color codes are portable text, not an ioctl).
+See `PARITY.md`'s "Themes: token spec + TUI renderer" entry for the full
+story, including a real caveat: `REQUIRED_TOKENS`'s 52-token, 7-category
+list is closely modeled on, but not verified byte-for-byte against,
+`prime-agent`'s own `docs/themes.md` (unavailable in this sandbox; a
+live fetch attempt produced internally inconsistent results across
+repeated calls).
+
+Three pieces:
+- `ThemeFile`/`ColorValue`/`Theme` -- the on-disk `{"name", "vars",
+  "colors"}` shape, a resolved four-format color value (`#rrggbb` hex,
+  a `0`-`255` xterm index, a `vars` reference, or empty-string
+  "terminal default"), and a fully-resolved theme (`Theme::from_file`
+  rejects any theme missing a required token, matching `prime-agent`'s
+  own "no optional colors" rule). `Theme::dark`/`Theme::light` are the
+  two built-ins; both validate the full 52-token set but only assign a
+  real color to the handful of tokens (`success`/`error`/`warning`/
+  `muted`/`dim`/`accent`/`text`) this project's own output actually
+  uses -- the rest resolve to `ColorValue::Default` (no ANSI escape) on
+  purpose, rather than picking a plausible-looking color for a token
+  nothing renders.
+- `resolve(theme_setting: Option<&str>) -> (Theme, Option<String>)` --
+  `settings.json`'s new `theme` field (`"dark"`/`"light"`, or a path to
+  a custom theme JSON file) resolved into an active theme plus an
+  optional failure explanation. Never fails outward: an unreadable path,
+  invalid JSON, or a theme missing required tokens all fall back to
+  `Theme::dark`, the same "an unparseable override degrades to the
+  default, non-fatal" stance `settings::load` itself already takes.
+- `colors_enabled()`/`colorize(text, color, enabled)` -- the actual
+  rendering gate (`termctl::is_tty()`, the exact check raw mode already
+  uses, *and* the `NO_COLOR` convention) and the ANSI-wrapping function
+  `client::session_repl` calls at its own handful of colorized output
+  points (the follow-up-queue notice, `/new`/`/resume`'s guard/success/
+  failure messages). Confirmed correct under a real pty, not just unit
+  tests: colors render as the expected `\x1b[38;2;R;G;Bm...\x1b[0m`
+  sequences under a genuine terminal, and `NO_COLOR=1` suppresses every
+  one of them.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth
