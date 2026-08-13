@@ -103,7 +103,13 @@ Recursion is bounded: a root session may create children up to
 not create grandchildren unless raised); a child inherits its parent's
 own max depth unchanged, and a call past the limit returns
 `{"error": "recursion depth limit reached ..."}` instead of admitting a
-child. No `rlm.list_subagents()`/`rlm.delete_subagent()` registry yet.
+child. Admitted children are tracked for you: `await
+rlm_list_subagents()` lists this session's own direct children --
+`[{"child_id", "name", "status", "session_dir"}, ...]` -- and `await
+rlm_delete_subagent(id)` (matching by child id or name) gracefully stops
+one, leaving its transcript and session directory on disk. Only a
+session's own direct children are visible/deletable this way, not
+grandchildren or unrelated sessions.
 
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython

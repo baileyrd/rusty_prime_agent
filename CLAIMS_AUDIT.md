@@ -55,9 +55,10 @@ conditioned differently than the claim implies), **N/A**.
   same `SessionNew`/`ScheduleAdd` daemon round trip `session spawn`
   already used, just callable as `await rlm("task")` from kernel code
   instead of the CLI. See the RLM Runtime Architecture section below for
-  the mechanism. Recursion depth limits (`RLM_DEPTH`/`RLM_MAX_DEPTH`) are
-  now also real -- see below; still not done: `rlm.list_subagents()`/
-  `delete_subagent()`, usage attribution.
+  the mechanism. Recursion depth limits (`RLM_DEPTH`/`RLM_MAX_DEPTH`) and
+  a parent-scoped child registry (`rlm_list_subagents()`/
+  `rlm_delete_subagent()`) are now also real -- see below; still not
+  done: usage attribution.
 - **"Everything is programmatic: file operations, shell commands, tool
   use, subagents, and context management happen through code."** --
   **False.** `--tools read|mcp` is a separate, independent model-facing
@@ -331,11 +332,16 @@ is now real (a kernel-callable coroutine over the `host.request` comm
 protocol, admitting a child session through the same daemon round trip
 `session spawn` uses) -- see the marketing-copy section above for the
 mechanism. `RLM_DEPTH`/`RLM_MAX_DEPTH` recursion limits are now real too
-(see below). Still genuinely absent: `RLMSpawnHandle` as a typed object
-(the reply is a plain dict, not an attribute-access object),
-`rlm.list_subagents()`/`rlm.delete_subagent()` (no parent-scoped registry
-yet), model search via `rlm.find_models()`, and usage/cost attribution --
-each tracked separately below. The specific points worth calling out
+(see below), and so is a parent-scoped child registry -- `await
+rlm_list_subagents()`/`await rlm_delete_subagent(id)`, backed by
+`Request::SessionList` filtered by `parent_id` and `Request::
+SessionStop` respectively, no separate registry data structure (see
+below). Still genuinely absent: `RLMSpawnHandle` as a typed object (the
+reply is a plain dict, not an attribute-access object), an `rlm`
+namespace object (`rlm_list_subagents`/`rlm_delete_subagent` are bare
+top-level functions, same simplification `rlm(...)` itself already
+made), model search via `rlm.find_models()`, and usage/cost attribution
+-- each tracked separately below. The specific points worth calling out
 individually:
 
 - **Persistent kernel, Jupyter protocol over ZeroMQ, HMAC-SHA256 signed
@@ -369,6 +375,30 @@ individually:
   `rlm_max_depth` inherited unchanged; a root session gets depth `0` and
   `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` (default `1`, matching this
   document's own stated default).
+- **"The TypeScript parent maintains the authoritative direct-child
+  registry"; `list_subagents()` returns stable child IDs/session IDs/
+  names/directories/running-or-completed status; `delete_subagent()`
+  accepts an exact child ID, session ID, or unique name, cancels/closes
+  the runtime, and does not erase the transcript or artifacts on disk.**
+  -- **Now True (was False).** Originally found False: no registry, no
+  `list_subagents`/`delete_subagent` of any kind. **Closed**: two new
+  `handle_host_request` kinds, `"rlm.list_subagents"`/
+  `"rlm.delete_subagent"`, back kernel-callable `rlm_list_subagents()`/
+  `rlm_delete_subagent(id)`. No separate registry data structure exists
+  -- a child's own persisted `parent_id` (set once, at admission) already
+  is the durable record, so `list_subagents()` is `Request::SessionList`
+  filtered to this session's own direct children, and `delete_subagent()`
+  resolves `id` against that same filtered set (by session id, falling
+  back to an exact unique name match) before issuing `Request::
+  SessionStop` -- gracefully stopping the worker, leaving `state.json`/
+  `transcript.jsonl` untouched, matching "does not erase the transcript
+  or artifacts on disk" exactly. Only direct children are visible/
+  deletable -- an unrelated session or a grandchild is rejected the same
+  as an unknown id, matching "parent-scoped." No separate durable
+  tombstone record is written; the stopped child's own persisted `status:
+  Stopped` already serves that purpose. `active-session ID` and `session
+  ID` collapse to the same concept here (no separate slot-id layer, same
+  simplification `rlm_child_id` already made).
 - **Usage/cost attribution: child assistant usage folded into the parent
   turn via a `child_usage_attributed` transcript entry.** -- **False.**
   Confirmed absent by grep -- `session spawn` creates a fully independent
@@ -594,26 +624,29 @@ above:
 
 - **The callable `rlm` object preloaded in kernel globals
   (`await rlm(...)`, `.list_subagents()`, `.delete_subagent()`,
-  `.host_request(...)`).** -- **False**, still. `bootstrap_kernel`
-  defines `rlm_heartbeat` and a bare `host_request(kind, payload)`
-  coroutine (see the system-diagram entry above), but no `rlm` object of
-  any kind, namespaced or otherwise, exists in kernel globals -- `await
-  rlm(...)`/`rlm.list_subagents()`/`rlm.host_request(...)` all remain
-  unavailable. The underlying comm-protocol primitive the last sentence
-  named as missing (`host_request`) is exactly what's now real, just not
-  yet exposed through an `rlm` namespace or consumed by any real request
-  kind.
+  `.host_request(...)`).** -- **Partial (was False).** No `rlm` object of
+  any kind, namespaced or otherwise, exists in kernel globals -- there is
+  no `rlm.list_subagents()`/`rlm.delete_subagent()` method-call syntax,
+  and never a bare `rlm.host_request(...)` either. **What's now real**:
+  the equivalent functionality, as bare top-level coroutines instead of
+  namespaced methods -- `rlm(task, ...)`, `rlm_list_subagents()`,
+  `rlm_delete_subagent(id)` -- all defined in `bootstrap_kernel`
+  alongside `rlm_heartbeat` and the underlying `host_request(kind,
+  payload)` coroutine, a deliberate, repeated simplification (see the RLM
+  Runtime Architecture section above), not an oversight.
 - **`goal`/`agent_message`/`compact` skills all calling
   `rlm.host_request(...)`.** -- **False**, confirmed each has zero
   kernel presence -- goal/compaction/messaging are all CLI/daemon-level
-  only. `host_request` itself is real now (see above), but nothing calls
-  it for any of these three kinds yet.
+  only. `host_request` itself is real now (see above), consumed by
+  `rlm`/`rlm_list_subagents`/`rlm_delete_subagent`/`rlm_heartbeat`, but
+  nothing calls it for `goal`/`agent_message`/`compact` yet.
 - **Child usage attribution, parent-scoped registry surviving
   compaction/restart, recursion depth limits.** -- **Recursion depth
-  limits now closed** (`SessionState.rlm_depth`/`rlm_max_depth`, see the
-  RLM Runtime Architecture section above); child usage attribution and a
-  parent-scoped registry remain **False/N/A**, reconfirmed with no new
-  evidence.
+  limits and a parent-scoped registry are now closed** (`SessionState.
+  rlm_depth`/`rlm_max_depth`; `rlm_list_subagents()`/
+  `rlm_delete_subagent()`, see the RLM Runtime Architecture section
+  above); child usage attribution remains **False/N/A**, reconfirmed with
+  no new evidence.
 - **Automatic compaction preserving kernel state.** -- **True.** The
   kernel process is untouched by compaction, which only changes
   `build_turns`'s provider-facing output.

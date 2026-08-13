@@ -242,7 +242,11 @@ async fn bootstrap_kernel(
          \x20       payload['name'] = name\n\
          \x20   if model is not None:\n\
          \x20       payload['model'] = model\n\
-         \x20   return await host_request('rlm.run', payload)\n",
+         \x20   return await host_request('rlm.run', payload)\n\n\
+         async def rlm_list_subagents():\n\
+         \x20   return await host_request('rlm.list_subagents')\n\n\
+         async def rlm_delete_subagent(id):\n\
+         \x20   return await host_request('rlm.delete_subagent', {{'id': id}})\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 
