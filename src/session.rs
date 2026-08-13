@@ -55,6 +55,30 @@ use crate::transport;
 /// real print() is likely to emit by accident.
 pub(crate) const HEARTBEAT_MARKER: &str = "___RPA_HEARTBEAT___";
 
+/// Parity with `prime-agent`'s `AGENTS.md`/`CLAUDE.md` auto-loading:
+/// global-tier only, same reason `skills::discover` is (see that
+/// module's own doc comment) -- the worker process has no access to the
+/// CLI caller's own cwd, so a project-local tier (walked up from cwd,
+/// `prime-agent`'s own other half) isn't attempted here. Checks
+/// `<state_dir>/AGENTS.md` first, then `<state_dir>/CLAUDE.md` -- the
+/// first one found wins, they're not merged. An empty or all-whitespace
+/// file is treated the same as a missing one (nothing to inject).
+/// `SYSTEM.md`/`APPEND_SYSTEM.md` (`prime-agent`'s own system-prompt
+/// override/append pair) stay unimplemented: this project has no base
+/// system prompt at all to override or append to outside of this
+/// context-file injection and the compaction summary, so there's
+/// nothing for either to hook into without a larger design change.
+fn read_context_file(state_root: &Path) -> Option<String> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(content) = std::fs::read_to_string(state_root.join(name)) {
+            if !content.trim().is_empty() {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
 /// Finds `HEARTBEAT_MARKER` in `stdout` (if present) and returns
 /// `(every_argument, stdout_with_the_marker_line_removed)`.
 /// `worker::bootstrap_kernel`'s `rlm_heartbeat(every=None)` prints
@@ -696,7 +720,12 @@ impl AgentSession {
     /// being sent verbatim -- `transcript.jsonl`/`self.transcript`
     /// themselves are untouched either way (see `CompactionState`'s own
     /// doc comment), so this is the only place compaction is visible to
-    /// the provider.
+    /// the provider. Also where `<state_dir>/AGENTS.md`/`CLAUDE.md` (see
+    /// `read_context_file`) becomes visible, as an even earlier system
+    /// turn -- read fresh on every call (no caching, no persisted state)
+    /// so an edit takes effect on the very next prompt, same as
+    /// `skills::discover`/`prompt_template::discover` already do for
+    /// their own on-disk sources.
     fn build_turns(&self) -> Vec<ChatTurn> {
         let boundary = self
             .state
@@ -705,6 +734,15 @@ impl AgentSession {
             .map(|c| c.compacted_up_to_sequence)
             .unwrap_or(0);
         let mut turns = Vec::new();
+        if let Some(context) = read_context_file(&self.state_root) {
+            turns.push(ChatTurn {
+                role: TurnRole::System,
+                content: Some(context),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
         if let Some(compaction) = &self.state.compaction {
             turns.push(ChatTurn {
                 role: TurnRole::System,
@@ -1107,6 +1145,100 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    fn temp_state_root(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rpa-session-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_context_file_returns_none_when_neither_file_exists() {
+        let root = temp_state_root("context-none");
+        assert_eq!(read_context_file(&root), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_context_file_finds_agents_md() {
+        let root = temp_state_root("context-agents");
+        std::fs::write(root.join("AGENTS.md"), "be concise").unwrap();
+        assert_eq!(read_context_file(&root).as_deref(), Some("be concise"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_context_file_falls_back_to_claude_md() {
+        let root = temp_state_root("context-claude");
+        std::fs::write(root.join("CLAUDE.md"), "use tabs").unwrap();
+        assert_eq!(read_context_file(&root).as_deref(), Some("use tabs"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_context_file_prefers_agents_md_over_claude_md() {
+        let root = temp_state_root("context-both");
+        std::fs::write(root.join("AGENTS.md"), "from agents").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "from claude").unwrap();
+        assert_eq!(read_context_file(&root).as_deref(), Some("from agents"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_context_file_treats_a_whitespace_only_file_as_missing() {
+        let root = temp_state_root("context-blank");
+        std::fs::write(root.join("AGENTS.md"), "   \n\n  ").unwrap();
+        assert_eq!(read_context_file(&root), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// End-to-end proof (no daemon/worker needed -- `AgentSession` is a
+    /// plain Rust type) that a state-root `AGENTS.md` actually reaches
+    /// `build_turns`'s output, not just `read_context_file` in
+    /// isolation.
+    #[rusty_tokio::test]
+    async fn build_turns_prepends_the_context_file_as_a_system_turn() {
+        let root = temp_state_root("build-turns-context");
+        std::fs::write(root.join("AGENTS.md"), "be terse").unwrap();
+
+        let session = AgentSession::create(
+            &root,
+            "sess-context-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let turns = session.build_turns();
+        assert_eq!(turns.len(), 1, "got: {turns:?}");
+        assert_eq!(turns[0].role, TurnRole::System);
+        assert_eq!(turns[0].content.as_deref(), Some("be terse"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn build_turns_has_no_system_turn_when_no_context_file_exists() {
+        let root = temp_state_root("build-turns-no-context");
+
+        let session = AgentSession::create(
+            &root,
+            "sess-no-context-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        assert!(session.build_turns().is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

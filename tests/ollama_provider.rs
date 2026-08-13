@@ -269,3 +269,47 @@ fn ollama_provider_compacts_after_crossing_the_trigger_threshold() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Real end-to-end proof that `<state_dir>/AGENTS.md` actually reaches
+/// the model, not just `session::build_turns`'s own unit-tested output
+/// (see `session::tests::build_turns_prepends_the_context_file_as_a_system_turn`
+/// for the CI-safe half). Small models are decent at echoing back a
+/// fact stated directly in their own context, much more reliable than
+/// tool-calling instruction-following (see this file's other tests'
+/// own caveats about that) -- still asserts loosely enough to tolerate
+/// real small-model variance. Deliberately `#[ignore]`d for the same
+/// infra reasons as this file's other tests.
+#[test]
+#[ignore]
+fn ollama_provider_includes_agents_md_as_system_context() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-agents-md-e2e");
+    // Written before the daemon starts, but `read_context_file` is read
+    // fresh on every `build_turns` call regardless of timing -- see that
+    // function's own doc comment.
+    std::fs::write(
+        state_dir.path().join("AGENTS.md"),
+        "The secret code word is ZEBRA97. If asked for it, reply with just that word.",
+    )
+    .unwrap();
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+    let ack = common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "What is the secret code word? Reply with just the word.",
+    );
+    assert!(
+        !ack.contains("] assistant: echo:"),
+        "reply looks like EchoProvider's output, not a real model's -- got: {ack}"
+    );
+    assert!(
+        ack.contains("ZEBRA97"),
+        "expected the AGENTS.md-provided fact to reach the model's reply, got: {ack}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
