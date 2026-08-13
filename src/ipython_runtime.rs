@@ -1718,4 +1718,123 @@ compact = _Compact()
 
         let _ = std::fs::remove_dir_all(&session_dir);
     }
+
+    /// Real end-to-end coverage for the `_Pi` mechanism `worker::
+    /// bootstrap_kernel` defines for extensions: registers a command and
+    /// a pre-tool-call hook exactly the way a real extension's own
+    /// `register(pi)` would, then drives `pi._run_command` and `pi.
+    /// _run_pre_tool_call_hooks` (the same two entry points `session::
+    /// invoke_extension_command`/`run_pre_tool_call_hooks` call in
+    /// production) and confirms both return what a real extension author
+    /// would expect. Deliberately does not go through a real `import
+    /// <extension>` + `EXTENSION_REGISTRY_MARKER` round trip -- this test
+    /// is about proving the `_Pi` class itself works against a genuine
+    /// kernel, independent of `extensions::discover`/file-layout
+    /// concerns those already have their own CI-safe coverage.
+    /// `#[ignore]`d for the same real-`ipykernel`-install reason as its
+    /// siblings.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_pi_registers_a_command_and_a_pre_tool_call_hook() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-pi-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the `_Pi` class `worker::bootstrap_kernel` defines.
+        let define_pi = "\
+class _Pi:
+    def __init__(self):
+        self._pre_tool_call_hooks = []
+        self._commands = {}
+    def on(self, event, handler):
+        if event != 'pre_tool_call':
+            raise ValueError(
+                'unknown event %r -- only \\'pre_tool_call\\' is supported'
+                % (event,)
+            )
+        self._pre_tool_call_hooks.append(handler)
+    def register_command(self, name, handler, description=''):
+        self._commands[name] = (handler, description)
+    def _run_pre_tool_call_hooks(self, tool_name, arguments):
+        for hook in self._pre_tool_call_hooks:
+            result = hook(tool_name, arguments)
+            if result:
+                return result
+        return None
+    def _run_command(self, name, args):
+        entry = self._commands.get(name)
+        if entry is None:
+            return None
+        return entry[0](args)
+pi = _Pi()
+";
+        runtime
+            .execute(define_pi)
+            .await
+            .expect("defining _Pi should round-trip");
+
+        // Mimics a real extension's synchronous `register(pi)` call.
+        let register = "\
+def greet(args):
+    return 'hello ' + args
+pi.register_command('greet', greet, description='say hello')
+
+def block_shell(tool_name, arguments):
+    if tool_name == 'run_shell':
+        return 'shell calls are blocked in this test'
+    return None
+pi.on('pre_tool_call', block_shell)
+";
+        runtime
+            .execute(register)
+            .await
+            .expect("register(pi) should round-trip");
+
+        let outcome = runtime
+            .execute("pi._run_command('greet', 'world')")
+            .await
+            .expect("invoking the registered command should round-trip");
+        assert_eq!(outcome.result.as_deref(), Some("'hello world'"));
+
+        // IPython's interactive displayhook -- same as a plain Python
+        // REPL -- suppresses `execute_result` entirely when the value is
+        // `None`, so this reads as no result at all rather than the
+        // string `"None"`.
+        let outcome = runtime
+            .execute("pi._run_command('missing', '')")
+            .await
+            .expect("invoking an unregistered command should round-trip");
+        assert_eq!(outcome.result, None);
+
+        let outcome = runtime
+            .execute("pi._run_pre_tool_call_hooks('run_shell', {'cmd': 'ls'})")
+            .await
+            .expect("running the pre-tool-call hooks should round-trip");
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("'shell calls are blocked in this test'")
+        );
+
+        let outcome = runtime
+            .execute("pi._run_pre_tool_call_hooks('read_file', {'path': 'x'})")
+            .await
+            .expect("running the hooks for an unblocked tool should round-trip");
+        assert_eq!(outcome.result, None);
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
 }

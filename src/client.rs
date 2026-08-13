@@ -1409,6 +1409,29 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if let Some(rest) = text.strip_prefix('/') {
+            // Falls through here only after every built-in slash command
+            // above has already had a chance to match -- bounded parity
+            // with a slice of `prime-agent`'s extension system
+            // (`pi.register_command`, see `extensions.rs`'s own module
+            // doc comment). Optimistically round-trips to the worker
+            // rather than checking a client-side list first: which
+            // commands exist depends on the live kernel's own state
+            // (which extensions actually loaded, whether `register(pi)`
+            // ran without error), not something the REPL loop could
+            // know independently without its own separate round trip
+            // first -- one request either way, so there's no real
+            // "extra" cost to just trying. Not Tab-completed (`REPL_
+            // SLASH_COMMANDS` only lists the built-ins) -- an honest,
+            // stated limitation, not an oversight.
+            let (command, args) = rest.split_once(' ').unwrap_or((rest, ""));
+            let output = send_extension_command(state_root, &session_id, command, args).await?;
+            println!(
+                "{}",
+                crate::theme::colorize(&output, theme.token("text"), colors_on)
+            );
+            continue;
+        }
         let text_to_send = match pending_file_content.take() {
             Some(prefix) => format!("{prefix}{text}"),
             None => text.to_string(),
@@ -2002,6 +2025,35 @@ async fn send_prompt_with_images(
     .await?;
     match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
         Response::SessionPromptAck { entry } => Ok(entry),
+        other => Err(unexpected_response(other)),
+    }
+}
+
+/// `session_repl`'s own fallback for a `/foo args...` line that matched
+/// none of the built-in slash commands -- bounded parity with a slice
+/// of `prime-agent`'s extension system, see `extensions.rs`'s own
+/// module doc comment. REPL-only, no top-level `harness` subcommand:
+/// an extension command only exists once a running kernel has actually
+/// registered it, so there's nothing a one-shot CLI invocation (no live
+/// session to check against) could usefully do with `--command <name>`.
+async fn send_extension_command(
+    state_root: &Path,
+    session_id: &str,
+    command: &str,
+    args: &str,
+) -> Result<String> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionExtensionCommand {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            args: args.to_string(),
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        Response::SessionExtensionCommandResult { output } => Ok(output),
         other => Err(unexpected_response(other)),
     }
 }

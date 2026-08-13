@@ -160,6 +160,20 @@ pub enum Request {
         session_id: String,
         instructions: Option<String>,
     },
+    /// Invokes an extension-registered command (`pi.register_command`,
+    /// bounded parity with a slice of `prime-agent`'s extension system --
+    /// see `extensions.rs`'s own module doc comment). Valid on both
+    /// transports, forwarded to the owning worker unchanged, same
+    /// reasoning as `SessionRename`/`SessionCompact`. Not a top-level
+    /// CLI subcommand -- only `client::session_repl`'s own fallback (a
+    /// `/foo args...` line that matched none of the built-in slash
+    /// commands) ever sends this, since extension commands only exist
+    /// once a running kernel has actually registered them.
+    SessionExtensionCommand {
+        session_id: String,
+        command: String,
+        args: String,
+    },
     /// Parity with `session-format.md`'s active-leaf concept: redirects
     /// `session_id`'s own `SessionState::active_leaf_sequence` to
     /// `sequence` -- the entry the *next* append continues from. Valid on
@@ -347,6 +361,15 @@ pub enum Response {
     SessionCompactAck {
         compacted: bool,
         summary: Option<String>,
+    },
+    /// `output` is a friendly "unknown extension command: /foo" message
+    /// (not a `Response::Error`) when `command` names nothing
+    /// registered -- the same "accurate no-op beats a manufactured
+    /// error" reasoning `SessionCompactAck`/`ScheduleCancelAck::found`
+    /// already use, since an unrecognized `/foo` typed in the REPL is
+    /// normal, recoverable input.
+    SessionExtensionCommandResult {
+        output: String,
     },
     SessionSetActiveLeafAck {
         active_leaf_sequence: u64,

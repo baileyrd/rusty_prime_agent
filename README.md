@@ -298,6 +298,28 @@ lists what's installed.
 harness skill list
 ```
 
+### Extensions
+
+A bounded first slice of `prime-agent`'s `ExtensionAPI`, for
+`--runtime ipython` sessions -- see `ARCHITECTURE.md`'s "Extensions"
+section and `PARITY.md` for the full design and what's still absent.
+Drop a directory into `<state-dir>/extensions/<name>/`: an
+`EXTENSION.md` (`description` frontmatter) alongside a real Python
+package (`__init__.py`) defining `def register(pi): ...`. `pi` supports
+two calls:
+
+- `pi.on("pre_tool_call", handler)` -- `handler(tool_name, arguments)`
+  runs before every tool call; returning a non-empty string skips the
+  real call and substitutes that string as the result.
+- `pi.register_command(name, handler, description="")` -- makes
+  `/name <args>` invocable from `session repl`, calling
+  `handler(args)` and printing whatever it returns.
+
+Both must be plain synchronous Python functions (no `async`/`await`) --
+see `ARCHITECTURE.md` for why. An unrecognized `/name` (including on a
+session with no extensions at all) prints
+`unknown extension command: /name` rather than erroring.
+
 ### Context files
 
 Drop an `AGENTS.md` (or `CLAUDE.md`) into the state directory and every

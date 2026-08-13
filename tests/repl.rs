@@ -778,3 +778,30 @@ fn repl_accepts_a_builtin_theme_name_with_no_warning() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// `/foo` doesn't match any built-in slash command, so it falls through
+/// to the extension-command dispatch (`send_extension_command` ->
+/// `Request::SessionExtensionCommand` -> `AgentSession::
+/// invoke_extension_command`). This session never ran `--runtime
+/// ipython`, so no extension registry was ever installed
+/// (`registered_commands` stays empty) -- proving the friendly "unknown
+/// extension command" fallback, not a hard error, is what a session with
+/// no extensions at all actually returns. No real kernel needed: this
+/// exercises the daemon/worker/session relay path with `EchoProvider`
+/// only.
+#[test]
+fn repl_unknown_extension_command_reports_a_friendly_message() {
+    let state_dir = common::TempDir::new("repl-extension-unknown");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/foo bar\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unknown extension command: /foo"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}

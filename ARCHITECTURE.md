@@ -387,6 +387,68 @@ string rides along on the marker's own printed line
 (`client::schedule_add`) instead of sending a prompt immediately, since
 a repeating heartbeat is a standing re-entry, not a one-time action.
 
+## Extensions
+
+A bounded first slice of `prime-agent`'s `ExtensionAPI` -- see
+`PARITY.md` for the full story, including why the surface stayed
+unimplemented for a while and what's still genuinely absent. An
+extension is a Python package discovered exactly the way skills are
+(`src/extensions.rs` mirrors `skills.rs` line-for-line):
+`<state_root>/extensions/<name>/EXTENSION.md` (`description`
+frontmatter) plus `__init__.py` defining `def register(pi): ...`.
+
+`worker::bootstrap_kernel` (the same function that installs skills and
+defines `rlm_heartbeat`, above) now always defines a `_Pi` class and a
+shared `pi = _Pi()` instance in the kernel's globals when `--runtime
+ipython`, then `import`s every discovered extension and calls its
+`register(pi)` if present. `pi` exposes exactly two of `prime-agent`'s
+~25 named lifecycle events: `pi.on("pre_tool_call", handler)` and
+`pi.register_command(name, handler, description="")`. Both are
+deliberately **synchronous** Python methods, no `await
+host_request(...)` the way `goal`/`agent_message`/`compact`/`rlm(...)`
+are -- registration itself never needs a round trip back into Rust, and
+critically *can't* use one: an extension's `register(pi)` call runs from
+inside a plain `import` statement, and ordinary module-level code
+executed via `import` does not get IPython's own top-level-`await`
+support the way a real `execute_request` cell does, so an `async def
+register` would need `bootstrap_kernel`'s single
+`tool_runtime.execute(&code)` call to pause and resume mid-registration
+-- machinery it deliberately doesn't have. What Rust needs back (which
+commands got registered, whether any hook exists) is read in one shot
+instead: one more marker-prefixed `print` (`EXTENSION_REGISTRY_MARKER`)
+appended to the end of the same bootstrap code string, the same
+technique `session::HEARTBEAT_MARKER` already established.
+
+`pi.on("pre_tool_call", handler)` hooks the one real chokepoint every
+tool call passes through regardless of backend,
+`AgentSession::execute_tool_call` -- confirmed, not assumed, before this
+was built. A handler returning a non-empty string skips the real tool
+call and substitutes that string as the result
+(`"blocked by extension: <reason>"`). The check and the registry state
+(`registered_commands`, `has_pre_tool_call_hook`) both live on
+`AgentSession` itself, installed once after `bootstrap_kernel` returns
+(`AgentSession::install_extension_registry`); each hook invocation is a
+small generated code string (`import json; __rpa_result =
+pi._run_pre_tool_call_hooks(...); print(MARKER + json.dumps(...))`) run
+through the same `tool_runtime.execute` every other Python round trip
+uses, with the marker-print pattern read back via a small shared helper
+(`extract_marker_json`).
+
+`pi.register_command(name, handler, description="")` makes `/name
+<args>` invocable from `session_repl`: a new `Request::
+SessionExtensionCommand` (daemon relays to the worker, same shape as
+every other session-scoped request) drives
+`AgentSession::invoke_extension_command`, which runs `pi._run_command`
+the same generated-code-plus-marker way. `session_repl`'s dispatch tries
+every built-in slash command first; only if none match does it fall
+through to `send_extension_command` as the last step before treating the
+line as an ordinary prompt. An unrecognized command name (including on
+a session that never ran `--runtime ipython`, so `registered_commands`
+stays empty) reads as `"unknown extension command: /name"`, not a hard
+error. Deliberately not added to `REPL_SLASH_COMMANDS` (the flat list
+Tab-completion consults) -- extension commands aren't known statically
+at REPL-loop-construction time, so there's no completion for them.
+
 ## Automatic context compaction
 
 Parity with `prime-agent compaction.md` -- see `PARITY.md` for the full
