@@ -611,24 +611,32 @@ above:
 ## sessions.md
 
 - **"Sessions auto-save to `~/.prime/agent/sessions/`. Each session is a
-  JSONL file with a tree structure."** -- **Partial.** Auto-saves too,
-  but as a per-session *directory* (`state.json` + `transcript.jsonl`),
-  not one flat JSONL file -- and no tree structure (see session-format.md
-  below).
+  JSONL file with a tree structure."** -- **Partial, one clause now
+  closed.** Auto-saves too, but as a per-session *directory*
+  (`state.json` + `transcript.jsonl`), not one flat JSONL file -- still
+  true. **Closed**: the transcript now does have a real tree structure
+  (see session-format.md below).
 - **Session picker (search, sort toggle, rename, delete-via-trash).** --
   **False.** No interactive picker exists; `session list` is a flat
   print and there's no delete command at all (only manual directory
   removal).
-- **`/tree`/`/fork`/`/clone` comparison.** -- **Partial**, only the
-  `/fork` column has a real (bounded) analog -- `session fork` matches
-  reasonably well; `/tree` and `/clone` have none, already tracked as
-  structurally out of scope.
+- **`/tree`/`/fork`/`/clone` comparison.** -- **Partial.** `/fork` has a
+  real (bounded) analog -- `session fork` matches reasonably well. The
+  data model `/tree` and `/clone` would need is now real (see
+  session-format.md below), but neither's own CLI/REPL surface (`/tree`
+  navigation, `/clone`'s live-state duplication) exists yet.
 
 ## session-format.md
 
 - **"Sessions... form a tree structure via `id`/`parentId` fields,
-  enabling in-place branching."** -- **False.** `TranscriptEntry` has
-  only a linear `sequence: u64`, no `id`/`parentId` fields at all.
+  enabling in-place branching."** -- **Partial.** No separate `id`
+  field (this project addresses tree position via the pre-existing
+  `sequence: u64` instead of a new id concept), but `TranscriptEntry::
+  parent_sequence: Option<u64>` is a real `parentId` analog, and
+  `SessionState::active_leaf_sequence` tracks the branch point
+  `AgentSession::set_active_leaf` can redirect mid-session -- in-place
+  branching itself is real. No CLI/REPL surface exposes it yet (no
+  `/tree`, no way to trigger `set_active_leaf` outside the protocol).
 - **File location: one `<session-id>.jsonl` file per session.** --
   **False.** A directory with separate `state.json`
   (pointer/recovery metadata) and `transcript.jsonl` (append-only log).

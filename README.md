@@ -180,9 +180,12 @@ enough to fold away yet.
 starting transcript is a copy of `<id>`'s own transcript up through
 `--at N` (or the whole thing, if `--at` is omitted) -- bounded parity
 with a slice of `prime-agent`'s `/fork` (session-level forking, not
-intra-session branching; no `/tree` visualization or active-leaf
-switching -- see `ARCHITECTURE.md` for exactly what that distinction
-means and why). The new session carries forward the source's `--model`/
+intra-session branching -- see `ARCHITECTURE.md` for exactly what that
+distinction means. Intra-session branching's own data model (an
+active-leaf pointer any transcript entry can redirect) now exists
+underneath the protocol, but no `/tree` visualization or CLI/REPL
+command reaches it yet). The new session carries forward the source's
+`--model`/
 `--thinking`/`--tools`/`--runtime` configuration but starts with no goal
 and no Continual Harness history, since both would only be accurate
 against the source's full history, not necessarily a truncated copy of

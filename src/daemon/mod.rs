@@ -311,6 +311,13 @@ impl Supervisor {
                 self.handle_session_compact(&mut conn, session_id, instructions)
                     .await
             }
+            Request::SessionSetActiveLeaf {
+                session_id,
+                sequence,
+            } => {
+                self.handle_session_set_active_leaf(&mut conn, session_id, sequence)
+                    .await
+            }
             Request::SessionFork {
                 session_id,
                 at_sequence,
@@ -1057,6 +1064,38 @@ impl Supervisor {
             .await?
             .ok_or_else(|| {
                 HarnessError::protocol(Context::Worker, "worker closed before responding to rename")
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_session_set_active_leaf(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        sequence: u64,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::SessionSetActiveLeaf {
+                    session_id,
+                    sequence,
+                },
+            )
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to set_active_leaf",
+                )
             })?;
         conn.write_response(Context::Daemon, &response).await
     }
