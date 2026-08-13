@@ -443,6 +443,15 @@ list`/`cancel`, same as any other schedule. A line that's `/compact` or
 `/compact <instructions>` forces context compaction immediately, same as
 `session compact`.
 
+Typing a new line while a prompt is still generating its reply doesn't
+block: it's queued and sent, in order, as soon as the current reply
+lands, printed with a `(queued -- will run once the current reply
+finishes)` notice so it's clear it hasn't been dropped. This is the
+follow-up half of `prime-agent`'s "steering vs. follow-up queuing" --
+*steering* (interrupting an in-flight prompt instead of queuing behind
+it) isn't supported, since there's no way yet to cancel a prompt this
+project's daemon/worker are already processing.
+
 `/file <path>` reads a local file and includes its content in your
 *next* prompt (queued across an intervening `/heartbeat`/`/compact`/
 `/fork` line, not dropped) -- a bounded slice of a TUI's file-reference

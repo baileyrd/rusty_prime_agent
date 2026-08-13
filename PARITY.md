@@ -855,13 +855,110 @@ daemon/worker split rather than requiring the Python control environment:
   same honest, bounded interpretation this project has applied to every
   other `prime-agent` surface that assumes a richer host environment than
   a terminal byte stream provides.
+- [x] **Interactive TUI: steering vs. follow-up message queue.** Half of
+  the surface this bullet used to name as one atomic "structurally
+  absent" blob -- follow-up queuing -- turns out to be genuinely
+  buildable; the other half, steering (interrupting an in-flight prompt
+  rather than queuing behind it), is a real, separately-tracked gap (see
+  "Needs a new subsystem" below for exactly why: there's no cancellation
+  primitive anywhere in this project today).
+
+  Before this increment, `session_repl`'s stdin loop was fully
+  synchronous: read one line, `.await` its full reply, only then read
+  the next -- there was never a window during which a second line could
+  even be read, let alone dispatched. Reading now lives on its own
+  persistent background task (`rusty_tokio::spawn_blocking`, looping
+  internally -- a *persistent* reader is required here, unlike
+  `session_rpc`'s own per-line `spawn_blocking` call, because racing a
+  *fresh* blocking read against an in-flight prompt on every loop
+  iteration would risk two concurrent blocking reads on the same fd if
+  the prompt happened to finish first and the read was abandoned
+  mid-flight), feeding lines into an unbounded channel. The main loop
+  races that channel against whatever prompt is currently in flight
+  (`rusty_tokio::select!`, this project's own hand-rolled two-to-five-way
+  future-racing macro -- see `rusty_tokio`'s crate docs): a line that
+  arrives while nothing is in flight dispatches immediately, unchanged
+  from before; a line that arrives while a prompt is still generating is
+  queued and dispatched, in FIFO order, once the in-flight prompt's
+  reply lands. Only ordinary prompt sends run concurrently with reading
+  -- slash commands still execute synchronously once dispatched (see
+  the "full slash-command surface" entry below for why widening every
+  one of them to also run concurrently is a separate, larger increment).
+
+  A real implementation hazard, found while wiring this up rather than
+  assumed away: `rusty_tokio::select!` expands each branch into one
+  shared `move` `poll_fn` closure, and a `move` closure captures every
+  referenced outer variable *by value* -- not merely by the reference
+  its usage would otherwise need. The first draft mutated `current`/
+  `queue`/`reader_done` directly from inside `select!` branch bodies;
+  this both silently discarded the mutation (the closure's own copy was
+  dropped once the `.await` completed) and failed to compile on the
+  *second* loop iteration ("borrow of moved value" -- the same outer
+  variable had already been moved into the *first* iteration's now-
+  dropped closure). Fixed by having every branch compute and return a
+  plain value (a two-variant `Wake` enum: the prompt finished, or the
+  reader produced something) with zero side effects inside the macro,
+  and doing every mutation in ordinary code immediately after the
+  `select!` call completes, once no closure is holding a borrow of
+  anything. The channel receiver itself needed the same treatment for a
+  different reason: it's reused across every loop iteration (both inside
+  `select!` and in the plain idle-path `.await` below it), so it can
+  never itself be moved into a `select!`-generated closure -- a fresh
+  `&mut line_rx` reborrow, taken immediately before each use, is what
+  actually gets captured instead.
+
+  A second, real concurrent-output hazard: raw mode's own per-keystroke
+  echo (`read_raw_line`, on the persistent background task) can now run
+  at the same moment the main task prints a reply that just finished
+  generating -- unlike before, when reading and printing could never
+  overlap by construction. Guarded with a shared `Arc<std::sync::Mutex<
+  ()>>` (not `rusty_tokio::sync::Mutex` -- the reader lives in a
+  genuinely synchronous `spawn_blocking` closure that can't `.await` an
+  async lock), the same shared-lock shape `session_rpc`'s own
+  `stdout_lock`/`forward_events` already established for an analogous
+  problem. Bounded, not exhaustive: it covers every `read_raw_line`
+  write plus this increment's own two new output points, but doesn't
+  reach into `session_compact`/`session_fork`/`session_tree`/etc.'s own
+  internal print calls (shared with the plain top-level, non-REPL CLI
+  commands, which have no such lock and no reason to need one) -- a
+  slash command's own output can still, in principle, interleave with
+  live keystroke echo of whatever's typed immediately afterward, now
+  that the reader runs continuously regardless of what the main task is
+  doing. Stated honestly rather than left silently uncovered: closing
+  that residual gap would mean threading a lock through every shared
+  client function's own print calls, materially larger than this
+  increment's scope.
+
+  Verified with a new CI-safe `tests/repl.rs` integration test
+  (`repl_queues_lines_typed_while_a_reply_is_still_in_flight`) that pipes
+  four lines at once and asserts all four replies land, in order, and
+  that the "queued" notice fires -- reliable in practice (confirmed
+  across repeated runs) because a kernel pipe read is effectively
+  instant while a daemon round trip (a real socket hop plus transcript
+  persistence) is not, so the background reader routinely gets ahead of
+  the first prompt's own completion. Cross-checked the existing full
+  test suite stays green (every pre-existing REPL/piped-stdin test
+  behaves identically). Plus a real pty pass in this sandbox (Python's
+  `pty` module, the same technique used to verify raw mode itself in the
+  "raw-mode rendering foundation" entry): typing three lines back to
+  back under genuine raw-mode terminal control produced two "queued"
+  notices and all three replies in strict order (`[2]`/`[4]`/`[6]`),
+  reproduced identically across three separate runs, with clean,
+  non-garbled echo throughout -- proof the `stdout_lock` fix genuinely
+  holds under a real terminal, not just in the piped/cooked-mode tests.
+  (One artifact surfaced and ruled out during that manual pass: typing
+  *immediately* at process spawn, before `RawModeGuard::enable()` has
+  had a chance to run, can produce a doubled echo of the very first
+  line -- a startup race in the pre-existing raw-mode foundation from
+  task #76, not something this increment introduced, and not reachable
+  by any real human typing at a real terminal.)
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
-  below for the pieces that genuinely don't have a bounded slice --
-  steering vs. follow-up queuing, `/clone`, `/share` -- and why; `/tree`
-  itself is covered by the entry just above, image paste by its own
-  entry further up).
+  below for "steering", the one piece that genuinely doesn't have a
+  bounded slice yet -- along with `/clone`/`/share` -- and why; `/tree`
+  itself is covered by the entry just above, image paste and follow-up
+  message queuing by their own entries further up).
 
   `/file <path>` reads a local file client-side and queues its content
   to be prepended to the *next* line that actually sends a prompt (a
@@ -1037,9 +1134,9 @@ daemon/worker split rather than requiring the Python control environment:
   of that, the same "extract the tractable session-level mechanism,
   leave the rich surface out" move as `session spawn`/prompt templates
   above. Most have since landed (see the `/file`/`/fork`/`/export`,
-  `/tree`/active-leaf-switching, and image paste entries further down);
-  steering vs. follow-up queuing and `/clone`/`/share` still haven't, see
-  "Needs a new subsystem" below for why.
+  `/tree`/active-leaf-switching, image paste, and follow-up message
+  queue entries further down); steering and `/clone`/`/share` still
+  haven't, see "Needs a new subsystem" below for why.
 - [x] **Model/provider catalog listing** (`harness model list`), the
   provider tier of `prime-agent model list`'s catalog browse: which of
   the known providers (`openai`/`anthropic`/`gemini`/`groq`/`ollama`,
@@ -2137,20 +2234,26 @@ attempted here, and not silently implied by anything in
   actually color yet. A theme spec is inert without that renderer to
   consume it, so this stays blocked on a later TUI increment, not on
   missing spec.
-- **The interactive TUI's message-queue surface, the piece that still
-  needs more than raw mode plus text-only line editing gives** (raw mode
-  itself, multi-line input/`@` file-reference completion/slash-command
-  Tab completion, and image paste, now exist -- see the medium-effort
-  section's own "Interactive TUI: raw-mode rendering foundation", "rich
-  editor", and "image paste support" entries): **steering vs. follow-up
-  queuing** (typing a new message while a prior one is still generating,
-  and choosing whether it interrupts or queues -- `session_repl`'s stdin
-  loop is synchronous start to finish, `send_prompt` blocks the loop
-  until the full reply lands, so there is no window during which a
-  second line could even be read, let alone dispatched as steering-vs-
-  queued; this isn't "harder in a REPL," it's structurally absent without
-  a real concurrent-input event loop). `/clone` (live-state duplication)
-  stays out of scope for
+- **"Steering"** -- interrupting an already-in-flight prompt instead of
+  queuing a follow-up behind it (the other half of `prime-agent`'s
+  "steering vs. follow-up queuing" surface; the follow-up-queuing half
+  is done, see the medium-effort section's own "Interactive TUI:
+  steering vs. follow-up message queue" entry for the full story of what
+  landed there and why this half specifically didn't). Investigated, not
+  assumed: there is no cancellation primitive anywhere in this project's
+  protocol/daemon/worker layers today -- no `Request::SessionInterrupt`,
+  nothing a client could send to abort a `session.lock().await`-held
+  `prompt()` call already running server-side. A client dropping its own
+  connection or spawned task wouldn't cancel the daemon's own in-flight
+  work either; the worker would keep processing the abandoned prompt and
+  could append a stray, unrequested reply to the transcript later,
+  incoherent with whatever the "steering" message produced instead. A
+  real fix needs an actual interrupt primitive threaded through
+  `daemon`/`worker`/`session.rs` -- tracked as its own item (see the
+  "Bounded candidates" batches' own "cancel primitive" entry), not
+  something the REPL's own input-handling increment can absorb as a
+  side effect.
+- `/clone` (live-state duplication) stays out of scope for
   the reasons given above and in the medium-effort section's `session
   fork` entry -- a running kernel connection or MCP session dies with
   the source worker, same as any other session boundary, and that's not

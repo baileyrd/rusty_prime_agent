@@ -887,6 +887,67 @@ vision model for most coverage; `tests/ollama_provider.rs`'s
 `#[ignore]`d `ollama_provider_describes_a_real_image` is the real-model
 proof, run manually against `moondream` in this project's own sandbox.
 
+## Follow-up message queue
+
+`prime-agent`'s "steering vs. follow-up queuing" surface, bounded to the
+follow-up half -- see `PARITY.md`'s "Interactive TUI: steering vs.
+follow-up message queue" entry for the full story of why steering
+(interrupting an in-flight prompt) stays out of scope: there is no
+cancellation primitive anywhere in this project's protocol/daemon/worker
+layers today.
+
+Before this increment, `client::session_repl`'s stdin loop was fully
+synchronous -- read one line, `.await` its whole reply, only then read
+the next -- so a second line could never even be read while a prompt was
+in flight. Reading now lives on its own persistent
+`rusty_tokio::spawn_blocking` task, looping internally and feeding lines
+into an unbounded `rusty_tokio::sync::mpsc` channel; a persistent reader
+is required rather than one fresh `spawn_blocking` call per line (the
+shape `client::session_rpc`'s own stdin loop already uses) specifically
+because racing a *fresh* blocking read against an in-flight prompt every
+loop iteration risks two concurrent blocking reads on the same fd if the
+prompt happens to finish first and the read is abandoned mid-flight. The
+main loop races that channel against whatever prompt is currently in
+flight with `rusty_tokio::select!` (this project's `tokio`-free async
+runtime's own hand-rolled two-to-five-way future-racing macro): a line
+that arrives while idle dispatches immediately; a line that arrives
+while a prompt is generating is pushed onto a `VecDeque<String>` and
+dispatched, FIFO, once the in-flight prompt's reply lands. Only ordinary
+prompt sends (`rusty_tokio::spawn`, replacing a direct `.await`) run
+concurrently with reading -- every slash command still executes
+synchronously once dispatched.
+
+Two real hazards surfaced building this, not assumed away:
+
+- `rusty_tokio::select!` expands each branch into one shared `move`
+  `poll_fn` closure, and a `move` closure captures every referenced
+  outer variable *by value*. Branches can't mutate outer state directly
+  (the mutation is silently lost once that one-shot closure drops, and
+  reusing the same outer variable on the next loop iteration fails to
+  compile outright -- "borrow of moved value"). Every branch instead
+  computes and returns a plain `Wake` enum value with zero side effects,
+  and all mutation happens in ordinary code immediately after the
+  `select!` call completes. The channel receiver needs the identical
+  treatment for the same underlying reason: a fresh `&mut line_rx`
+  reborrow, taken immediately before each use (both inside `select!` and
+  in the plain idle-path `.await`), is what actually gets captured --
+  `line_rx` itself is never moved, since it has to survive across every
+  loop iteration.
+- Raw mode's own per-keystroke echo (`read_raw_line`, on the persistent
+  reader task) can now run at the same moment the main task prints a
+  reply that just finished -- a genuinely new possibility, since reading
+  and printing could never overlap before this increment. Guarded with a
+  shared `Arc<std::sync::Mutex<()>>` (plain `std::sync::Mutex`, not
+  `rusty_tokio::sync::Mutex` -- the reader is a genuinely synchronous
+  `spawn_blocking` closure that can't `.await` an async lock), mirroring
+  `session_rpc`'s own `stdout_lock`/`forward_events` shared-lock shape
+  for an analogous concurrent-writer problem. Covers every
+  `read_raw_line` write plus this increment's own two new output points;
+  does *not* reach into `session_compact`/`session_fork`/`session_tree`/
+  etc.'s own internal print calls, shared with the plain top-level CLI
+  commands -- see `PARITY.md`'s own entry for why that residual gap is
+  stated rather than silently left uncovered.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth
