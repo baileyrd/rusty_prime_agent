@@ -256,7 +256,24 @@ pub struct NewSessionMeta {
     pub tools: Option<String>,
     /// See `protocol::Request::SessionNew::runtime`'s own doc comment.
     pub runtime: Option<String>,
+    /// See `protocol::SessionState::rlm_depth`'s own doc comment. `None`
+    /// here means "not yet resolved" (defaults to `0` in
+    /// [`AgentSession::create`]); by the time a real worker is spawned,
+    /// `daemon::handle_session_new` has always resolved a real value,
+    /// same treatment as `model`'s env-var fallback.
+    pub rlm_depth: Option<u32>,
+    /// See `protocol::SessionState::rlm_max_depth`'s own doc comment.
+    /// `None` defaults to `1` in [`AgentSession::create`], same
+    /// resolved-server-side treatment as `rlm_depth`.
+    pub rlm_max_depth: Option<u32>,
 }
+
+/// `rlm-runtime.md`'s own stated default for `RLM_MAX_DEPTH`: a root
+/// session may create children; those children may not create
+/// grandchildren unless the limit is configured higher (`
+/// RUSTY_PRIME_AGENT_RLM_MAX_DEPTH`, resolved in `daemon::
+/// handle_session_new`).
+pub(crate) const DEFAULT_RLM_MAX_DEPTH: u32 = 1;
 
 impl AgentSession {
     /// Create a brand-new session: fresh id, empty transcript, generation
@@ -276,6 +293,8 @@ impl AgentSession {
             thinking,
             tools,
             runtime,
+            rlm_depth,
+            rlm_max_depth,
         } = meta;
         let session_dir = paths::session_dir(state_root, &session_id);
         paths::ensure_dir(Context::Session, &session_dir)?;
@@ -308,6 +327,8 @@ impl AgentSession {
             runtime,
             compaction: None,
             forked_from: None,
+            rlm_depth: rlm_depth.unwrap_or(0),
+            rlm_max_depth: rlm_max_depth.unwrap_or(DEFAULT_RLM_MAX_DEPTH),
         };
         let session = AgentSession {
             state,
@@ -675,11 +696,25 @@ impl AgentSession {
     /// immediately after admission, never waiting for the child's own
     /// reply -- parity with `rlm(...)` "returns immediately after task
     /// admission... never waits for or returns the child's answer"
-    /// (`rlm-runtime.md`). No recursion-depth check yet (a later,
-    /// separate increment) and no parent-scoped registry of admitted
-    /// children yet (likewise) -- this covers exactly the admission call
-    /// itself.
+    /// (`rlm-runtime.md`). Rejects admission once `RLM_DEPTH >=
+    /// RLM_MAX_DEPTH` (see the check at the top of the body below); no
+    /// parent-scoped registry of admitted children yet (a later, separate
+    /// increment) -- this covers admission and its depth limit only.
     async fn handle_rlm_run(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
+        // Parity with `rlm-runtime.md`'s `AgentSession.runRlmChild()`:
+        // "Check `RLM_DEPTH < RLM_MAX_DEPTH`" is step 1, checked by the
+        // parent before a child is ever admitted -- not something the
+        // daemon rejects after the fact. `self.state.rlm_depth`/
+        // `rlm_max_depth` are already loaded in memory (no daemon round
+        // trip needed just to check this).
+        if self.state.rlm_depth >= self.state.rlm_max_depth {
+            return Ok(serde_json::json!({
+                "error": format!(
+                    "recursion depth limit reached (RLM_DEPTH={}, RLM_MAX_DEPTH={})",
+                    self.state.rlm_depth, self.state.rlm_max_depth
+                ),
+            }));
+        }
         let Some(task) = payload.get("task").and_then(|v| v.as_str()) else {
             return Ok(serde_json::json!({"error": "rlm.run requires a \"task\" string"}));
         };
@@ -1289,6 +1324,12 @@ pub(crate) async fn seed_forked_session(
         runtime: source.runtime.clone(),
         compaction: None,
         forked_from: Some(forked_from),
+        // Same "fresh, standalone session" treatment `daemon::
+        // handle_session_fork`'s own `NewSessionMeta` construction gives
+        // this via `AgentSession::create`'s defaults -- a fork isn't
+        // tied into the source's own recursion tree.
+        rlm_depth: 0,
+        rlm_max_depth: DEFAULT_RLM_MAX_DEPTH,
     };
     write_state(&session_dir, &state).await
 }
@@ -1465,6 +1506,50 @@ mod tests {
         .expect("session creation should succeed");
 
         assert!(session.build_turns().is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Parity with `rlm-runtime.md`'s `AgentSession.runRlmChild()` step 1
+    /// ("Check `RLM_DEPTH < RLM_MAX_DEPTH`"): proven directly against
+    /// `handle_host_request`/`handle_rlm_run` with no daemon/kernel
+    /// involved at all, since the depth check happens before either is
+    /// ever touched -- same "direct, deterministic proof" reasoning the
+    /// real-kernel tests use for kernel-side behavior, applied here to
+    /// the purely in-memory half of the mechanism.
+    #[rusty_tokio::test]
+    async fn handle_rlm_run_rejects_admission_once_the_depth_limit_is_reached() {
+        let root = temp_state_root("rlm-depth-limit");
+
+        let session = AgentSession::create(
+            &root,
+            "sess-depth-test".to_string(),
+            NewSessionMeta {
+                rlm_depth: Some(1),
+                rlm_max_depth: Some(1),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let response = session
+            .handle_host_request("rlm.run", serde_json::json!({"task": "do something"}))
+            .await
+            .expect("handle_host_request should not itself error");
+
+        let error = response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("rejected admission should carry an \"error\" field");
+        assert!(
+            error.contains("recursion depth limit reached"),
+            "got: {error:?}"
+        );
+        assert!(error.contains("RLM_DEPTH=1"), "got: {error:?}");
+        assert!(error.contains("RLM_MAX_DEPTH=1"), "got: {error:?}");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

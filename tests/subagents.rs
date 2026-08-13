@@ -96,6 +96,84 @@ fn session_children_lists_only_direct_children() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// `daemon::handle_session_new`'s recursion-depth computation, parity
+/// with `rlm-runtime.md`: a root session gets `RLM_DEPTH=0` and
+/// `RLM_MAX_DEPTH` from `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` (default `1`
+/// otherwise); a child gets `parent.RLM_DEPTH + 1` and *inherits* the
+/// parent's own `RLM_MAX_DEPTH` unchanged, not a freshly-resolved one --
+/// proven here by setting the env var only on the root's own daemon and
+/// spawning two generations of children from it. `session spawn` reuses
+/// the exact same `SessionNew` daemon round trip the kernel-side
+/// `rlm(...)` does (`session::handle_rlm_run`'s own doc comment), so this
+/// proves the shared daemon-side computation without needing a real
+/// kernel.
+#[test]
+fn session_spawn_inherits_the_parents_max_depth_and_increments_depth_by_one() {
+    let state_dir = common::TempDir::new("subagents-rlm-depth");
+    common::daemon_start_with_env(
+        state_dir.path(),
+        &[("RUSTY_PRIME_AGENT_RLM_MAX_DEPTH", "3")],
+    );
+
+    let root_id = common::session_new(state_dir.path(), None);
+    let (root_depth, root_max_depth) = common::session_rlm_depth(state_dir.path(), &root_id);
+    assert_eq!(root_depth, 0, "a root session starts at depth 0");
+    assert_eq!(
+        root_max_depth, 3,
+        "a root session's max depth comes from RUSTY_PRIME_AGENT_RLM_MAX_DEPTH"
+    );
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "spawn", &root_id, "child", "task"],
+    );
+    common::assert_success("session spawn (child)", &out);
+    let child_id = common::stdout_string(&out);
+    let (child_depth, child_max_depth) = common::session_rlm_depth(state_dir.path(), &child_id);
+    assert_eq!(child_depth, 1, "a child is one deeper than its parent");
+    assert_eq!(
+        child_max_depth, 3,
+        "a child inherits the parent's max depth unchanged"
+    );
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "spawn", &child_id, "grandchild", "task"],
+    );
+    common::assert_success("session spawn (grandchild)", &out);
+    let grandchild_id = common::stdout_string(&out);
+    let (grandchild_depth, grandchild_max_depth) =
+        common::session_rlm_depth(state_dir.path(), &grandchild_id);
+    assert_eq!(
+        grandchild_depth, 2,
+        "depth keeps incrementing per generation"
+    );
+    assert_eq!(
+        grandchild_max_depth, 3,
+        "max depth keeps propagating unchanged, not re-resolved"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// No `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` set at all: a root session falls
+/// back to `session::DEFAULT_RLM_MAX_DEPTH` (`1`), matching
+/// `rlm-runtime.md`'s own stated default of "root sessions may create
+/// children; children may not create grandchildren unless configured
+/// higher".
+#[test]
+fn session_new_defaults_to_max_depth_one_with_no_env_var_set() {
+    let state_dir = common::TempDir::new("subagents-rlm-depth-default");
+    common::daemon_start(state_dir.path());
+
+    let root_id = common::session_new(state_dir.path(), None);
+    let (root_depth, root_max_depth) = common::session_rlm_depth(state_dir.path(), &root_id);
+    assert_eq!(root_depth, 0);
+    assert_eq!(root_max_depth, 1);
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 #[test]
 fn session_spawn_with_an_unknown_parent_is_a_conflict() {
     let state_dir = common::TempDir::new("subagents-unknown-parent");

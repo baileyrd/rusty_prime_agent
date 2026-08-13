@@ -260,9 +260,15 @@ handle_host_request`/`handle_rlm_run` (`session.rs`) is the one live
 consumer so far: a kernel-callable `rlm(task, ...)` that admits a child
 session through the same `SessionNew`/`ScheduleAdd` daemon round trip
 `session spawn` already uses, just issued from inside the worker process.
-See `PARITY.md`'s RLM programming model entry for the full mechanism
-(why `control`, why the `ipykernel` monkeypatch is necessary, what still
-isn't wired up).
+Admission is gated by a recursion-depth check (`RLM_DEPTH >=
+RLM_MAX_DEPTH`) held in `SessionState`/checked entirely client-side
+before the daemon round trip even starts; the daemon itself is the one
+place that *computes* those two values (`daemon::handle_session_new`,
+inheriting `rlm_max_depth` from the parent unchanged and incrementing
+`rlm_depth` by one, or resolving both from scratch for a root session),
+never a client. See `PARITY.md`'s RLM programming model entry for the
+full mechanism (why `control`, why the `ipykernel` monkeypatch is
+necessary, what still isn't wired up).
 
 **Not the same thing as the real tool-calling loop** (`provider`/`tools`
 modules, `session new --tools read|mcp`, see `PARITY.md`): that's

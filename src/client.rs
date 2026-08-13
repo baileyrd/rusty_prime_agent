@@ -239,6 +239,11 @@ async fn create_session(state_root: &Path, meta: crate::session::NewSessionMeta)
         thinking,
         tools,
         runtime,
+        // Resolved server-side by `daemon::handle_session_new`, not part
+        // of the `Request::SessionNew` wire shape -- see that field's own
+        // doc comment on `protocol::SessionState`.
+        rlm_depth: _,
+        rlm_max_depth: _,
     } = meta;
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -382,6 +387,8 @@ pub async fn session_spawn(
             thinking: None,
             tools: None,
             runtime: None,
+            rlm_depth: None,
+            rlm_max_depth: None,
         },
     )
     .await?;

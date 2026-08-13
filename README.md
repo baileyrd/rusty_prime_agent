@@ -97,9 +97,13 @@ The kernel also gets `rlm(task, name=None, model=None)`, parity with
 the API")` admits a real child session (the same underlying mechanism as
 `session spawn`, just called from inside the kernel instead of the CLI)
 and returns immediately after admission -- `{"rlm_child_id", "name",
-"session_dir", "model"}` -- without waiting for the child's answer. No
-recursion-depth limit yet, and no `rlm.list_subagents()`/
-`rlm.delete_subagent()` registry yet.
+"session_dir", "model"}` -- without waiting for the child's answer.
+Recursion is bounded: a root session may create children up to
+`RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` deep (default `1`, i.e. children may
+not create grandchildren unless raised); a child inherits its parent's
+own max depth unchanged, and a call past the limit returns
+`{"error": "recursion depth limit reached ..."}` instead of admitting a
+child. No `rlm.list_subagents()`/`rlm.delete_subagent()` registry yet.
 
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
@@ -454,6 +458,7 @@ crate-internal (`daemon`/`worker`/`ipython_runtime`/`zmtp`).
 | `RUSTY_PRIME_AGENT_RP_SERVER_BIN` | Path/name of the `rp-server` binary (default: `rp-server` on `PATH`). |
 | `RUSTY_PRIME_AGENT_OLLAMA_BASE_URL` | Base URL for the Ollama provider (default: `http://127.0.0.1:11434/v1`). |
 | `RUSTY_PRIME_AGENT_IPYTHON_BIN` | Path/name of the Python interpreter `--runtime ipython` spawns (default: `python3`, or `python` on Windows). Must have `ipykernel` installed. |
+| `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` | Max `rlm(...)` recursion depth for a root session (default: `1`). Children inherit their parent's own resolved value unchanged. |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` | Activate the matching provider when set. |
 
 Setting a `--model` on `session new` (directly, or via

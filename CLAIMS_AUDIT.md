@@ -55,8 +55,9 @@ conditioned differently than the claim implies), **N/A**.
   same `SessionNew`/`ScheduleAdd` daemon round trip `session spawn`
   already used, just callable as `await rlm("task")` from kernel code
   instead of the CLI. See the RLM Runtime Architecture section below for
-  the mechanism and what's still not done (recursion depth limits,
-  `rlm.list_subagents()`/`delete_subagent()`, usage attribution).
+  the mechanism. Recursion depth limits (`RLM_DEPTH`/`RLM_MAX_DEPTH`) are
+  now also real -- see below; still not done: `rlm.list_subagents()`/
+  `delete_subagent()`, usage attribution.
 - **"Everything is programmatic: file operations, shell commands, tool
   use, subagents, and context management happen through code."** --
   **False.** `--tools read|mcp` is a separate, independent model-facing
@@ -194,18 +195,19 @@ worker/session code.
 - **Prompt execution sequence diagram** (`U -> C -> S -> W -> A -> P`,
   streamed back through the same chain, transcript appended, "opt
   IPython tool call" branching into a "typed host request" vs. "ordinary
-  execution" alternative). -- **True for the outer flow, mechanism now
-  real but unwired for the inner branch.** The client/daemon/worker/
-  `AgentSession`/provider chain, transcript append, and event streaming
-  back to the client all match what `handle_session_prompt`/
+  execution" alternative). -- **Now True for both the outer flow and the
+  inner branch (was "mechanism real but unwired").** The client/daemon/
+  worker/`AgentSession`/provider chain, transcript append, and event
+  streaming back to the client all match what `handle_session_prompt`/
   `AgentSession::prompt` actually do, including the "generation-aware
   events" detail (`SessionState.generation`, `src/protocol.rs:531`,
   bumped on every respawn precisely so attach-stream cursors can detect
-  it). The "typed host request" arm of the IPython branch now exists at
-  the `ToolRuntime` layer (see the system-diagram entry above) but
-  `session.rs`'s own tool-calling loop doesn't yet call it -- so this
-  branch is real machinery without a live caller, not the "only the
-  heartbeat marker special case" finding of the earlier pass.
+  it). **Closed**: `session.rs`'s own tool-calling loop
+  (`execute_python_tool_call`) now loops on `pending_host_request`,
+  dispatching to `AgentSession::handle_host_request` and
+  `ToolRuntime::resume_execute` until the cell finishes -- the "typed
+  host request" arm is real machinery with a live caller now, not
+  unwired.
 - **"From the session queue onward, the same execution and persistence
   path is used when a prompt comes from a heartbeat, cron schedule, goal
   continuation, autonomous mode, or another agent instead of an attached
@@ -328,12 +330,13 @@ to check. **Since closed in part**: `rlm(task, name=None, model=None)`
 is now real (a kernel-callable coroutine over the `host.request` comm
 protocol, admitting a child session through the same daemon round trip
 `session spawn` uses) -- see the marketing-copy section above for the
-mechanism. Still genuinely absent: `RLMSpawnHandle` as a typed object
-(the reply is a plain dict, not an attribute-access object), `RLM_DEPTH`/
-`RLM_MAX_DEPTH` recursion limits, `rlm.list_subagents()`/
-`rlm.delete_subagent()` (no parent-scoped registry yet), model search via
-`rlm.find_models()`, and usage/cost attribution -- each tracked
-separately below. The specific points worth calling out individually:
+mechanism. `RLM_DEPTH`/`RLM_MAX_DEPTH` recursion limits are now real too
+(see below). Still genuinely absent: `RLMSpawnHandle` as a typed object
+(the reply is a plain dict, not an attribute-access object),
+`rlm.list_subagents()`/`rlm.delete_subagent()` (no parent-scoped registry
+yet), model search via `rlm.find_models()`, and usage/cost attribution --
+each tracked separately below. The specific points worth calling out
+individually:
 
 - **Persistent kernel, Jupyter protocol over ZeroMQ, HMAC-SHA256 signed
   frames.** -- **True.** `zmtp.rs`/`sha256.rs`, hand-rolled and verified
@@ -354,6 +357,18 @@ separately below. The specific points worth calling out individually:
   `HEARTBEAT_MARKER` stdout hack is untouched for now -- generalizing it
   into a real `host.request` comm protocol over this channel is the next
   increment.
+- **`AgentSession.runRlmChild()` checks `RLM_DEPTH < RLM_MAX_DEPTH`
+  before admitting a child; children inherit the parent's own maximum
+  depth.** -- **Now True (was False).** Originally found False: `rlm(...)`
+  admitted children with no depth check at all. **Closed**:
+  `SessionState.rlm_depth`/`rlm_max_depth` are now persisted fields,
+  checked client-side in `handle_rlm_run` before a child is ever admitted
+  (`RLM_DEPTH >= RLM_MAX_DEPTH` returns `{"error": ...}` instead of
+  spawning). The daemon computes both centrally in `handle_session_new`:
+  a child gets `parent.rlm_depth + 1` and the parent's own
+  `rlm_max_depth` inherited unchanged; a root session gets depth `0` and
+  `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` (default `1`, matching this
+  document's own stated default).
 - **Usage/cost attribution: child assistant usage folded into the parent
   turn via a `child_usage_attributed` transcript entry.** -- **False.**
   Confirmed absent by grep -- `session spawn` creates a fully independent
@@ -594,8 +609,11 @@ above:
   only. `host_request` itself is real now (see above), but nothing calls
   it for any of these three kinds yet.
 - **Child usage attribution, parent-scoped registry surviving
-  compaction/restart, recursion depth limits.** -- **False/N/A**,
-  already settled, reconfirmed with no new evidence.
+  compaction/restart, recursion depth limits.** -- **Recursion depth
+  limits now closed** (`SessionState.rlm_depth`/`rlm_max_depth`, see the
+  RLM Runtime Architecture section above); child usage attribution and a
+  parent-scoped registry remain **False/N/A**, reconfirmed with no new
+  evidence.
 - **Automatic compaction preserving kernel state.** -- **True.** The
   kernel process is untouched by compaction, which only changes
   `build_turns`'s provider-facing output.

@@ -575,6 +575,31 @@ pub struct SessionState {
     /// after Phase 1 has it.
     #[serde(default)]
     pub forked_from: Option<ForkedFrom>,
+    /// Parity with `rlm-runtime.md`'s `RLM_DEPTH`: how many `rlm(...)`
+    /// admissions separate this session from the nearest root session
+    /// with no `parent_id` of its own -- `0` for a root session, `parent.
+    /// rlm_depth + 1` for a session created by `AgentSession::
+    /// handle_rlm_run`. Computed server-side in `daemon::
+    /// handle_session_new` (a parent lookup, the same place `parent_id`
+    /// itself is already validated), not client-settable -- `#[serde(
+    /// default)]` is for the same pre-existing-`state.json` reason every
+    /// other field added after Phase 1 has it, not because a client is
+    /// ever expected to omit it on purpose.
+    #[serde(default)]
+    pub rlm_depth: u32,
+    /// Parity with `rlm-runtime.md`'s `RLM_MAX_DEPTH`: "the inherited
+    /// maximum depth" -- a root session resolves this once (`
+    /// RUSTY_PRIME_AGENT_RLM_MAX_DEPTH`, default `1`, matching
+    /// `rlm-runtime.md`'s own stated default), and every descendant
+    /// created via `rlm(...)` inherits the exact same value rather than
+    /// re-resolving it, so raising the limit for one recursive tree
+    /// doesn't require raising it globally. `#[serde(default)]` for the
+    /// same reason `rlm_depth` has it; the field-level default here
+    /// (`0`, from `u32::default()`) is never the value actually
+    /// persisted for a real session -- `daemon::handle_session_new`
+    /// always resolves a real one before a worker is ever spawned.
+    #[serde(default)]
+    pub rlm_max_depth: u32,
 }
 
 /// Provenance for a session created by `session fork <id> [--at N]`

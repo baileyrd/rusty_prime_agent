@@ -111,6 +111,11 @@ pub async fn run(args: &[String]) -> Result<()> {
                     thinking,
                     tools,
                     runtime,
+                    // Resolved server-side by `daemon::handle_session_new`
+                    // -- see that field's own doc comment on `protocol::
+                    // SessionState`.
+                    rlm_depth: None,
+                    rlm_max_depth: None,
                 },
                 output_mode,
             )
@@ -233,6 +238,8 @@ pub async fn run(args: &[String]) -> Result<()> {
             thinking,
             tools,
             runtime,
+            rlm_depth,
+            rlm_max_depth,
         } => {
             worker::run(worker::WorkerArgs {
                 session_id,
@@ -245,6 +252,8 @@ pub async fn run(args: &[String]) -> Result<()> {
                 thinking,
                 tools,
                 runtime,
+                rlm_depth,
+                rlm_max_depth,
             })
             .await
         }
