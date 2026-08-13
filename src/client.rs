@@ -740,6 +740,17 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         }
     }
 
+    // Set by `/file <path>`, consumed (and cleared) by the next line that
+    // actually sends a prompt -- a REPL-only, bounded slice of
+    // `prime-agent`'s TUI-side "file reference" feature: no client-side
+    // editor/attachment UI, just reading a local file and folding its
+    // content into the next real prompt's text, the same "no new
+    // subsystem, reuse what `send_prompt` already does" shape `/compact`
+    // above uses. Left queued (not sent immediately) across an
+    // intervening `/heartbeat`/`/compact`/`/fork` line, so `/file`
+    // followed by one of those doesn't silently drop it.
+    let mut pending_file_content: Option<String> = None;
+
     use std::io::BufRead;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -831,13 +842,114 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             session_compact(state_root, session_id.clone(), instructions, mode).await?;
             continue;
         }
-        let entry = send_prompt(state_root, &session_id, text.to_string()).await?;
+        if let Some(path) = text
+            .strip_prefix("/file ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // file-reference feature -- see this loop's own
+            // `pending_file_content` doc comment above.
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    println!(
+                        "queued {path} ({} bytes) -- included in your next prompt",
+                        content.len()
+                    );
+                    pending_file_content = Some(format!("--- {path} ---\n{content}\n---\n\n"));
+                }
+                Err(e) => println!("failed to read {path}: {e}"),
+            }
+            continue;
+        }
+        if text == "/fork" || text.starts_with("/fork ") {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // `/fork` -- `session fork` itself already exists as a
+            // top-level `harness session fork <id>` command (see
+            // `protocol::Request::SessionFork`'s own doc comment for the
+            // full design and what it deliberately doesn't deliver);
+            // this is just wiring the same client-side call into the
+            // REPL loop, the identical shape `/compact` above already
+            // has for `session compact`.
+            let rest = text.strip_prefix("/fork").unwrap_or("").trim();
+            match parse_repl_fork_args(rest) {
+                Ok((at_sequence, name)) => {
+                    session_fork(state_root, session_id.clone(), at_sequence, name, mode).await?;
+                }
+                Err(e) => println!("{e}"),
+            }
+            continue;
+        }
+        if let Some(path) = text
+            .strip_prefix("/export ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // `/export` -- writes this session's current transcript
+            // (fetched fresh, so it reflects everything sent so far in
+            // this REPL run) to a local file as pretty-printed JSON.
+            // `/share` (sending it somewhere hosted) stays out of scope:
+            // this project has no hosted destination to send it to, the
+            // same "nothing on the other end" shape `/login` has.
+            let transcript = fetch_transcript_snapshot(state_root, &session_id).await?;
+            match serde_json::to_string_pretty(&transcript) {
+                Ok(json) => match std::fs::write(path, json) {
+                    Ok(()) => println!("exported {} turn(s) to {path}", transcript.len()),
+                    Err(e) => println!("failed to write {path}: {e}"),
+                },
+                Err(e) => println!("failed to serialize transcript: {e}"),
+            }
+            continue;
+        }
+        let text_to_send = match pending_file_content.take() {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        };
+        let entry = send_prompt(state_root, &session_id, text_to_send).await?;
         match mode {
             OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
             OutputMode::Text => print_entry(&entry),
         }
     }
     Ok(())
+}
+
+/// Parses `/fork`'s own trailing `[--at N] [--name TEXT]` -- a small,
+/// self-contained parser rather than reusing `cli::scan_named_flag`
+/// (private to `cli.rs`, and shaped around a full `&[&String]` argv
+/// slice, not a single already-stripped REPL line) since this is the
+/// only REPL command that needs more than "everything after the
+/// keyword is one piece of free text" (`/compact`'s own `instructions`,
+/// `/export`'s `path`). Returns a plain `String` error message, printed
+/// directly by the caller, the same friendly non-fatal shape
+/// `/heartbeat every <duration>`'s own parse-failure handling already
+/// uses.
+fn parse_repl_fork_args(rest: &str) -> std::result::Result<(Option<u64>, Option<String>), String> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut at_sequence = None;
+    let mut name = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--at" => {
+                let value = tokens.get(i + 1).ok_or("--at requires a value")?;
+                at_sequence = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--at requires an integer, got {value:?}"))?,
+                );
+                i += 2;
+            }
+            "--name" => {
+                let value = tokens.get(i + 1).ok_or("--name requires a value")?;
+                name = Some((*value).to_string());
+                i += 2;
+            }
+            other => return Err(format!("unknown /fork argument {other:?}")),
+        }
+    }
+    Ok((at_sequence, name))
 }
 
 pub async fn session_prompt(

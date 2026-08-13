@@ -354,6 +354,36 @@ daemon/worker split rather than requiring the Python control environment:
   after further prompts on each, and `--mode json`'s `forked_from`
   provenance -- plus a manual pass in this sandbox confirming the same
   end to end against the real compiled binary.
+- [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
+  with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
+  features, investigated piece by piece (see "Needs a new subsystem"
+  below for the pieces that genuinely don't have a bounded slice --
+  image paste, steering vs. follow-up queuing, `/tree`, `/clone`,
+  `/share` -- and why).
+
+  `/file <path>` reads a local file client-side and queues its content
+  to be prepended to the *next* line that actually sends a prompt (a
+  `pending_file_content: Option<String>` local to the REPL loop,
+  surviving an intervening `/heartbeat`/`/compact`/`/fork` line rather
+  than being silently dropped) -- no daemon/worker/protocol change, the
+  same "reuse `send_prompt`'s existing path" shape `/compact` already
+  has. `/fork [--at N] [--name TEXT]` wires the already-existing
+  top-level `session fork` command (`client::session_fork`) directly
+  into the REPL loop -- a small local argument parser
+  (`parse_repl_fork_args`) rather than reusing `cli::scan_named_flag`
+  (private to `cli.rs`, shaped around a full argv slice rather than one
+  already-stripped REPL line). `/export <path>` writes the session's
+  current transcript (fetched fresh) to a local file as pretty-printed
+  JSON -- reuses the same already-`Serialize` `TranscriptEntry` type
+  `--mode json` already renders, no new format invented.
+
+  Verified with a new `tests/repl.rs` suite: `/file` queuing content
+  into the next prompt and surviving a missing-file error without
+  sending anything; `/fork` creating a real new session (checked via
+  `--mode json`'s `session_new` response and `session list`); `/export`
+  writing a real, round-trippable JSON file -- plus a manual pass in
+  this sandbox confirming `/file`+`/export` together end to end against
+  the real compiled binary.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -1139,11 +1169,33 @@ attempted here, and not silently implied by anything in
   with; the interactive TUI a theme would apply to is itself a separate,
   already-tracked, not-yet-attempted item, see below) -- nothing to
   scope a bounded increment against.
-- **The interactive TUI**'s rich editor/message-queue features (file
-  reference, image paste, steering vs. follow-up queuing, `/tree`,
-  `/fork`, `/clone`, `/compact`, `/export`, `/share`). (The bare
-  read-a-line/send-a-prompt loop underneath the TUI itself is done --
-  `session repl`, see the medium-effort section above.)
+- **The interactive TUI itself** (a real terminal UI -- panes, cursor
+  control, live re-rendering) and the pieces of its rich editor/
+  message-queue surface that genuinely need one: **image paste** (zero
+  non-text-content plumbing exists anywhere in this project -- `provider::
+  ChatTurn.content` is `Option<String>`, text only, and `mcp_client.rs`'s
+  own doc comment already names this exact gap for a different reason;
+  a real slice needs a content-type change to the transcript/provider
+  boundary before anything REPL-side could plug into it, not a REPL
+  command) and **steering vs. follow-up queuing** (typing a new message
+  while a prior one is still generating, and choosing whether it
+  interrupts or queues -- `session_repl`'s stdin loop is synchronous
+  start to finish, `send_prompt` blocks the loop until the full reply
+  lands, so there is no window during which a second line could even be
+  read, let alone dispatched as steering-vs-queued; this isn't "harder
+  in a REPL," it's structurally absent without a real concurrent-input
+  event loop). `/tree` (real intra-session branching) and `/clone`
+  (live-state duplication) stay out of scope for the reasons given
+  above and in the medium-effort section's `session fork` entry.
+
+  Investigated the rest of this bullet's original list piece by piece
+  rather than leaving it one atomic blob, the same way `/tree`/`/fork`/
+  `/clone` got split earlier -- `/file`, `/fork`, `/compact`, and
+  `/export` all turned out to have honest, bounded REPL-only slices and
+  are now done, see the medium-effort section's `session_repl` entry.
+  `/share` stays out of scope: it needs somewhere to send the export
+  *to* (a hosted paste/share destination), the same "nothing on the
+  other end" shape `/login` has just below.
 - **`/login`**, an in-session OAuth-style flow to Prime Intellect's own
   hosted account system. `prime-agent`'s own
   [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md)

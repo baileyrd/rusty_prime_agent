@@ -349,6 +349,15 @@ list`/`cancel`, same as any other schedule. A line that's `/compact` or
 `/compact <instructions>` forces context compaction immediately, same as
 `session compact`.
 
+`/file <path>` reads a local file and includes its content in your
+*next* prompt (queued across an intervening `/heartbeat`/`/compact`/
+`/fork` line, not dropped) -- a bounded slice of a TUI's file-reference
+feature, no client-side attachment UI, just folding the file's content
+into the next ordinary prompt text. `/fork [--at N] [--name TEXT]` is
+`session fork` wired into the REPL loop, same as `session compact` is
+via `/compact`. `/export <path>` writes the session's current
+transcript to a local file as pretty-printed JSON.
+
 ### RPC mode
 
 ```sh
