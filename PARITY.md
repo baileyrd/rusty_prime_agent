@@ -804,6 +804,39 @@ daemon/worker split rather than requiring the Python control environment:
   Extension UI sub-protocol (`select`/`confirm`/`input`/`editor` dialogs)
   -- there is no extension system for it to serve (see "Needs a new
   subsystem" below).
+- [x] **Context files** (`AGENTS.md`/`CLAUDE.md` auto-loading), parity
+  with `prime-agent`'s own auto-loaded context files. A prior revision of
+  this document filed the whole "Context files" bullet under "Needs a
+  new subsystem" (assuming it needed the same project-local-discovery
+  machinery `prompt_template::discover`/a hypothetical project-tier
+  skills discovery would) -- on closer look, only the *project-local*
+  half (walked up from cwd) actually needs that, for the same reason
+  `skills::discover` stayed global-only: the worker process has no
+  access to the CLI caller's own cwd. The *global* half doesn't have
+  that problem at all, and turned out to be a small, bounded increment
+  reusing a mechanism this project already had: `session::
+  read_context_file` checks `<state_dir>/AGENTS.md`, then
+  `<state_dir>/CLAUDE.md` (first found wins, not merged; empty/
+  whitespace-only treated as missing), read fresh on every
+  `build_turns` call -- the exact same "no caching, no persisted state,
+  an edit takes effect on the next prompt" property `skills`/
+  `prompt_template` discovery already have. Its content becomes an
+  even-earlier system turn than the compaction summary's own (see that
+  entry above), the same "provider-facing only, `transcript.jsonl`
+  never touched" shape compaction's injection already established.
+
+  Verified two ways: a unit test constructing a real `AgentSession`
+  in-process (no daemon needed, `AgentSession::create` is a plain async
+  call) and inspecting `build_turns`'s own output directly, and a real
+  end-to-end test against `ollama/qwen2.5:0.5b` (`#[ignore]`d, same
+  real-infra reasons as this project's other `ollama_provider.rs`
+  tests) confirming a fact stated only in `AGENTS.md` actually reached
+  the model's reply.
+
+  The project-local half stays unimplemented for the same cwd reason
+  `skills::discover`'s own project-local tier does; `SYSTEM.md`/
+  `APPEND_SYSTEM.md` stay unimplemented too -- see "Needs a new
+  subsystem" below.
 
 ## Needs a new subsystem
 
@@ -857,11 +890,11 @@ attempted here, and not silently implied by anything in
   `transcript.jsonl`) is linear, one worker owning one line of turns, and
   branching would change that data model, not just add REPL commands on
   top of it.
-- **Context files** (`AGENTS.md`/`CLAUDE.md` auto-loaded from a global
-  dir and walked up from the current directory, `SYSTEM.md`/
-  `APPEND_SYSTEM.md` system-prompt overrides). No equivalent exists here;
-  a session only ever gets the text passed to `session new`/`session
-  prompt`, plus whatever the Continual Harness accumulates on top.
+- **`SYSTEM.md`/`APPEND_SYSTEM.md`** (system-prompt override/append).
+  This project has no base system prompt at all to override or append
+  to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"
+  above) and the compaction summary -- there's nothing for either to
+  hook into without a larger design change than either of those needed.
 - **A `settings.json` config file** (project + global, merged). Every
   knob in this project is a CLI flag or an env var, set fresh per
   invocation -- there's no persistent, mergeable config file layer

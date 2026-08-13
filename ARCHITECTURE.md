@@ -315,6 +315,21 @@ already produced -- see `PARITY.md` for why this is closing this
 process's own scheduling latency, not waiting on the provider), same
 convention `session_repl` uses.
 
+## Context files (`AGENTS.md`/`CLAUDE.md`)
+
+Parity with `prime-agent`'s own auto-loaded context files -- see
+`PARITY.md` for the full story, including a scoping correction (a
+project-local tier would need the same cwd-visibility machinery
+`skills::discover` doesn't have, but the global tier this project
+actually built doesn't need it at all). `session::read_context_file`
+checks `<state_dir>/AGENTS.md` then `<state_dir>/CLAUDE.md`, read fresh
+on every `build_turns` call -- no persisted state, no caching, same "an
+edit takes effect on the next prompt" property `skills`/
+`prompt_template` discovery already have. Its content becomes an
+even-earlier system turn than the compaction summary's own; like that
+injection, `transcript.jsonl` is never touched, so this is
+provider-facing only.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

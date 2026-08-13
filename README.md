@@ -205,6 +205,16 @@ lists what's installed.
 harness skill list
 ```
 
+### Context files
+
+Drop an `AGENTS.md` (or `CLAUDE.md`) into the state directory and every
+session automatically gets its content as context, on every prompt --
+parity with `prime-agent`'s own auto-loaded context files. Checks
+`AGENTS.md` first, then `CLAUDE.md` (whichever is found first wins, not
+merged); read fresh each time, so an edit takes effect on the very next
+prompt with no restart needed. Global only -- no project-local tier, same
+cwd-visibility reason `skills` don't have one either.
+
 ### The Continual Harness
 
 Durable supplemental notes (prompts, memories, skill descriptions) a
