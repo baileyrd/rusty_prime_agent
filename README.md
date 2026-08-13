@@ -585,6 +585,27 @@ listed as configured -- it needs no API key.
 per-model catalog instead (id, owning provider, context length) -- needs
 `rp-server` on `PATH`, unlike the plain listing above.
 
+### Self-update
+
+```sh
+harness update
+harness update --force
+```
+
+Best-effort translation of `prime-agent update [--force]` -- not a real
+release-channel check (this project isn't published anywhere: no
+crates.io, no GitHub Releases), just `git pull` followed by `cargo build
+--release`, run in the same git checkout `cargo build --release` was
+originally run in to produce this exact binary (embedded at compile
+time, independent of the caller's own current directory). If `git pull`
+reports nothing new, the rebuild is skipped unless `--force` is passed
+-- `--force` means "rebuild anyway," never "discard local changes": `git
+pull` already refuses on its own to overwrite uncommitted work a merge
+would touch. Prints what happened; if a daemon is already running,
+restart it (`daemon shutdown` then `daemon start`) to actually pick up
+the rebuilt binary. Fails loudly, naming the expected checkout path, if
+that checkout can't be found (e.g. this binary was copied elsewhere).
+
 ## Embedding as a library
 
 `harness` is one binary built on top of the `rusty_prime_agent` library

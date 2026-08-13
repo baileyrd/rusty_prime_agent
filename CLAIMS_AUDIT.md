@@ -519,8 +519,16 @@ above:
 - **"`prime-agent status`."** -- **True.** `daemon status` reports
   `protocol_version`/`pid`/`generation`/`sessions_active`.
 - **"`prime-agent doctor [--fix]`."** -- **False.** Confirmed absent.
-- **"`prime-agent update [--force]`."** -- **False/N/A.** No self-update
-  subcommand exists.
+- **"`prime-agent update [--force]`."** -- **Partial.** `harness update
+  [--force]` now exists (`src/self_update.rs`), but it can't check any
+  release channel the way `prime-agent`'s own (published to npm)
+  presumably does -- this project's `Cargo.toml` says `publish = false`,
+  with no crates.io release and no GitHub Releases. What it does instead:
+  `git pull` + `cargo build --release` in the git checkout this exact
+  binary was built from (`CARGO_MANIFEST_DIR`, embedded at compile time).
+  `--force` means "rebuild even if nothing new was pulled," not
+  "discard local changes" -- see `PARITY.md`'s own "Self-update"
+  entry.
 - **"`prime-agent shutdown [--force]`."** -- **Partial.** `daemon
   shutdown` does stop every active worker and the `rp-server` sidecar,
   matching the substance, but there's no `--force` flag -- shutdown is
@@ -624,8 +632,10 @@ above:
   -- **Partial.** `list`/`attach`/`stop`/`rename`/`schedule`/`status`/
   `shutdown` map to real subcommands. `send` maps to `session message`
   but requires an existing parent/child relationship rather than
-  addressing any agent freely. `doctor`, `update`, `package *`, and
-  `config` are all absent.
+  addressing any agent freely. `update` now exists too (`harness update
+  [--force]`, a best-effort translation with no release channel behind
+  it -- see `PARITY.md`'s own "Self-update" entry). `doctor`, `package
+  *`, and `config` are all still absent.
 - **Model options: `--provider`, `--model`, `--api-key`, `--thinking`,
   `--models` (cycling).** -- **Partial.** `--model provider/id` and
   `--thinking low|medium|high` exist. No `--provider` flag (provider is

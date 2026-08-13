@@ -2502,6 +2502,62 @@ daemon/worker split rather than requiring the Python control environment:
   screen as it's typed, the same as everything else piped through this
   REPL. Not attempted here; a caller who wants the key hidden can still
   hand-edit `auth.json` directly instead.
+- [x] **Self-update: best-effort translation.** `prime-agent update
+  [--force]` (see `CLAIMS_AUDIT.md`'s own quickstart/usage entries,
+  previously confirmed False/N/A) presumably checks whatever registry
+  `prime-agent` itself is published to (npm) for a newer release. That
+  premise doesn't transfer here at all: this project's own `Cargo.toml`
+  says `publish = false`, there's no crates.io release, no GitHub
+  Releases workflow -- no release channel exists to check *against*,
+  confirmed by direct inspection rather than assumed from the command's
+  name alone.
+
+  What *is* real: this project is only ever built one way (`cargo build
+  --release`, run directly in a git checkout of its own source -- see
+  the README's own "Build" section, unchanged since day one). `harness
+  update [--force]` (new `src/self_update.rs`, no daemon needed, same
+  "pure local operation" shape as `model list`/`skill list`) translates
+  the *substance* of "update" into the one thing that already covers
+  every real user of this binary: `git pull` the checkout this exact
+  binary was built from (`CARGO_MANIFEST_DIR`, embedded at compile
+  time -- accurate for exactly the binary this project ever produces),
+  then `cargo build --release` in the same directory unless `git pull`
+  reported nothing new and `--force` wasn't passed. A missing checkout
+  (the binary was copied somewhere else, or the source directory has
+  since been deleted) fails loudly naming the embedded path, rather than
+  silently doing nothing -- the same "loud failure over fake success"
+  stance every other config-file/subsystem lookup in this project
+  already takes.
+
+  `--force` deliberately does **not** mean "discard uncommitted local
+  changes" -- consistent with this whole project's own development
+  discipline around destructive git operations, that would need an
+  explicit, separate ask, never a side effect of an update flag. `git
+  pull` already refuses, loudly, to overwrite uncommitted changes a
+  merge would touch; nothing here second-guesses that. `--force` instead
+  means "rebuild even if `git pull` alone saw nothing new" -- useful
+  after a manual local edit or branch switch.
+
+  Verified for real, not just unit-tested: `harness update` and
+  `harness --mode json update` both run successfully against this
+  project's own checkout in this sandbox, correctly reporting "Already
+  up to date" and taking no rebuild action; a dedicated `#[ignore]`d
+  test (`run_against_the_real_checkout_pulls_and_rebuilds`, real network
+  access to `origin`, same reasoning as this project's other genuinely-
+  external-state tests) was also run manually and passed. Two CI-safe
+  unit tests cover what doesn't need real git/cargo: `SOURCE_ROOT`
+  really does resolve to a `.git`-containing directory, and a plain temp
+  directory (never `git init`-ed) reports "no release channel" rather
+  than attempting a `git pull` against it.
+
+  Still genuinely absent: any actual release-channel check (there is
+  none to check), any binary-replacement/download mechanism (irrelevant
+  without a release channel), and any attempt to hot-swap the
+  *currently running* daemon's own in-memory code -- the wizard's own
+  success message says to restart the daemon manually, the same honest
+  "you still have to act to actually reach the new code" caveat
+  `/login`'s own entry above already established for an `auth.json`
+  edit.
 
 ## Needs a new subsystem
 

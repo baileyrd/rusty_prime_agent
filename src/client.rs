@@ -2220,6 +2220,21 @@ pub async fn model_list(state_root: &Path, detailed: bool, mode: OutputMode) -> 
     Ok(())
 }
 
+/// `harness update [--force]` -- bounded, honest parity with
+/// `prime-agent update [--force]`. See `self_update`'s own module doc
+/// comment for exactly what it does and doesn't cover. A pure local
+/// `git pull` + `cargo build --release` in the checkout this binary was
+/// itself built from, no daemon connection at all -- same reasoning as
+/// `model_list`/`skill_list`.
+pub async fn self_update(force: bool, mode: OutputMode) -> Result<()> {
+    let summary = crate::self_update::run(force).await?;
+    match mode {
+        OutputMode::Json => print_json(&serde_json::json!({ "message": summary })),
+        OutputMode::Text => println!("{summary}"),
+    }
+    Ok(())
+}
+
 /// `harness prompt-template list` -- a pure local directory scan, no
 /// daemon connection at all (unlike almost every other subcommand in
 /// this file).

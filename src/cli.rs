@@ -253,6 +253,16 @@ pub enum Command {
     ModelList {
         detailed: bool,
     },
+    /// `harness update [--force]` -- bounded, honest parity with
+    /// `prime-agent update [--force]`. See `self_update`'s own module
+    /// doc comment for exactly what it does and doesn't cover: this
+    /// project has no release channel to check against (`publish =
+    /// false`, no GitHub Releases), so this pulls and rebuilds the git
+    /// checkout this binary was itself built from instead. No daemon
+    /// needed, same reasoning as `ModelList`.
+    Update {
+        force: bool,
+    },
     /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
     /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
     /// subcommand, does not require `daemon start` first: see
@@ -644,10 +654,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
             }
             other => Err(usage(format!("expected `model list`, got {other:?}"))),
         },
+        Some("update") => {
+            let rest: Vec<&String> = it.collect();
+            let force = rest.iter().any(|a| a.as_str() == "--force");
+            Ok(Command::Update { force })
+        }
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
