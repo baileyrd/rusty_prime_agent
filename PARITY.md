@@ -837,6 +837,38 @@ daemon/worker split rather than requiring the Python control environment:
   `skills::discover`'s own project-local tier does; `SYSTEM.md`/
   `APPEND_SYSTEM.md` stay unimplemented too -- see "Needs a new
   subsystem" below.
+- [x] **A `settings.json` config file**, parity with `prime-agent`'s own
+  persistent config layer -- global only, same cwd-visibility reason
+  `skills::discover`/`read_context_file` are global-only (no project tier
+  attempted, and no merge between tiers to speak of as a result). Scoped
+  narrowly to the only two tunables that make sense as a persistent
+  default rather than a one-off override: the compaction thresholds
+  (`compact_trigger_tokens`/`compact_keep_recent_tokens`, previously
+  env-var-only). `prime-agent`'s own `settings.json` covers real estate
+  this project has no equivalent knob for at all (`enabled`/telemetry,
+  retry policy) and isn't attempted here.
+
+  Precedence, highest wins: an env var beats `settings.json`, which beats
+  the hardcoded default -- the same order the compaction thresholds'
+  env-var overrides already established, just with one more fallback
+  tier (`crate::settings::load`) inserted underneath. Field names are
+  `snake_case` (`compact_trigger_tokens`, `compact_keep_recent_tokens`),
+  matching this project's own JSON convention throughout rather than
+  copying `prime-agent`'s own camelCase verbatim. Malformed or missing
+  JSON reads as "no settings" (every field `None`) rather than a hard
+  error -- the same permissive stance the env-var overrides already take
+  for an unparseable value.
+
+  Verified two ways: unit tests in both `src/settings.rs` (`load` in
+  isolation -- missing file, malformed JSON, an empty object, unknown
+  fields ignored) and `src/session.rs` (`compact_trigger_tokens`/
+  `compact_keep_recent_tokens` actually consulting a real settings.json
+  on a real state root, and an env var still winning when both are set),
+  plus a real end-to-end test against `ollama/qwen2.5:0.5b`
+  (`#[ignore]`d, same real-infra reasons as this project's other
+  `ollama_provider.rs` tests) proving a `settings.json`-only threshold
+  (no env var set at all) actually triggers a real compaction round trip
+  through the daemon/worker/provider, not just the in-process unit tests.
 
 ## Needs a new subsystem
 
@@ -895,10 +927,6 @@ attempted here, and not silently implied by anything in
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"
   above) and the compaction summary -- there's nothing for either to
   hook into without a larger design change than either of those needed.
-- **A `settings.json` config file** (project + global, merged). Every
-  knob in this project is a CLI flag or an env var, set fresh per
-  invocation -- there's no persistent, mergeable config file layer
-  underneath them.
 - **`auth.json` with shell-command key resolution** (e.g.
   `"key": "!security find-generic-password ..."`). This project only
   ever reads a key from a literal env var (`rp_server.rs`'s

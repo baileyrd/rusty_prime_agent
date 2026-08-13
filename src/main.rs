@@ -15,6 +15,7 @@ mod provider;
 mod rp_server;
 mod schedule;
 mod session;
+mod settings;
 mod sha256;
 mod skills;
 mod tool_runtime;

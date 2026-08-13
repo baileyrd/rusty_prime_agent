@@ -46,6 +46,7 @@ project's current shape.
 | `frontmatter` | Hand-rolled `---\nkey: value\n---\n<body>` parsing shared by `prompt_template` and `skills` -- both only ever read a couple of flat string keys |
 | `skills` | Discovery of real, importable Python packages for `session new --runtime ipython` (`paths::global_skills_dir`, `SKILL.md` frontmatter) -- see below and `PARITY.md` |
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
+| `settings` | `<state_dir>/settings.json` read/parse (`load`) -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
 ## Dependency stack
@@ -329,6 +330,22 @@ edit takes effect on the next prompt" property `skills`/
 even-earlier system turn than the compaction summary's own; like that
 injection, `transcript.jsonl` is never touched, so this is
 provider-facing only.
+
+## `settings.json`
+
+Parity with `prime-agent`'s own persistent config layer -- see
+`PARITY.md` for the full story. `settings::load(state_root)` reads and
+parses `<state_dir>/settings.json`, returning an all-`None` `Settings`
+for a missing file, an unreadable one, or one that isn't valid JSON --
+never a hard error, the same permissive stance the compaction
+thresholds' own env-var overrides already take for an unparseable
+value. Scoped today to exactly the two fields those overrides already
+had (`compact_trigger_tokens`/`compact_keep_recent_tokens`);
+`session::compact_trigger_tokens`/`compact_keep_recent_tokens` now check,
+in order, the env var, then `settings::load(&self.state_root)`, then the
+hardcoded default -- one more fallback tier under what was already there,
+not a new precedence model. Global only, same cwd-visibility reason
+`skills::discover`/`read_context_file` are.
 
 ## Known gaps
 

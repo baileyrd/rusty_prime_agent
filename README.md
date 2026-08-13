@@ -215,6 +215,26 @@ merged); read fresh each time, so an edit takes effect on the very next
 prompt with no restart needed. Global only -- no project-local tier, same
 cwd-visibility reason `skills` don't have one either.
 
+### Config file (`settings.json`)
+
+Drop a `settings.json` into the state directory to persist a default for
+a tunable that's otherwise only a CLI flag or an env var, checked fresh
+on every read (no restart needed):
+
+```json
+{
+  "compact_trigger_tokens": 4000,
+  "compact_keep_recent_tokens": 1500
+}
+```
+
+Currently covers just the two automatic-compaction thresholds above
+(parity with `prime-agent`'s own `settings.json`, narrower today). An env
+var still wins when both are set; a missing or malformed file is treated
+as "no settings" rather than an error. Global only, same cwd-visibility
+reason `--runtime ipython` skills and context files don't have a
+project-local tier either.
+
 ### The Continual Harness
 
 Durable supplemental notes (prompts, memories, skill descriptions) a

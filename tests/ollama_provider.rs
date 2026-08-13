@@ -270,6 +270,55 @@ fn ollama_provider_compacts_after_crossing_the_trigger_threshold() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// Same real end-to-end trigger as `ollama_provider_compacts_after_
+/// crossing_the_trigger_threshold` above, but via `<state_dir>/
+/// settings.json` instead of the env-var overrides -- proves
+/// `session::compact_trigger_tokens`/`compact_keep_recent_tokens`
+/// actually consult `settings::load` against a real model and a real
+/// daemon process, not just the CI-safe unit tests in `session.rs`
+/// itself (which construct an `AgentSession` in-process, no daemon
+/// involved) and `settings.rs`'s own in-isolation `load` tests.
+#[test]
+#[ignore]
+fn ollama_provider_compacts_using_settings_json_thresholds() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-compaction-settings-e2e");
+    std::fs::write(
+        state_dir.path().join("settings.json"),
+        r#"{"compact_trigger_tokens": 20, "compact_keep_recent_tokens": 5}"#,
+    )
+    .unwrap();
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+    common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "Say hello in one short sentence.",
+    );
+    common::session_prompt(
+        state_dir.path(),
+        &session_id,
+        "Now say goodbye in one short sentence.",
+    );
+
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let snapshot = lines.join("\n");
+    assert!(
+        snapshot.contains("(compacted") && snapshot.contains("into a running summary)"),
+        "expected a Role::System transcript entry documenting a real compaction, got: {snapshot}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 /// Real end-to-end proof that `<state_dir>/AGENTS.md` actually reaches
 /// the model, not just `session::build_turns`'s own unit-tested output
 /// (see `session::tests::build_turns_prepends_the_context_file_as_a_system_turn`
