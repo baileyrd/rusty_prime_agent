@@ -998,6 +998,7 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             Some(prefix) => format!("{prefix}{text}"),
             None => text.to_string(),
         };
+        let text_to_send = expand_at_references(&text_to_send);
         let entry = send_prompt(state_root, &session_id, text_to_send).await?;
         match mode {
             OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
@@ -1033,28 +1034,32 @@ fn next_repl_line(stdin: &std::io::Stdin, raw_active: bool) -> Result<Option<Str
     Ok(Some(buf))
 }
 
-/// Reads one line from a raw-mode terminal, byte by byte, doing this
-/// project's own minimal echo/editing -- raw mode disables the
-/// terminal's own line buffering and local echo (`termctl::
-/// RawModeGuard`'s own doc comment), so both become this function's job
-/// instead. Deliberately minimal, the actual "raw-mode rendering
-/// foundation" this increment delivers rather than the rich editor a
-/// later one builds on top of it: printable bytes are echoed and
-/// appended, Backspace/Delete erases the last byte (visually and from
-/// the buffer), `Ctrl-C` cancels the current line (prints `^C`, starts a
-/// fresh one -- the same behavior most REPLs already give `Ctrl-C` at an
-/// empty-ish prompt) rather than exiting the process, `Ctrl-D` on an
-/// empty line signals EOF (the same meaning `Ctrl-D` already has at a
-/// cooked-mode prompt), and Enter (CR or LF) submits. No multi-line
-/// editing, no cursor movement within the line, no history, no
-/// completion -- see `PARITY.md`'s "Interactive TUI" entries for why
-/// those are later, separate increments built on top of this one, not
-/// bundled into it. Accumulates raw bytes and decodes lossily at Enter
-/// rather than tracking UTF-8 boundaries as they arrive -- correct for
-/// well-formed input, and multi-byte sequences still render correctly
-/// since each byte is echoed immediately as typed, the same way a real
-/// terminal emulator assembles a UTF-8 sequence from bytes arriving one
-/// at a time.
+/// Reads one (possibly multi-line) submission from a raw-mode terminal,
+/// byte by byte, doing this project's own minimal echo/editing -- raw
+/// mode disables the terminal's own line buffering and local echo
+/// (`termctl::RawModeGuard`'s own doc comment), so both become this
+/// function's job instead. Builds on the foundation the previous
+/// increment landed (see `PARITY.md`'s "raw-mode rendering foundation"
+/// entry) with the rich-editor pieces that increment explicitly
+/// deferred: **multi-line input** (Enter, a raw `\r`, submits; `Ctrl-J`,
+/// a raw `\n` -- reachable because raw mode leaves the two bytes
+/// distinct, unlike cooked mode's CR-to-NL translation -- inserts a
+/// literal newline and keeps composing, so a multi-paragraph prompt can
+/// be typed as itself rather than one `session prompt` line at a time)
+/// and **Tab completion**, covering both slash-command names and (after
+/// an `@`) fuzzy file-path completion -- see [`complete_repl_line`]'s
+/// own doc comment for exactly what "fuzzy" means here and why there's
+/// no live dropdown. Still no cursor movement *within* a line and no
+/// history, and backspacing across a line the user already committed
+/// with `Ctrl-J` only rejoins the buffer (no visual un-scroll) -- both
+/// stay out of scope, needing real terminal cursor-positioning
+/// primitives `termctl` deliberately doesn't have yet (see that
+/// module's own doc comment). Accumulates raw bytes and decodes lossily
+/// at submission time rather than tracking UTF-8 boundaries as they
+/// arrive -- correct for well-formed input, and multi-byte sequences
+/// still render correctly since each byte is echoed immediately as
+/// typed, the same way a real terminal emulator assembles a UTF-8
+/// sequence from bytes arriving one at a time.
 fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
     use std::io::{Read, Write};
     let mut locked = stdin.lock();
@@ -1071,10 +1076,19 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
             return Ok(None);
         }
         match byte[0] {
-            b'\r' | b'\n' => {
+            b'\r' => {
                 let _ = out.write_all(b"\r\n");
                 let _ = out.flush();
                 return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            b'\n' => {
+                // `Ctrl-J`: continue composing on a fresh line rather
+                // than submitting -- see this function's own doc
+                // comment for why `\r`/`\n` can be told apart at all
+                // here.
+                buf.push(b'\n');
+                let _ = out.write_all(b"\r\n");
+                let _ = out.flush();
             }
             0x03 => {
                 buf.clear();
@@ -1087,10 +1101,39 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
                 return Ok(None);
             }
             0x7f | 0x08 => {
-                if buf.pop().is_some() {
-                    let _ = out.write_all(b"\x08 \x08");
-                    let _ = out.flush();
+                match buf.pop() {
+                    Some(b'\n') => {
+                        // Rejoins the buffer, but doesn't try to move
+                        // the terminal's own cursor back up a line it
+                        // already scrolled past -- see this function's
+                        // own doc comment for why that stays out of
+                        // scope here.
+                    }
+                    Some(_) => {
+                        let _ = out.write_all(b"\x08 \x08");
+                        let _ = out.flush();
+                    }
+                    None => {}
                 }
+            }
+            0x09 => {
+                if let Some(completed) = complete_repl_line(&buf) {
+                    let erase = buf.len() - completed.common_prefix_len;
+                    for _ in 0..erase {
+                        let _ = out.write_all(b"\x08 \x08");
+                    }
+                    buf.truncate(completed.common_prefix_len);
+                    buf.extend_from_slice(completed.replacement.as_bytes());
+                    let _ = out.write_all(completed.replacement.as_bytes());
+                } else {
+                    // No completion possible (ambiguous with nothing
+                    // more in common, or no candidates at all) -- the
+                    // bell is the same portable "can't complete that"
+                    // signal every terminal already understands, no
+                    // dropdown UI required.
+                    let _ = out.write_all(b"\x07");
+                }
+                let _ = out.flush();
             }
             b => {
                 buf.push(b);
@@ -1099,6 +1142,205 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
             }
         }
     }
+}
+
+/// Every slash-command `read_raw_line`'s Tab completion knows about --
+/// kept as one list precisely so it can't drift from `session_repl`'s
+/// own dispatch (a mismatch here would complete to a command that
+/// doesn't exist, or fail to complete one that does).
+const REPL_SLASH_COMMANDS: &[&str] = &[
+    "/exit",
+    "/quit",
+    "/heartbeat",
+    "/compact",
+    "/file",
+    "/fork",
+    "/tree",
+    "/branch-summary",
+    "/export",
+];
+
+/// The result of a successful Tab completion: replace everything in the
+/// buffer from `common_prefix_len` onward with `replacement`.
+struct Completion {
+    common_prefix_len: usize,
+    replacement: String,
+}
+
+/// Tab completion for `read_raw_line`'s current buffer -- two triggers,
+/// sharing one mechanism:
+/// - the buffer is exactly a partial slash-command (`/` at the very
+///   start, no whitespace yet) -- completes against
+///   [`REPL_SLASH_COMMANDS`];
+/// - the current word (the text since the last whitespace, or since the
+///   start of the buffer) starts with `@` -- completes the path fragment
+///   after it against real filesystem entries, the bounded, portable
+///   slice of `prime-agent`'s TUI-side "`@` fuzzy search": no live
+///   interactive dropdown (that needs terminal cursor-positioning
+///   primitives `termctl` doesn't have yet -- see that module's own doc
+///   comment), just Tab-driven completion of the reference itself.
+///   "Fuzzy" here means subsequence matching (`fuzzy_matches`'s own doc
+///   comment), not just a prefix match -- typing `@mn` can complete
+///   toward `main.rs`.
+///
+/// Returns `None` when there's nothing to complete: zero candidates, or
+/// more than one candidate with no further common prefix beyond what's
+/// already typed (an ambiguous completion this text-only mechanism has
+/// no listing UI to disambiguate with -- `read_raw_line`'s own caller
+/// rings the terminal bell instead, the same "no dropdown" shape).
+fn complete_repl_line(buf: &[u8]) -> Option<Completion> {
+    let text = String::from_utf8_lossy(buf);
+    let word_start = text.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let word = &text[word_start..];
+
+    // Slash-command completion only applies to the very first word of
+    // the whole buffer -- once there's a preceding word (`word_start >
+    // 0`), any `/`/`@` in the current word is ordinary prompt text or a
+    // command's own argument, not the command name itself.
+    if word_start == 0 {
+        if let Some(fragment) = word.strip_prefix('/') {
+            let candidates: Vec<&str> = REPL_SLASH_COMMANDS
+                .iter()
+                .copied()
+                .filter(|c| c.strip_prefix('/').unwrap().starts_with(fragment))
+                .collect();
+            let common = common_prefix(&candidates)?;
+            let completed = common.strip_prefix('/').unwrap_or(common);
+            if completed.len() <= fragment.len() {
+                return None;
+            }
+            return Some(Completion {
+                common_prefix_len: 0,
+                replacement: format!("/{completed}"),
+            });
+        }
+    }
+
+    let fragment = word.strip_prefix('@')?;
+    let candidates = complete_at_path(fragment);
+    let owned: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let common = common_prefix(&owned)?;
+    if common.len() <= fragment.len() {
+        return None;
+    }
+    Some(Completion {
+        common_prefix_len: word_start,
+        replacement: format!("@{common}"),
+    })
+}
+
+/// Fuzzy (subsequence) match: every character of `pattern`, in order,
+/// appears somewhere in `candidate` -- case-insensitive, so `mn`
+/// matches `main.rs`, `Main.rs`, and `MAIN.RS` alike. Not a scored/
+/// ranked fuzzy match (no "best" ordering beyond what
+/// [`complete_at_path`]'s own directory-listing order gives) -- ranking
+/// candidates is exactly the kind of thing a live dropdown UI would do,
+/// and this mechanism doesn't have one.
+fn fuzzy_matches(candidate: &str, pattern: &str) -> bool {
+    let mut pattern_chars = pattern.chars().flat_map(char::to_lowercase);
+    let mut next = pattern_chars.next();
+    for c in candidate.chars().flat_map(char::to_lowercase) {
+        match next {
+            Some(p) if c == p => next = pattern_chars.next(),
+            _ => {}
+        }
+    }
+    next.is_none()
+}
+
+/// Lists `fragment`'s directory (everything up to its last `/`, or `.`
+/// if there isn't one) and fuzzy-matches each entry's own filename
+/// against the part of `fragment` after that -- candidates are returned
+/// as full paths (directory prefix reattached), with a trailing `/` on
+/// directory entries so a completed directory reference can be Tab-ed
+/// straight into its own contents next, the same convention shell path
+/// completion already uses. An unreadable directory (a typo, a path
+/// that isn't a directory at all) yields no candidates rather than an
+/// error -- Tab completion finding nothing is an ordinary, silent
+/// outcome, not a failure to surface.
+fn complete_at_path(fragment: &str) -> Vec<String> {
+    let (dir, name_fragment) = match fragment.rfind('/') {
+        Some(i) => (&fragment[..=i], &fragment[i + 1..]),
+        None => ("", fragment),
+    };
+    let scan_dir = if dir.is_empty() { "." } else { dir };
+    let Ok(entries) = std::fs::read_dir(scan_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !fuzzy_matches(name, name_fragment) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        candidates.push(format!("{dir}{name}{}", if is_dir { "/" } else { "" }));
+    }
+    candidates.sort();
+    candidates
+}
+
+/// The longest string every one of `candidates` starts with -- `None`
+/// for an empty slice (nothing to complete toward at all).
+fn common_prefix<'a>(candidates: &[&'a str]) -> Option<&'a str> {
+    let first = *candidates.first()?;
+    let mut end = first.len();
+    for candidate in &candidates[1..] {
+        let shared = first
+            .bytes()
+            .zip(candidate.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        end = end.min(shared);
+    }
+    // Never split a multi-byte UTF-8 character in half.
+    while end > 0 && !first.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&first[..end])
+}
+
+/// Expands every `@<path>` token in `text` (a `@` immediately followed
+/// by a non-whitespace path fragment) into that file's content inline,
+/// formatted the same way `/file`'s own `pending_file_content` prefix
+/// already is -- the other half of the bounded `@`-reference slice
+/// [`complete_repl_line`]'s own doc comment describes: Tab completes the
+/// reference while composing, this expands it at submission time,
+/// wherever in the text it was typed (not just prepended, unlike
+/// `/file`) -- a more precise placement than `/file` gives, now that
+/// there's a natural point in the text to put it. Applies regardless of
+/// whether the line came from raw-mode input or the piped/cooked-mode
+/// fallback (every one of this project's own tests uses the latter), so
+/// it's testable without a real terminal. A token whose path doesn't
+/// resolve to a real, readable file is left untouched -- most likely
+/// just a literal `@` mention (an email-style handle, social-media
+/// syntax the user typed on purpose), not a botched file reference, so
+/// silently leaving it alone beats guessing or erroring.
+fn expand_at_references(text: &str) -> String {
+    fn expand_word(word: &str) -> String {
+        if let Some(path) = word.strip_prefix('@') {
+            if !path.is_empty() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    return format!("--- {path} ---\n{content}\n---\n\n");
+                }
+            }
+        }
+        word.to_string()
+    }
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_whitespace() {
+            out.push_str(&expand_word(&word));
+            word.clear();
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    out.push_str(&expand_word(&word));
+    out
 }
 
 /// Parses `/fork`'s own trailing `[--at N] [--name TEXT]` -- a small,
@@ -2222,4 +2464,160 @@ fn unexpected_response(response: Response) -> HarnessError {
         Context::Daemon,
         format!("unexpected response: {response:?}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rpa-client-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn expand_at_references_folds_in_a_real_files_content() {
+        let dir = temp_dir("expand-real-file");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "the file's content").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let expanded = expand_at_references(&format!("before @{path_str} after"));
+        assert_eq!(
+            expanded,
+            format!("before --- {path_str} ---\nthe file's content\n---\n\n after")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expand_at_references_leaves_a_nonexistent_path_untouched() {
+        let expanded = expand_at_references("hello @this-path-does-not-exist-xyz world");
+        assert_eq!(expanded, "hello @this-path-does-not-exist-xyz world");
+    }
+
+    #[test]
+    fn expand_at_references_leaves_plain_text_with_no_at_tokens_untouched() {
+        let text = "just an ordinary prompt\nwith a second line, no references";
+        assert_eq!(expand_at_references(text), text);
+    }
+
+    #[test]
+    fn expand_at_references_preserves_surrounding_multiline_structure() {
+        let dir = temp_dir("expand-multiline");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, "DATA").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let expanded = expand_at_references(&format!("line one\n@{path_str}\nline three"));
+        assert!(expanded.starts_with("line one\n"), "got: {expanded:?}");
+        assert!(expanded.ends_with("\nline three"), "got: {expanded:?}");
+        assert!(expanded.contains("DATA"), "got: {expanded:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fuzzy_matches_finds_an_in_order_subsequence_case_insensitively() {
+        assert!(fuzzy_matches("main.rs", "mn"));
+        assert!(fuzzy_matches("main.rs", "MN"));
+        assert!(fuzzy_matches("main.rs", "main.rs"));
+        assert!(!fuzzy_matches("main.rs", "nm"));
+        assert!(!fuzzy_matches("main.rs", "xyz"));
+    }
+
+    #[test]
+    fn common_prefix_of_one_candidate_is_the_candidate_itself() {
+        assert_eq!(common_prefix(&["/export"]), Some("/export"));
+    }
+
+    #[test]
+    fn common_prefix_of_diverging_candidates_stops_at_the_divergence() {
+        assert_eq!(common_prefix(&["/exit", "/export"]), Some("/ex"));
+    }
+
+    #[test]
+    fn common_prefix_of_candidates_with_nothing_shared_is_empty() {
+        assert_eq!(common_prefix(&["abc", "xyz"]), Some(""));
+    }
+
+    #[test]
+    fn common_prefix_of_no_candidates_is_none() {
+        assert_eq!(common_prefix(&[]), None);
+    }
+
+    #[test]
+    fn complete_at_path_fuzzy_matches_and_marks_directories() {
+        let dir = temp_dir("complete-at-path");
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        std::fs::write(dir.join("lib.rs"), "").unwrap();
+        std::fs::create_dir(dir.join("target")).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        let mut candidates = complete_at_path(&format!("{dir_str}/mn"));
+        candidates.sort();
+        assert_eq!(candidates, vec![format!("{dir_str}/main.rs")]);
+
+        let mut all = complete_at_path(&format!("{dir_str}/"));
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                format!("{dir_str}/lib.rs"),
+                format!("{dir_str}/main.rs"),
+                format!("{dir_str}/target/"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn complete_at_path_of_an_unreadable_directory_is_empty() {
+        assert!(complete_at_path("/this/does/not/exist/at/all/frag").is_empty());
+    }
+
+    #[test]
+    fn complete_repl_line_completes_an_unambiguous_slash_command() {
+        let completion = complete_repl_line(b"/tr").expect("should complete");
+        assert_eq!(completion.common_prefix_len, 0);
+        assert_eq!(completion.replacement, "/tree");
+    }
+
+    #[test]
+    fn complete_repl_line_partially_completes_an_ambiguous_slash_command() {
+        // `/exit` and `/export` share only `/ex` beyond the typed `/e`.
+        let completion = complete_repl_line(b"/e").expect("should partially complete");
+        assert_eq!(completion.replacement, "/ex");
+    }
+
+    #[test]
+    fn complete_repl_line_returns_none_when_no_slash_command_matches() {
+        assert!(complete_repl_line(b"/zzz").is_none());
+    }
+
+    #[test]
+    fn complete_repl_line_does_not_complete_slash_commands_past_the_first_word() {
+        // A `/`-looking token that isn't the first word (e.g. a `/fork`
+        // argument) isn't a command name to complete.
+        assert!(complete_repl_line(b"hello /tr").is_none());
+    }
+
+    #[test]
+    fn complete_repl_line_completes_an_at_path_reference_mid_line() {
+        let dir = temp_dir("complete-repl-line-at");
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        let buf = format!("please read @{dir_str}/mn").into_bytes();
+        let completion = complete_repl_line(&buf).expect("should complete");
+        assert_eq!(completion.common_prefix_len, "please read ".len());
+        assert_eq!(completion.replacement, format!("@{dir_str}/main.rs"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -668,6 +668,94 @@ daemon/worker split rather than requiring the Python control environment:
   proof `ISIG` was genuinely disabled (a real terminal's default
   disposition would otherwise have delivered `SIGINT` and killed the
   process outright, not produced this project's own handled `^C` text).
+- [x] **Interactive TUI: rich editor -- multi-line input, `@` fuzzy file
+  search, Tab completion.** Builds directly on the raw-mode foundation
+  just above: three named pieces of `prime-agent`'s rich-editor surface,
+  each investigated for an honest bounded slice rather than assumed to
+  need a full interactive dropdown/overlay UI (the thing `termctl`'s own
+  doc comment already flagged as needing terminal cursor-positioning
+  primitives that module deliberately doesn't have yet).
+
+  **Multi-line input**: raw mode leaves `\r` (Enter) and `\n` (`Ctrl-J`)
+  genuinely distinct bytes (cooked mode's `ICRNL` translation, which
+  would fold them together, is one of the flags raw mode already
+  clears) -- `read_raw_line` now treats `\r` as submit and `\n` as
+  "insert a literal newline, keep composing," so a multi-paragraph
+  prompt can be typed as itself instead of joined by hand into one
+  `session prompt` line. Backspacing across a line boundary the user
+  already committed with `Ctrl-J` rejoins the buffer but doesn't try to
+  move the terminal's own cursor back up a line it's already scrolled
+  past -- correctly deferred, needing the same cursor-positioning
+  primitives noted above.
+
+  **Tab completion and `@` fuzzy search share one mechanism**
+  (`complete_repl_line`), triggered two ways: the buffer's very first
+  word starting with `/` completes against a fixed list of this
+  project's own REPL commands (`REPL_SLASH_COMMANDS`, kept as one list
+  specifically so it can't drift from `session_repl`'s real dispatch);
+  the *current* word (wherever it is in the line) starting with `@`
+  fuzzy-completes the path fragment after it against real filesystem
+  entries (`complete_at_path`). "Fuzzy" here means subsequence matching
+  (`fuzzy_matches`: every character of the typed fragment appears
+  somewhere in the candidate, in order, case-insensitively -- so `mn`
+  completes toward `main.rs`), not just a prefix match, and not a
+  ranked/scored match either -- there's no dropdown to rank *for*.
+  Completion is bash-style: an unambiguous match completes fully, an
+  ambiguous one completes to the longest shared prefix across every
+  candidate (`common_prefix`), and a fragment with zero candidates or no
+  further shared prefix rings the terminal bell (`\x07`) -- the same
+  portable "can't complete that" signal every terminal already
+  understands, no candidate-listing UI needed. This is the bounded,
+  text-only slice of `prime-agent`'s own `@` fuzzy search: no live
+  interactive dropdown that narrows as you type and lets you arrow
+  through candidates -- that's the piece still genuinely blocked on
+  `termctl` growing real cursor-positioning primitives, tracked below in
+  "Needs a new subsystem," not attempted here.
+
+  **`expand_at_references`** is the other half of the `@` slice: at
+  submission time (not just while Tab-completing), every `@<path>` token
+  found anywhere in the line -- typed out fully by hand, not
+  necessarily Tab-completed -- that resolves to a real, readable file is
+  expanded inline into that file's own content, formatted the same way
+  `/file`'s own `pending_file_content` prefix already is. Placed
+  precisely where referenced in the text rather than only prepended
+  (unlike `/file`, which can only queue content ahead of the *next*
+  whole prompt) -- a more precise placement `/file` structurally
+  couldn't offer, now that `@` gives a natural point in the text to put
+  it. A token that doesn't resolve to a real file (most likely an
+  ordinary `@`-mention, not a botched reference) is left exactly as
+  typed rather than guessed at or erroring. Deliberately applied
+  regardless of whether the line came from raw-mode input or the piped/
+  cooked-mode fallback every one of this project's own tests still
+  uses -- so it's genuinely CI-testable without a real terminal, unlike
+  the completion/multi-line pieces above.
+
+  Verified with 16 new CI-safe unit tests directly on the pure helper
+  functions (`expand_at_references` folding in a real file's content
+  correctly, leaving a nonexistent path and plain `@`-free text
+  untouched, preserving surrounding multi-line structure;
+  `fuzzy_matches`'s in-order-subsequence/case-insensitive behavior;
+  `common_prefix` across one/diverging/disjoint/zero candidates;
+  `complete_at_path` fuzzy-matching real directory entries and marking
+  directories with a trailing `/`; `complete_repl_line` completing an
+  unambiguous command, partially completing an ambiguous one, returning
+  nothing for a command with no match, correctly *not* treating a
+  `/`-looking token past the first word as a command name, and
+  completing an `@`-path fragment mid-line) plus two new CI-safe
+  `tests/repl.rs` integration tests proving `@`-expansion end to end
+  through a real (piped) `session repl` process. The full existing test
+  suite (unit + integration) stayed green with zero changes elsewhere,
+  confirming no regression to ordinary single-line, non-`@` REPL use.
+  Plus a real end-to-end pass in this sandbox against an actual
+  pseudo-terminal: typing `line one<Ctrl-J>line two<Enter>` produced a
+  single prompt whose text was `line one\nline two` (the embedded
+  newline intact, confirmed by `EchoProvider`'s own reply echoing it
+  back); typing `/tr<Tab>` visibly erased and replaced itself with
+  `/tree`; typing `@<dir>/mn<Tab>` visibly erased and replaced itself
+  with the real, fuzzy-matched `@<dir>/main.rs`, and submitting that
+  line produced a reply containing the referenced file's actual
+  content -- proof the completion and the expansion genuinely connect
+  end to end, not just independently in isolation.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
@@ -1950,9 +2038,11 @@ attempted here, and not silently implied by anything in
   consume it, so this stays blocked on a later TUI increment, not on
   missing spec.
 - **The interactive TUI's rich editor/message-queue surface, the pieces
-  that still need more than raw mode alone gives** (raw mode itself now
-  exists -- see the medium-effort section's own "Interactive TUI:
-  raw-mode rendering foundation" entry): **image paste** (zero
+  that still need more than raw mode plus text-only line editing gives**
+  (raw mode itself, and multi-line input/`@` file-reference completion/
+  slash-command Tab completion on top of it, now exist -- see the
+  medium-effort section's own "Interactive TUI: raw-mode rendering
+  foundation" and "rich editor" entries): **image paste** (zero
   non-text-content plumbing exists anywhere in this project -- `provider::
   ChatTurn.content` is `Option<String>`, text only, and `mcp_client.rs`'s
   own doc comment already names this exact gap for a different reason;

@@ -408,13 +408,22 @@ Reads lines from stdin, sends each as a prompt, prints the reply, until
 EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
 existing transcript first. When both stdin and stdout are a real
 interactive terminal, the REPL puts it into raw mode and does its own
-minimal line editing (byte-by-byte echo, Backspace/Delete erases the
-last character, `Ctrl-C` cancels the current line instead of killing the
-process, `Ctrl-D` on an empty line exits) -- the foundation a later
-increment's richer editor (multiline input, `@` fuzzy file search, tab
-completion) builds on. Piped/non-interactive stdin (scripts, this
-project's own tests) is unaffected -- ordinary line-buffered reading,
-exactly as before. A line that's exactly `/heartbeat` manually
+line editing: byte-by-byte echo, Backspace/Delete erases the last
+character, `Ctrl-C` cancels the current line instead of killing the
+process, `Ctrl-D` on an empty line exits, `Enter` submits, and `Ctrl-J`
+inserts a literal newline instead -- so a multi-paragraph prompt can be
+typed as itself. Tab completes: at the start of a line, a partial
+`/command` name; anywhere else, a partial `@path` fragment against real
+files/directories, fuzzy-matched (characters just have to appear in
+order, e.g. `@sr/mn` can complete toward `@src/main.rs`) rather than a
+plain prefix match. Any `@<path>` left in the submitted line (typed by
+hand or Tab-completed) that resolves to a real file gets expanded inline
+into that file's own content before the prompt is sent -- placed exactly
+where referenced, unlike `/file` below (which can only queue content
+ahead of the next whole prompt). Piped/non-interactive stdin (scripts,
+this project's own tests) is unaffected by any of the above -- ordinary
+line-buffered reading, exactly as before, though `@<path>` expansion
+still applies there too. A line that's exactly `/heartbeat` manually
 re-enters the session's `Active` goal right away (`"Continue working
 toward the goal: ..."`) -- with no active goal, it prints an explanation
 and sends nothing. `/heartbeat every <duration>` (e.g. `/heartbeat every

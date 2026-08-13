@@ -557,15 +557,20 @@ above:
 
 - **Interactive-mode UI (startup header, `--verbose`, footer, `/usage`),
   editor features (`@` fuzzy search, Tab completion, image paste,
-  external-editor hotkey).** -- **False/N/A, one clause now partial.**
-  `session_repl` is still a plain line-at-a-time REPL with no rich
-  editor layer -- no `@` fuzzy search, no Tab completion, no image
-  paste, no external-editor hotkey, no startup header/footer/`/usage`,
-  all still absent. **Partial now**: it's no longer a *cooked-mode-only*
-  stdin loop -- when connected to a real terminal it puts the terminal
-  into raw mode and does its own byte-level echo/backspace/cancel
-  editing (`termctl`, see `ARCHITECTURE.md`), the foundation those
-  editor features would build on, without any of them existing yet.
+  external-editor hotkey).** -- **False/N/A, two clauses now real.**
+  No startup header/footer/`/usage`, no image paste, no
+  external-editor hotkey -- all still absent, image paste still
+  structurally blocked on a content-type change to the transcript/
+  provider boundary (see `PARITY.md`). **Real now**: `@` fuzzy search
+  and Tab completion both exist, in a bounded, text-only form -- Tab
+  completes a partial `/command` name or (after `@`) a fuzzy-matched
+  file path (`client::complete_repl_line`/`fuzzy_matches`), and any
+  `@<path>` left in a submitted line expands inline into that file's
+  content (`client::expand_at_references`). No live interactive
+  dropdown -- that still needs terminal cursor-positioning primitives
+  `termctl` doesn't have yet, see `ARCHITECTURE.md`'s own "rich editor"
+  entry. Multi-line input (`Ctrl-J`) is real too, though it wasn't named
+  in this particular upstream bullet.
 - **Slash-command table (23 commands).** -- **Partial, one clause now
   closed.** Only `/quit` (aliased `/exit`), `/compact`, `/heartbeat`, a
   bounded `/fork`/`/file`/`/export`/`/tree` exist (the last **closed**
