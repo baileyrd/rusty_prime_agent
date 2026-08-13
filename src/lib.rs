@@ -129,9 +129,11 @@ pub async fn run(args: &[String]) -> Result<()> {
             client::session_attach(&state_root, session_id, output_mode).await
         }
         cli::Command::SessionList => client::session_list(&state_root, output_mode).await,
-        cli::Command::SessionPrompt { session_id, text } => {
-            client::session_prompt(&state_root, session_id, text, output_mode).await
-        }
+        cli::Command::SessionPrompt {
+            session_id,
+            text,
+            image_paths,
+        } => client::session_prompt(&state_root, session_id, text, image_paths, output_mode).await,
         cli::Command::SessionStop { session_id } => {
             client::session_stop(&state_root, session_id, output_mode).await
         }

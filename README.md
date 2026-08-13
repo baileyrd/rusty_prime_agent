@@ -159,7 +159,7 @@ harness daemon shutdown              # gracefully stops every worker, then exits
 harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read|mcp] [--runtime ipython]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
-harness session prompt <id> <text...>
+harness session prompt <id> [--image PATH]... <text...>
 harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
 harness session compact <id> [instructions...]   # force compaction now
@@ -168,6 +168,16 @@ harness session tree <id>                     # show every branch of the transcr
 harness session set-active-leaf <id> <sequence>  # switch which entry the next prompt continues from
 harness session branch-summary <id> <sequence>   # ask the model to summarize a branch other than the active one
 ```
+
+`session prompt <id> --image <path>` attaches a local image (recognized
+by extension: png/jpg/jpeg/gif/webp/bmp) to the prompt, encoded as a
+base64 data URI and threaded through to the model alongside any prompt
+text -- repeat `--image` for more than one. Bounded parity with
+`prime-agent`'s image-paste feature: "paste" here means "reference a
+local file," not a real terminal clipboard/image-protocol capture (see
+`PARITY.md` for why). Fails loudly on an unreadable path or an
+unrecognized extension, rather than silently sending the prompt without
+it.
 
 Sessions with a real `--model` automatically compact their own context
 once it grows past a size threshold -- older turns get folded into a
@@ -437,7 +447,13 @@ list`/`cancel`, same as any other schedule. A line that's `/compact` or
 *next* prompt (queued across an intervening `/heartbeat`/`/compact`/
 `/fork` line, not dropped) -- a bounded slice of a TUI's file-reference
 feature, no client-side attachment UI, just folding the file's content
-into the next ordinary prompt text. `/fork [--at N] [--name TEXT]` is
+into the next ordinary prompt text. If `<path>` looks like an image
+(png/jpg/jpeg/gif/webp/bmp) it's queued as an image attachment instead
+of inlined text -- the same mechanism `session prompt --image` uses.
+`@<path>` anywhere in the line behaves the same way for images: a real
+image path is attached out of band (the literal `@path` text is left in
+place, unlike a text file, which gets its content substituted in). `/fork
+[--at N] [--name TEXT]` is
 `session fork` wired into the REPL loop, same as `session compact` is
 via `/compact`. `/export <path>` writes the session's current
 transcript to a local file as pretty-printed JSON.

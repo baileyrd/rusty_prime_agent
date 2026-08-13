@@ -542,9 +542,12 @@ above:
   -- **False.** No `@`-prefixed file-argument parsing exists; `Print`
   takes only free-text argv.
 - **Image paste, `!command` shell passthrough, `/model`/`/effort`
-  scoped-model cycling.** -- **False**, all three -- no image content
-  type, no `!`-dispatch, and model/thinking-level are fixed at `session
-  new` time with no mid-session change.
+  scoped-model cycling.** -- **False for two of three; image paste now
+  real** (bounded to "reference a local image file" via `/file`, `@`, or
+  `session prompt --image` -- see `PARITY.md`'s "Interactive TUI: image
+  paste support" entry). `!`-dispatch and mid-session model/thinking-
+  level cycling stay False -- no `!`-dispatch exists, and model/thinking-
+  level are still fixed at `session new` time with no mid-session change.
 - **"Continue Later": `-c`/`-r [path|id]`.** -- **False as top-level
   flags** -- covered functionally by `session list` + `session attach`
   instead.
@@ -557,16 +560,18 @@ above:
 
 - **Interactive-mode UI (startup header, `--verbose`, footer, `/usage`),
   editor features (`@` fuzzy search, Tab completion, image paste,
-  external-editor hotkey).** -- **False/N/A, two clauses now real.**
-  No startup header/footer/`/usage`, no image paste, no
-  external-editor hotkey -- all still absent, image paste still
-  structurally blocked on a content-type change to the transcript/
-  provider boundary (see `PARITY.md`). **Real now**: `@` fuzzy search
-  and Tab completion both exist, in a bounded, text-only form -- Tab
-  completes a partial `/command` name or (after `@`) a fuzzy-matched
-  file path (`client::complete_repl_line`/`fuzzy_matches`), and any
-  `@<path>` left in a submitted line expands inline into that file's
-  content (`client::expand_at_references`). No live interactive
+  external-editor hotkey).** -- **False/N/A, three clauses now real.**
+  No startup header/footer/`/usage`, no external-editor hotkey -- both
+  still absent. **Real now**: `@` fuzzy search and Tab completion both
+  exist, in a bounded, text-only form -- Tab completes a partial
+  `/command` name or (after `@`) a fuzzy-matched file path
+  (`client::complete_repl_line`/`fuzzy_matches`), and any `@<path>` left
+  in a submitted line expands inline into that file's content
+  (`client::expand_at_references`). Image paste is also real now,
+  bounded to "reference a local image file" (`/file`, `@`, or `session
+  prompt --image`; see `PARITY.md`'s "Interactive TUI: image paste
+  support" entry) -- not a terminal clipboard/paste-protocol capture,
+  which stays out of scope for the reasons given there. No live interactive
   dropdown -- that still needs terminal cursor-positioning primitives
   `termctl` doesn't have yet, see `ARCHITECTURE.md`'s own "rich editor"
   entry. Multi-line input (`Ctrl-J`) is real too, though it wasn't named

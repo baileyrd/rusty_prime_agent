@@ -51,6 +51,13 @@ pub struct ChatTurn {
     pub tool_call_id: Option<String>,
     /// Set only on a `TurnRole::Tool` turn: the tool's name.
     pub name: Option<String>,
+    /// Parity with a bounded slice of `prime-agent`'s image-paste
+    /// feature -- see `protocol::TranscriptEntry::images`'s own doc
+    /// comment for the shape (`data:<mime>;base64,<...>` URIs) and
+    /// `RustyProviderModel::build_request_body` for how a non-empty list
+    /// switches this turn's outgoing `content` from a plain string to
+    /// `rp-server`'s own multipart content-block array.
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,15 +131,31 @@ impl ModelProvider for EchoProvider {
         turns: &'a [ChatTurn],
         _tools: &'a [ToolDef],
     ) -> BoxFuture<'a, Result<ProviderResponse>> {
-        let last_user_text = turns
-            .iter()
-            .rev()
-            .find(|t| t.role == TurnRole::User)
+        let last_user_turn = turns.iter().rev().find(|t| t.role == TurnRole::User);
+        let last_user_text = last_user_turn
             .and_then(|t| t.content.clone())
             .unwrap_or_default();
+        // Mentions the image count rather than ignoring `images`
+        // entirely (unlike `tools`, deliberately never exercised here) --
+        // proves `images` threaded all the way from a prompt through
+        // `build_turns` to the provider without needing a real
+        // vision-capable model, the same "CI-safe proof independent of
+        // real-model reliability" reasoning skills/RLM tests already use.
+        let image_count = last_user_turn
+            .and_then(|t| t.images.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let suffix = if image_count > 0 {
+            format!(
+                " [+{image_count} image{}]",
+                if image_count == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         Box::pin(async move {
             Ok(ProviderResponse {
-                reply: ProviderReply::Text(format!("echo: {last_user_text}")),
+                reply: ProviderReply::Text(format!("echo: {last_user_text}{suffix}")),
                 usage: None,
             })
         })
@@ -183,8 +206,30 @@ impl RustyProviderModel {
             .iter()
             .map(|t| {
                 let mut msg = serde_json::json!({ "role": turn_role_str(t.role) });
-                if let Some(content) = &t.content {
-                    msg["content"] = serde_json::Value::String(content.clone());
+                match &t.images {
+                    // A non-empty `images` list switches `content` from a
+                    // plain string to `rp-server`'s own multipart
+                    // content-block array (`ContentPart::Text`/
+                    // `ContentPart::ImageUrl`) -- the shape real
+                    // vision-capable models expect, not something a
+                    // string could carry.
+                    Some(images) if !images.is_empty() => {
+                        let mut parts: Vec<serde_json::Value> = Vec::new();
+                        if let Some(content) = &t.content {
+                            if !content.is_empty() {
+                                parts.push(serde_json::json!({"type": "text", "text": content}));
+                            }
+                        }
+                        parts.extend(images.iter().map(|url| {
+                            serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+                        }));
+                        msg["content"] = serde_json::Value::Array(parts);
+                    }
+                    _ => {
+                        if let Some(content) = &t.content {
+                            msg["content"] = serde_json::Value::String(content.clone());
+                        }
+                    }
                 }
                 if let Some(tool_calls) = &t.tool_calls {
                     msg["tool_calls"] = serde_json::Value::Array(
@@ -328,6 +373,18 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: None,
+        }
+    }
+
+    fn user_turn_with_images(text: &str, images: Vec<String>) -> ChatTurn {
+        ChatTurn {
+            role: TurnRole::User,
+            content: Some(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            images: Some(images),
         }
     }
 
@@ -385,6 +442,7 @@ mod tests {
                 }]),
                 tool_call_id: None,
                 name: None,
+                images: None,
             },
             ChatTurn {
                 role: TurnRole::Tool,
@@ -392,6 +450,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
                 name: Some("read_file".to_string()),
+                images: None,
             },
         ];
         let body: serde_json::Value =
@@ -405,6 +464,49 @@ mod tests {
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
         assert_eq!(body["messages"][2]["name"], "read_file");
+    }
+
+    #[test]
+    fn build_request_body_switches_to_a_content_block_array_when_images_are_present() {
+        let provider = RustyProviderModel::new(1234, "ollama/qwen2.5:0.5b".to_string(), None);
+        let turns = [user_turn_with_images(
+            "what's in this picture?",
+            vec!["data:image/png;base64,AAAA".to_string()],
+        )];
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.build_request_body(&turns, &[])).unwrap();
+        let content = &body["messages"][0]["content"];
+        assert!(content.is_array(), "got: {content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what's in this picture?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn build_request_body_omits_the_text_part_when_images_are_present_with_empty_text() {
+        let provider = RustyProviderModel::new(1234, "ollama/qwen2.5:0.5b".to_string(), None);
+        let turns = [user_turn_with_images(
+            "",
+            vec!["data:image/png;base64,AAAA".to_string()],
+        )];
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.build_request_body(&turns, &[])).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "got: {content:?}");
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn build_request_body_ignores_an_empty_images_list() {
+        let provider = RustyProviderModel::new(1234, "ollama/qwen2.5:0.5b".to_string(), None);
+        let turns = [user_turn_with_images("hello", vec![])];
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.build_request_body(&turns, &[])).unwrap();
+        // An empty (but `Some`) `images` list should fall back to the
+        // plain-string `content` shape, same as `None` -- an empty list
+        // is not "images present."
+        assert_eq!(body["messages"][0]["content"], "hello");
     }
 
     #[test]

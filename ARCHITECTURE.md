@@ -817,9 +817,10 @@ to end against a real, piped `session repl` process).
 
 Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/
 message-queue features -- see `PARITY.md` for the full story, including
-which pieces of that surface (image paste, steering vs. follow-up
-queuing, `/clone`, `/share`) don't have a bounded slice and why. All
-four live in `client::session_repl`'s own stdin loop, the same shape
+which pieces of that surface (steering vs. follow-up queuing, `/clone`,
+`/share`) don't have a bounded slice and why (image paste does now --
+see "Image paste" below). All four live in `client::session_repl`'s own
+stdin loop, the same shape
 `/heartbeat`/`/compact` already established: a REPL-only line command
 calling directly into an existing client-side function, no daemon/
 worker/protocol change.
@@ -837,6 +838,54 @@ the session's current transcript and writes it as pretty-printed JSON
 via `serde_json::to_string_pretty` -- the same already-`Serialize`
 `TranscriptEntry` `--mode json` already renders, no new format
 invented.
+
+## Image paste
+
+`prime-agent`'s multimodal input, bounded to "reference a local image
+file" -- see `PARITY.md`'s "Interactive TUI: image paste support" entry
+for the full story of what was assumed missing (a whole new content-type
+subsystem) versus what actually was missing (only this project's own
+text-only wire shapes; `rp-server`, the sibling `rusty_provider` repo
+this project's `RustyProviderModel` already shells out to, already had
+real `ContentPart::ImageUrl` multimodal support end to end).
+
+Additive, not a restructuring: `images: Option<Vec<String>>` sits
+alongside `text` on `protocol::TranscriptEntry`, `provider::ChatTurn`,
+and `protocol::Request::SessionPrompt`, each entry a
+`data:<mime>;base64,<...>` URI -- the exact shape `rp_server`'s own
+`ContentPart::ImageUrl` already accepts inline. `session::
+AgentSession::prompt_with_images` is the one entry point every image-
+carrying prompt goes through, persisting the images on the user's
+`TranscriptEntry` via a narrowly-scoped `append_user_turn_with_images`
+helper (kept separate from the general-purpose `append` specifically to
+avoid pushing that function past clippy's `too_many_arguments` limit --
+`append` itself, and every existing caller, is untouched).
+`provider::RustyProviderModel::build_request_body` switches a turn's
+JSON `content` from a plain string to a `[{"type":"image_url",...},
+{"type":"text",...}]` content-block array only when that turn actually
+carries images.
+
+Three surfaces reach an image into a prompt: `client.rs`'s `/file
+<path>` and `@<path>` (`session_repl`'s two existing local-file-
+reference mechanisms) check the path's extension against a small
+recognized set (png/jpg/jpeg/gif/webp/bmp) before falling back to their
+existing text-inlining behavior, routing a real image to an out-of-band
+`images` list instead -- for `@`, the literal `@path` token stays in the
+prompt text unchanged, unlike a text-file `@`-expansion, which replaces
+the token with file content. A third surface, `harness session prompt
+<id> --image <path>... <text...>`, is a repeatable CLI flag (hand-parsed
+in `cli.rs` since `scan_named_flag` only handles single-occurrence
+flags) that fails loudly on an unreadable path or unrecognized
+extension, rather than `/file`'s silent fall-through to "not an image,
+try as text." Base64 encoding (`client::base64_encode`) is a small,
+hand-rolled RFC 4648 encoder, the same "hand-roll narrow protocol/
+encoding concerns instead of adding a dependency" precedent as the
+SHA-256/HMAC and ZMTP modules. `EchoProvider` appends `" [+N
+image(s)]"` to its reply when the last user turn carried images, a
+CI-safe seam proving images reach the provider without needing a real
+vision model for most coverage; `tests/ollama_provider.rs`'s
+`#[ignore]`d `ollama_provider_describes_a_real_image` is the real-model
+proof, run manually against `moondream` in this project's own sandbox.
 
 ## Known gaps
 

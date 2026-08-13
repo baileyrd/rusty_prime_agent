@@ -153,7 +153,11 @@ pub async fn print_once(
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
-        &Request::SessionPrompt { session_id, text },
+        &Request::SessionPrompt {
+            session_id,
+            text,
+            images: None,
+        },
     )
     .await?;
     match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
@@ -770,6 +774,11 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
     // intervening `/heartbeat`/`/compact`/`/fork` line, so `/file`
     // followed by one of those doesn't silently drop it.
     let mut pending_file_content: Option<String> = None;
+    // Same queuing shape as `pending_file_content`, for `/file <path>`
+    // when `<path>` names an image instead of a text file -- parity with
+    // a bounded slice of `prime-agent`'s image-paste feature, see
+    // `PARITY.md`'s own "Interactive TUI: image paste support" entry.
+    let mut pending_images: Vec<String> = Vec::new();
 
     // Raw mode when connected to a real interactive terminal (parity
     // with `prime-agent`'s interactive TUI's own foundation -- see
@@ -884,16 +893,25 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         {
             // Parity with a bounded slice of `prime-agent`'s TUI-side
             // file-reference feature -- see this loop's own
-            // `pending_file_content` doc comment above.
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    println!(
-                        "queued {path} ({} bytes) -- included in your next prompt",
-                        content.len()
-                    );
-                    pending_file_content = Some(format!("--- {path} ---\n{content}\n---\n\n"));
+            // `pending_file_content` doc comment above. An image path
+            // (`image_mime_type`'s own extension list) queues into
+            // `pending_images` instead -- see `pending_images`'s own doc
+            // comment -- since image bytes can't be inlined as text the
+            // way a text file's content can.
+            if let Some(data_uri) = load_image_as_data_uri(path) {
+                println!("queued {path} as an image -- included in your next prompt");
+                pending_images.push(data_uri);
+            } else {
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        println!(
+                            "queued {path} ({} bytes) -- included in your next prompt",
+                            content.len()
+                        );
+                        pending_file_content = Some(format!("--- {path} ---\n{content}\n---\n\n"));
+                    }
+                    Err(e) => println!("failed to read {path}: {e}"),
                 }
-                Err(e) => println!("failed to read {path}: {e}"),
             }
             continue;
         }
@@ -998,8 +1016,14 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             Some(prefix) => format!("{prefix}{text}"),
             None => text.to_string(),
         };
-        let text_to_send = expand_at_references(&text_to_send);
-        let entry = send_prompt(state_root, &session_id, text_to_send).await?;
+        let (text_to_send, at_images) = expand_at_references(&text_to_send);
+        let mut images = std::mem::take(&mut pending_images);
+        images.extend(at_images);
+        let entry = if images.is_empty() {
+            send_prompt(state_root, &session_id, text_to_send).await?
+        } else {
+            send_prompt_with_images(state_root, &session_id, text_to_send, Some(images)).await?
+        };
         match mode {
             OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
             OutputMode::Text => print_entry(&entry),
@@ -1301,6 +1325,79 @@ fn common_prefix<'a>(candidates: &[&'a str]) -> Option<&'a str> {
     Some(&first[..end])
 }
 
+/// File extensions this project treats as an image to attach out-of-band
+/// (`protocol::TranscriptEntry::images`/`provider::ChatTurn::images`)
+/// rather than expanded inline as text -- the same small, well-known set
+/// every vision-capable provider's own multipart content type accepts.
+/// Parity with a bounded slice of `prime-agent`'s image-paste feature --
+/// see `PARITY.md`'s own "Interactive TUI: image paste support" entry
+/// for why this project's own text-only shapes (not any missing backend
+/// support -- `rp-server`'s own `ContentPart::ImageUrl` already exists)
+/// were the actual gap "paste" needed closed.
+const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("bmp", "image/bmp"),
+];
+
+fn image_mime_type(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    IMAGE_EXTENSIONS
+        .iter()
+        .find(|(known, _)| *known == ext)
+        .map(|(_, mime)| *mime)
+}
+
+/// Hand-rolled RFC 4648 base64 encoding (standard alphabet, `=`
+/// padding) -- the one encoding this project's image-attachment feature
+/// needs, not a reason to add a `base64` crate dependency to a
+/// dependency floor kept deliberately narrow (`ARCHITECTURE.md`'s own
+/// "Dependency Stack" section), the same "hand-roll a narrowly scoped
+/// protocol/encoding concern, don't hand-roll everything" reasoning that
+/// chose to hand-roll SHA-256/HMAC/a ZMTP client for RLM while still
+/// using `serde_json` rather than a hand-rolled JSON parser.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Reads `path`'s raw bytes and base64-encodes them into a `data:` URI --
+/// the exact shape `rp-server`'s own `ContentPart::ImageUrl` (and, through
+/// it, every backend it fronts: Anthropic, Gemini, and the
+/// OpenAI-compatible path Ollama's own vision models go through) already
+/// accepts for an inline image. `None` for a path with no recognized
+/// image extension or that can't be read -- the caller falls back to
+/// treating it as an ordinary (non-image) reference in that case.
+fn load_image_as_data_uri(path: &str) -> Option<String> {
+    let mime = image_mime_type(path)?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
 /// Expands every `@<path>` token in `text` (a `@` immediately followed
 /// by a non-whitespace path fragment) into that file's content inline,
 /// formatted the same way `/file`'s own `pending_file_content` prefix
@@ -1317,10 +1414,23 @@ fn common_prefix<'a>(candidates: &[&'a str]) -> Option<&'a str> {
 /// just a literal `@` mention (an email-style handle, social-media
 /// syntax the user typed on purpose), not a botched file reference, so
 /// silently leaving it alone beats guessing or erroring.
-fn expand_at_references(text: &str) -> String {
-    fn expand_word(word: &str) -> String {
+///
+/// Returns `(expanded_text, images)`: an `@<path>` token naming a real,
+/// readable *image* file (`image_mime_type`'s own extension list) isn't
+/// inlined as text at all -- image bytes obviously can't be, the way a
+/// text file's content can -- its literal `@<path>` is left in the text
+/// unchanged (a perfectly readable reference on its own) and its content
+/// is instead base64-encoded and collected into `images`, the same
+/// out-of-band shape `protocol::TranscriptEntry::images`/`provider::
+/// ChatTurn::images` already carry.
+fn expand_at_references(text: &str) -> (String, Vec<String>) {
+    fn expand_word(word: &str, images: &mut Vec<String>) -> String {
         if let Some(path) = word.strip_prefix('@') {
             if !path.is_empty() {
+                if let Some(data_uri) = load_image_as_data_uri(path) {
+                    images.push(data_uri);
+                    return word.to_string();
+                }
                 if let Ok(content) = std::fs::read_to_string(path) {
                     return format!("--- {path} ---\n{content}\n---\n\n");
                 }
@@ -1328,19 +1438,20 @@ fn expand_at_references(text: &str) -> String {
         }
         word.to_string()
     }
+    let mut images = Vec::new();
     let mut out = String::new();
     let mut word = String::new();
     for c in text.chars() {
         if c.is_whitespace() {
-            out.push_str(&expand_word(&word));
+            out.push_str(&expand_word(&word, &mut images));
             word.clear();
             out.push(c);
         } else {
             word.push(c);
         }
     }
-    out.push_str(&expand_word(&word));
-    out
+    out.push_str(&expand_word(&word, &mut images));
+    (out, images)
 }
 
 /// Parses `/fork`'s own trailing `[--at N] [--name TEXT]` -- a small,
@@ -1380,13 +1491,38 @@ fn parse_repl_fork_args(rest: &str) -> std::result::Result<(Option<u64>, Option<
     Ok((at_sequence, name))
 }
 
+/// `image_paths` -- parity with a bounded slice of `prime-agent`'s
+/// image-paste feature, `harness session prompt <id> [--image <path>]...
+/// <text...>`. Unlike `/file`'s own silent-fallback ambiguity (an
+/// inline `@` token might not be a file reference at all), an explicit
+/// `--image <path>` is an unambiguous user intent, so a path that isn't a
+/// readable, recognized image file fails loudly instead of being folded
+/// in as literal text.
 pub async fn session_prompt(
     state_root: &Path,
     session_id: String,
     text: String,
+    image_paths: Vec<String>,
     mode: OutputMode,
 ) -> Result<()> {
-    let entry = send_prompt(state_root, &session_id, text).await?;
+    let entry = if image_paths.is_empty() {
+        send_prompt(state_root, &session_id, text).await?
+    } else {
+        let mut images = Vec::with_capacity(image_paths.len());
+        for path in &image_paths {
+            let data_uri = load_image_as_data_uri(path).ok_or_else(|| {
+                HarnessError::conflict(
+                    Context::Cli,
+                    format!(
+                        "--image {path}: not a readable image file (recognized extensions: \
+                         png, jpg, jpeg, gif, webp, bmp)"
+                    ),
+                )
+            })?;
+            images.push(data_uri);
+        }
+        send_prompt_with_images(state_root, &session_id, text, Some(images)).await?
+    };
     match mode {
         OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
         OutputMode::Text => print_entry(&entry),
@@ -1397,10 +1533,29 @@ pub async fn session_prompt(
 /// Shared by [`session_prompt`] and [`session_autonomous`]'s own
 /// continuation turns -- the latter needs the raw entry, not printed
 /// text, and drives many of these in a loop rather than just one.
+/// Text-only; [`send_prompt_with_images`] is the same thing plus a
+/// bounded slice of `prime-agent`'s image-paste feature (see that
+/// function's own doc comment), kept as a separate function rather than
+/// adding an `images` parameter here so every one of this function's
+/// existing callers stays untouched.
 async fn send_prompt(
     state_root: &Path,
     session_id: &str,
     text: String,
+) -> Result<crate::protocol::TranscriptEntry> {
+    send_prompt_with_images(state_root, session_id, text, None).await
+}
+
+/// Parity with a bounded slice of `prime-agent`'s image-paste feature --
+/// see `PARITY.md`'s own "Interactive TUI: image paste support" entry.
+/// `images` is a list of `data:<mime>;base64,<...>` URIs, the same shape
+/// `protocol::TranscriptEntry::images`/`provider::ChatTurn::images`
+/// already use.
+async fn send_prompt_with_images(
+    state_root: &Path,
+    session_id: &str,
+    text: String,
+    images: Option<Vec<String>>,
 ) -> Result<crate::protocol::TranscriptEntry> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -1408,6 +1563,7 @@ async fn send_prompt(
         &Request::SessionPrompt {
             session_id: session_id.to_string(),
             text,
+            images,
         },
     )
     .await?;
@@ -2485,25 +2641,29 @@ mod tests {
         std::fs::write(&path, "the file's content").unwrap();
         let path_str = path.to_str().unwrap();
 
-        let expanded = expand_at_references(&format!("before @{path_str} after"));
+        let (expanded, images) = expand_at_references(&format!("before @{path_str} after"));
         assert_eq!(
             expanded,
             format!("before --- {path_str} ---\nthe file's content\n---\n\n after")
         );
+        assert!(images.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn expand_at_references_leaves_a_nonexistent_path_untouched() {
-        let expanded = expand_at_references("hello @this-path-does-not-exist-xyz world");
+        let (expanded, images) = expand_at_references("hello @this-path-does-not-exist-xyz world");
         assert_eq!(expanded, "hello @this-path-does-not-exist-xyz world");
+        assert!(images.is_empty());
     }
 
     #[test]
     fn expand_at_references_leaves_plain_text_with_no_at_tokens_untouched() {
         let text = "just an ordinary prompt\nwith a second line, no references";
-        assert_eq!(expand_at_references(text), text);
+        let (expanded, images) = expand_at_references(text);
+        assert_eq!(expanded, text);
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -2513,10 +2673,49 @@ mod tests {
         std::fs::write(&path, "DATA").unwrap();
         let path_str = path.to_str().unwrap();
 
-        let expanded = expand_at_references(&format!("line one\n@{path_str}\nline three"));
+        let (expanded, images) =
+            expand_at_references(&format!("line one\n@{path_str}\nline three"));
         assert!(expanded.starts_with("line one\n"), "got: {expanded:?}");
         assert!(expanded.ends_with("\nline three"), "got: {expanded:?}");
         assert!(expanded.contains("DATA"), "got: {expanded:?}");
+        assert!(images.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expand_at_references_collects_an_image_reference_out_of_band() {
+        let dir = temp_dir("expand-image");
+        let path = dir.join("photo.png");
+        // A 1x1 transparent PNG's minimal real byte content -- doesn't
+        // need to be a valid, decodable image for this test, only real
+        // bytes readable off disk and a recognized extension.
+        std::fs::write(&path, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let (expanded, images) = expand_at_references(&format!("look at @{path_str} please"));
+        // The literal `@path` mention stays in the text -- image bytes
+        // can't be inlined the way a text file's content is.
+        assert_eq!(expanded, format!("look at @{path_str} please"));
+        assert_eq!(images.len(), 1);
+        assert!(images[0].starts_with("data:image/png;base64,"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expand_at_references_collects_multiple_images_in_order() {
+        let dir = temp_dir("expand-multi-image");
+        let path_a = dir.join("a.png");
+        let path_b = dir.join("b.jpg");
+        std::fs::write(&path_a, [1, 2, 3]).unwrap();
+        std::fs::write(&path_b, [4, 5, 6]).unwrap();
+        let (a_str, b_str) = (path_a.to_str().unwrap(), path_b.to_str().unwrap());
+
+        let (_, images) = expand_at_references(&format!("@{a_str} and @{b_str}"));
+        assert_eq!(images.len(), 2);
+        assert!(images[0].starts_with("data:image/png;base64,"));
+        assert!(images[1].starts_with("data:image/jpeg;base64,"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

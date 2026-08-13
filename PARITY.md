@@ -756,12 +756,112 @@ daemon/worker split rather than requiring the Python control environment:
   line produced a reply containing the referenced file's actual
   content -- proof the completion and the expansion genuinely connect
   end to end, not just independently in isolation.
+- [x] **Interactive TUI: image paste support.** The "Needs a new
+  subsystem" section (further down) previously framed this as blocked on
+  "a content-type change to the transcript/provider boundary" -- true as
+  far as it went, but a scoping pass first checked the *other* side of
+  that boundary before assuming the whole thing needed building: `rp-
+  server` (the sibling `rusty_provider` repo this project's own
+  `RustyProviderModel` already shells out to) turned out to already have
+  full, real multimodal support end to end -- `MessageContent`/
+  `ContentPart` enums with `ContentPart::ImageUrl`, consumed by its
+  Anthropic/Gemini/OpenAI-compatible backends alike (Ollama routes
+  through the OpenAI-compatible path). The gap was never `rp-server`; it
+  was entirely this project's own text-only wire/transcript shapes.
+
+  Kept deliberately additive rather than restructuring `text`/`content`
+  into a content-block union: a new `images: Option<Vec<String>>` field
+  (each entry a `data:<mime>;base64,<...>` URI, the exact inline shape
+  `ContentPart::ImageUrl` already accepts, so no new wire shape was
+  needed on the `rp-server` side at all) sits alongside `text` on
+  `protocol::TranscriptEntry`, `provider::ChatTurn`, and `protocol::
+  Request::SessionPrompt`. Every existing code path that never touches
+  `images` keeps compiling and behaving identically -- no restructuring
+  tax paid anywhere else. `RustyProviderModel::build_request_body`
+  switches a turn's JSON `content` from a plain string to a content-block
+  array only when that turn actually carries images, one array entry per
+  image plus (if non-empty) one text entry. Base64 encoding is a small,
+  hand-rolled RFC 4648 encoder in `client.rs`, consistent with this
+  project's established "hand-roll narrow protocol/encoding concerns
+  instead of adding a dependency" precedent (the same reasoning behind
+  the SHA-256/HMAC and ZMTP modules).
+
+  Three real surfaces reach an image into a prompt, all going through one
+  `AgentSession::prompt_with_images`: `/file <path>` and `@<path>` in
+  `session_repl` (both already-existing local-file-reference mechanisms)
+  now check the path's extension against a small recognized set (png,
+  jpg, jpeg, gif, webp, bmp) *before* falling back to their existing
+  text-inlining behavior, and route a real image to an out-of-band
+  `images` list instead of inlining bytes into the prompt text -- for
+  `@`, the literal `@path` token is left in the text unchanged (unlike a
+  text-file `@`-expansion, which replaces the token with file content);
+  for `/file`, the existing "queued" REPL feedback message names the
+  image explicitly. A new `harness session prompt <id> --image <path>...
+  <text...>` CLI flag (repeatable, hand-parsed since `scan_named_flag`
+  only handles single-occurrence flags) is the third, non-REPL surface --
+  it fails loudly on an unreadable path or unrecognized extension (unlike
+  `/file`'s silent fall-through to "not an image, try as text"), since a
+  CLI flag with a bad argument should error, not guess. Deliberately
+  *not* added to `-p`/`--print` one-shot mode or the cross-session
+  `agent_message_send` path in this increment -- both are additive follow-
+  ups if ever needed, not required to prove the mechanism.
+
+  `EchoProvider` (used by every CI-safe test) appends `" [+N image(s)]"`
+  to its echoed reply text when the last user turn carried images -- a
+  small, deliberate seam that lets tests prove images actually reached
+  the provider without needing a real vision model for the bulk of
+  coverage.
+
+  Verified with new CI-safe unit tests in `provider.rs` (the content-
+  block-array switch, including the images-present-but-empty-text and
+  empty-images-list edge cases) and `session.rs` (`prompt_with_images`
+  persisting images on the transcript entry and reaching the provider;
+  plain `prompt` still carries no images -- a regression guard), a new
+  `tests/image_paste.rs` (5 CI-safe integration tests covering single and
+  multiple `--image` flags, image-only prompts with no text, and the two
+  loud-failure cases: an unreadable path and a non-image extension, the
+  latter confirmed via `session list` still showing zero turns -- no
+  partial state written on a failed prompt), and two new `tests/repl.rs`
+  integration tests for the `@`/`/file` image-detection paths. Two clippy
+  fixes along the way: `SessionEvent::Turn`'s `TranscriptEntry` payload
+  needed boxing (`large_enum_variant`, mirroring `Snapshot::state`'s
+  existing `Box<SessionState>`) once `images` grew that struct, and the
+  images-carrying append needed its own narrowly-scoped
+  `append_user_turn_with_images` helper rather than adding an `images`
+  parameter to the general-purpose `append` (which would have pushed it
+  past clippy's `too_many_arguments` limit) -- `append`'s own signature
+  and every existing caller stayed untouched.
+
+  Real end-to-end proof against an actual vision model in this sandbox:
+  `ollama pull moondream`, then a hand-rolled valid (not just PNG-magic-
+  prefixed) solid-color PNG fixture -- a real zlib stream using
+  uncompressed "stored" DEFLATE blocks plus real CRC32/Adler32 checksums,
+  built without a new dependency for the same "narrow, self-contained
+  encoding concern" reason as the base64 encoder -- fed through `session
+  prompt --image <path> "What color is this image?"`. `moondream`
+  correctly identified the color; the transcript snapshot confirmed the
+  base64 data URI actually persisted on the user entry. `tests/
+  ollama_provider.rs`'s `ollama_provider_describes_a_real_image`,
+  `#[ignore]`d like this file's other real-model tests for the same "no
+  reason for `ci.yml` to depend on a third repo plus a model download"
+  reasoning.
+
+  Bounded honestly, not attempted: real terminal clipboard/paste-protocol
+  image capture (iTerm2's own protocol, the Kitty graphics protocol, OSC
+  52) -- these are unstandardized, proprietary per-terminal wire formats,
+  and `termctl.rs`'s raw-mode reader is a generic byte-stream reader with
+  no image-protocol negotiation of any kind. "Image paste" here means
+  "reference a local image file" (via `/file`, `@`, or `--image`), the
+  same honest, bounded interpretation this project has applied to every
+  other `prime-agent` surface that assumes a richer host environment than
+  a terminal byte stream provides.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
   below for the pieces that genuinely don't have a bounded slice --
-  image paste, steering vs. follow-up queuing, `/clone`, `/share` -- and
-  why; `/tree` itself is covered by the entry just above).
+  steering vs. follow-up queuing, `/clone`, `/share` -- and why; `/tree`
+  itself is covered by the entry just above, image paste by its own
+  entry further up).
 
   `/file <path>` reads a local file client-side and queues its content
   to be prepended to the *next* line that actually sends a prompt (a
@@ -936,10 +1036,10 @@ daemon/worker split rather than requiring the Python control environment:
   `/compact`/`/export`/`/share`) -- this was the bare loop underneath all
   of that, the same "extract the tractable session-level mechanism,
   leave the rich surface out" move as `session spawn`/prompt templates
-  above. Most have since landed (see the `/file`/`/fork`/`/export` and
-  `/tree`/active-leaf-switching entries further down); image paste,
-  steering vs. follow-up queuing, and `/clone`/`/share` still haven't,
-  see "Needs a new subsystem" below for why.
+  above. Most have since landed (see the `/file`/`/fork`/`/export`,
+  `/tree`/active-leaf-switching, and image paste entries further down);
+  steering vs. follow-up queuing and `/clone`/`/share` still haven't, see
+  "Needs a new subsystem" below for why.
 - [x] **Model/provider catalog listing** (`harness model list`), the
   provider tier of `prime-agent model list`'s catalog browse: which of
   the known providers (`openai`/`anthropic`/`gemini`/`groq`/`ollama`,
@@ -2037,25 +2137,20 @@ attempted here, and not silently implied by anything in
   actually color yet. A theme spec is inert without that renderer to
   consume it, so this stays blocked on a later TUI increment, not on
   missing spec.
-- **The interactive TUI's rich editor/message-queue surface, the pieces
-  that still need more than raw mode plus text-only line editing gives**
-  (raw mode itself, and multi-line input/`@` file-reference completion/
-  slash-command Tab completion on top of it, now exist -- see the
-  medium-effort section's own "Interactive TUI: raw-mode rendering
-  foundation" and "rich editor" entries): **image paste** (zero
-  non-text-content plumbing exists anywhere in this project -- `provider::
-  ChatTurn.content` is `Option<String>`, text only, and `mcp_client.rs`'s
-  own doc comment already names this exact gap for a different reason;
-  a real slice needs a content-type change to the transcript/provider
-  boundary before anything REPL-side could plug into it, not a REPL
-  command) and **steering vs. follow-up queuing** (typing a new message
-  while a prior one is still generating, and choosing whether it
-  interrupts or queues -- `session_repl`'s stdin loop is synchronous
-  start to finish, `send_prompt` blocks the loop until the full reply
-  lands, so there is no window during which a second line could even be
-  read, let alone dispatched as steering-vs-queued; this isn't "harder
-  in a REPL," it's structurally absent without a real concurrent-input
-  event loop). `/clone` (live-state duplication) stays out of scope for
+- **The interactive TUI's message-queue surface, the piece that still
+  needs more than raw mode plus text-only line editing gives** (raw mode
+  itself, multi-line input/`@` file-reference completion/slash-command
+  Tab completion, and image paste, now exist -- see the medium-effort
+  section's own "Interactive TUI: raw-mode rendering foundation", "rich
+  editor", and "image paste support" entries): **steering vs. follow-up
+  queuing** (typing a new message while a prior one is still generating,
+  and choosing whether it interrupts or queues -- `session_repl`'s stdin
+  loop is synchronous start to finish, `send_prompt` blocks the loop
+  until the full reply lands, so there is no window during which a
+  second line could even be read, let alone dispatched as steering-vs-
+  queued; this isn't "harder in a REPL," it's structurally absent without
+  a real concurrent-input event loop). `/clone` (live-state duplication)
+  stays out of scope for
   the reasons given above and in the medium-effort section's `session
   fork` entry -- a running kernel connection or MCP session dies with
   the source worker, same as any other session boundary, and that's not
