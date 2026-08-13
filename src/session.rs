@@ -678,6 +678,8 @@ impl AgentSession {
     ) -> Result<serde_json::Value> {
         match kind {
             "rlm.run" => self.handle_rlm_run(payload).await,
+            "rlm.list_subagents" => self.handle_list_subagents().await,
+            "rlm.delete_subagent" => self.handle_delete_subagent(payload).await,
             other => Ok(serde_json::json!({
                 "error": format!("unknown host request kind {other:?}"),
             })),
@@ -697,9 +699,11 @@ impl AgentSession {
     /// reply -- parity with `rlm(...)` "returns immediately after task
     /// admission... never waits for or returns the child's answer"
     /// (`rlm-runtime.md`). Rejects admission once `RLM_DEPTH >=
-    /// RLM_MAX_DEPTH` (see the check at the top of the body below); no
-    /// parent-scoped registry of admitted children yet (a later, separate
-    /// increment) -- this covers admission and its depth limit only.
+    /// RLM_MAX_DEPTH` (see the check at the top of the body below). See
+    /// [`handle_list_subagents`](Self::handle_list_subagents)/
+    /// [`handle_delete_subagent`](Self::handle_delete_subagent) for the
+    /// parent-scoped registry a child admitted here becomes visible
+    /// through.
     async fn handle_rlm_run(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
         // Parity with `rlm-runtime.md`'s `AgentSession.runRlmChild()`:
         // "Check `RLM_DEPTH < RLM_MAX_DEPTH`" is step 1, checked by the
@@ -780,6 +784,153 @@ impl AgentSession {
             "name": name,
             "session_dir": session_dir.display().to_string(),
             "model": model,
+        }))
+    }
+
+    /// Handles a kernel-side `rlm_list_subagents()` call -- parity with
+    /// `rlm.list_subagents()`, `rlm-runtime.md`: "the TypeScript parent
+    /// maintains the authoritative direct-child registry"/"returns stable
+    /// child IDs, ... session IDs, names, directories, and running/
+    /// completed status." This project has no separate registry data
+    /// structure to maintain, though -- a child's own `parent_id` (set
+    /// once, at admission, by `handle_rlm_run`'s `SessionNew` call) is
+    /// already the durable record of the relationship, so "the registry"
+    /// here is simply `session list` filtered down to this session's own
+    /// direct children, the exact same derivation `client::
+    /// session_children` (`session children <id>`) already performs --
+    /// this is that same filter, just reached from inside the worker
+    /// process instead of the CLI. Only *direct* children are visible,
+    /// matching "parent-scoped": a grandchild admitted by one of this
+    /// session's own children never appears here, the same boundary
+    /// `session_children` already enforces.
+    async fn handle_list_subagents(&self) -> Result<serde_json::Value> {
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(Context::Daemon, &Request::SessionList)
+            .await?;
+        let response = conn.read_response(Context::Daemon).await?;
+        let sessions = match response {
+            Some(crate::protocol::Response::SessionList { sessions }) => sessions,
+            other => {
+                return Err(HarnessError::protocol(
+                    Context::Daemon,
+                    format!(
+                        "expected a session_list response to rlm.list_subagents, got {other:?}"
+                    ),
+                ));
+            }
+        };
+        let subagents: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(self.state.session_id.as_str()))
+            .map(|s| {
+                let status = match s.status {
+                    SessionStatus::Active => "active",
+                    SessionStatus::Stopped => "stopped",
+                    SessionStatus::Crashed => "crashed",
+                };
+                let session_dir = paths::session_dir(&self.state_root, &s.session_id);
+                serde_json::json!({
+                    "child_id": s.session_id,
+                    "name": s.name,
+                    "status": status,
+                    "session_dir": session_dir.display().to_string(),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "subagents": subagents }))
+    }
+
+    /// Handles a kernel-side `rlm_delete_subagent(id)` call -- parity
+    /// with `rlm.delete_subagent()`, `rlm-runtime.md`: "accepts an exact
+    /// child ID, active-session ID, session ID, or unique name."
+    /// `active-session ID` and `session ID` are the same concept here (no
+    /// separate slot-id layer, same simplification `handle_rlm_run`'s own
+    /// doc comment already notes for `rlm_child_id`), so `id` is matched
+    /// against a direct child's `session_id` first, falling back to an
+    /// exact, unique `name` match. Only a *direct* child of this session
+    /// may be deleted -- matching "parent-scoped": an unrelated or
+    /// grandchild session id is rejected the same as an unknown one, not
+    /// silently accepted. "Deletion cancels or closes the runtime... It
+    /// does not erase the transcript or artifacts on disk" maps exactly
+    /// onto this project's own `session stop` (`Request::SessionStop`):
+    /// gracefully shuts the worker down, leaves `state.json`/
+    /// `transcript.jsonl` untouched. No separate tombstone entry is
+    /// written -- the stopped child's own persisted `status: Stopped` in
+    /// `state.json`, visible via `handle_list_subagents`/`session list`
+    /// from then on, already serves as the durable record that it was
+    /// deleted rather than crashed or never run, without inventing a
+    /// second status-tracking mechanism to keep in sync with the first.
+    async fn handle_delete_subagent(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let Some(id) = payload.get("id").and_then(|v| v.as_str()) else {
+            return Ok(
+                serde_json::json!({"error": "rlm.delete_subagent requires an \"id\" string"}),
+            );
+        };
+
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(Context::Daemon, &Request::SessionList)
+            .await?;
+        let response = conn.read_response(Context::Daemon).await?;
+        let sessions = match response {
+            Some(crate::protocol::Response::SessionList { sessions }) => sessions,
+            other => {
+                return Err(HarnessError::protocol(
+                    Context::Daemon,
+                    format!(
+                        "expected a session_list response to rlm.delete_subagent, got {other:?}"
+                    ),
+                ));
+            }
+        };
+        let children: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.parent_id.as_deref() == Some(self.state.session_id.as_str()))
+            .collect();
+        let target = children
+            .iter()
+            .find(|s| s.session_id == id)
+            .or_else(|| children.iter().find(|s| s.name.as_deref() == Some(id)));
+        let Some(target) = target else {
+            return Ok(serde_json::json!({
+                "error": format!("{id:?} is not a direct child of this session"),
+            }));
+        };
+        let child_id = target.session_id.clone();
+        let name = target.name.clone();
+
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(
+            Context::Daemon,
+            &Request::SessionStop {
+                session_id: child_id.clone(),
+            },
+        )
+        .await?;
+        let response = conn.read_response(Context::Daemon).await?;
+        match response {
+            Some(crate::protocol::Response::SessionStopAck { .. }) => {}
+            Some(crate::protocol::Response::Error { message, .. }) => {
+                return Ok(serde_json::json!({ "error": message }));
+            }
+            other => {
+                return Err(HarnessError::protocol(
+                    Context::Daemon,
+                    format!(
+                        "expected a session_stop_ack response to rlm.delete_subagent, got {other:?}"
+                    ),
+                ));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "deleted": child_id,
+            "name": name,
         }))
     }
 

@@ -1281,6 +1281,130 @@ async def rlm(task, name=None, model=None):
         let _ = std::fs::remove_dir_all(&session_dir);
     }
 
+    /// Same "prove the kernel produces the right request" scope as
+    /// `real_kernel_rlm_call_opens_an_rlm_run_host_request`, for the two
+    /// parent-scoped-registry calls (`rlm_list_subagents()`/
+    /// `rlm_delete_subagent(id)`) added alongside `rlm(...)`. Exercising
+    /// `handle_list_subagents`/`handle_delete_subagent` themselves needs
+    /// a real daemon, not just a real kernel -- same documented
+    /// infrastructure gap `rlm.run`'s own test lives with -- and their
+    /// `SessionList`/`SessionStop` calls are the identical shapes
+    /// `tests/subagents.rs`/`tests/session_lifecycle.rs` already cover
+    /// end to end.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_rlm_list_and_delete_subagent_open_typed_host_requests() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-rlm-registry-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the code `worker::bootstrap_kernel` sends for
+        // `host_request`/`rlm_list_subagents`/`rlm_delete_subagent`.
+        let setup_code = "\
+import asyncio
+from ipykernel.comm import Comm
+_host_request_kernel = get_ipython().kernel
+_host_request_kernel.control_handlers['comm_msg'] = _host_request_kernel.comm_manager.comm_msg
+_host_request_kernel.control_handlers['comm_close'] = _host_request_kernel.comm_manager.comm_close
+_host_request_loop = asyncio.get_event_loop()
+def host_request(kind, payload=None):
+    comm = Comm(target_name='host.request', data={'kind': kind, **(payload or {})})
+    fut = _host_request_loop.create_future()
+    def _on_msg(msg):
+        def _resolve():
+            if not fut.done():
+                fut.set_result(msg['content']['data'])
+        _host_request_loop.call_soon_threadsafe(_resolve)
+    comm.on_msg(_on_msg)
+    return fut
+
+async def rlm_list_subagents():
+    return await host_request('rlm.list_subagents')
+
+async def rlm_delete_subagent(id):
+    return await host_request('rlm.delete_subagent', {'id': id})
+";
+        runtime
+            .execute(setup_code)
+            .await
+            .expect("host_request setup code should round-trip");
+
+        let outcome = runtime
+            .execute("result = await rlm_list_subagents()\nresult")
+            .await
+            .expect("rlm_list_subagents() should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting rlm.list_subagents's reply");
+        assert_eq!(pending.kind, "rlm.list_subagents");
+        assert_eq!(
+            pending.payload,
+            serde_json::json!({"kind": "rlm.list_subagents"}),
+            "no payload was passed, so only the comm's own \"kind\" key should be present"
+        );
+
+        let resumed = runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"subagents": [{"child_id": "child-1"}]}),
+            )
+            .await
+            .expect(
+                "resume_execute should deliver the reply and let rlm_list_subagents() return it",
+            );
+        assert!(resumed.pending_host_request.is_none());
+        assert_eq!(
+            resumed.result.as_deref(),
+            Some("{'subagents': [{'child_id': 'child-1'}]}"),
+            "rlm_list_subagents() should return exactly whatever the host replied with"
+        );
+
+        let outcome = runtime
+            .execute("result = await rlm_delete_subagent('child-1')\nresult")
+            .await
+            .expect("rlm_delete_subagent(...) should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting rlm.delete_subagent's reply");
+        assert_eq!(pending.kind, "rlm.delete_subagent");
+        assert_eq!(
+            pending.payload.get("id").and_then(|v| v.as_str()),
+            Some("child-1")
+        );
+
+        let resumed = runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"deleted": "child-1"}),
+            )
+            .await
+            .expect(
+                "resume_execute should deliver the reply and let rlm_delete_subagent(...) return it",
+            );
+        assert!(resumed.pending_host_request.is_none());
+        assert_eq!(
+            resumed.result.as_deref(),
+            Some("{'deleted': 'child-1'}"),
+            "rlm_delete_subagent(...) should return exactly whatever the host replied with"
+        );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
     /// Real end-to-end coverage for `skills.rs`'s whole point: a real
     /// Python package on disk becomes `import`-able inside a real kernel
     /// once its parent directory is added to `sys.path` -- the exact

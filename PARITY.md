@@ -845,9 +845,9 @@ daemon/worker split rather than requiring the Python control environment:
   `rlm-runtime.md` describes), never waiting for the child's own reply --
   parity with `rlm(...)` "returns immediately after task admission...
   never waits for or returns the child's answer." Rejects admission once
-  the recursion-depth limit is reached (see the next paragraph). No
-  parent-scoped registry of admitted children yet -- a separate, later
-  increment (see below), not silently skipped.
+  the recursion-depth limit is reached (see the next paragraph). A child
+  admitted here becomes visible through the parent-scoped registry
+  described further below.
 
   Real end-to-end coverage of the *kernel* side (a new `#[ignore]`d test,
   `real_kernel_rlm_call_opens_an_rlm_run_host_request`) proves `rlm(...)`
@@ -947,6 +947,62 @@ daemon/worker split rather than requiring the Python control environment:
   `real_kernel_rlm_call_opens_an_rlm_run_host_request` test (which never
   hits the limit) and the CI-safe tests above already cover every code
   path a kernel-involving test could reach.
+
+  **Later increment: a parent-scoped child registry
+  (`rlm.list_subagents()`/`rlm.delete_subagent()`).** Parity with
+  `rlm-runtime.md`: "the TypeScript parent maintains the authoritative
+  direct-child registry... `list_subagents()` returns stable child IDs,
+  ... session IDs, names, directories, and running/completed status,"
+  "`delete_subagent()` accepts an exact child ID, ... session ID, or
+  unique name," and "deletion cancels or closes the runtime... It does
+  not erase the transcript or artifacts on disk." This project has no
+  separate registry data structure to maintain, though: a child's own
+  `parent_id` (set once, at admission, by `handle_rlm_run`'s
+  `Request::SessionNew`) is already the durable record of the
+  relationship, so "the registry" is simply `Request::SessionList`
+  filtered down to this session's own direct children -- the exact same
+  derivation `client::session_children` (`session children <id>`)
+  already performs, reached from inside the worker process instead of
+  the CLI. Two new `handle_host_request` kinds, `"rlm.list_subagents"`/
+  `"rlm.delete_subagent"`, back two new kernel-callable coroutines
+  (`rlm_list_subagents()`/`rlm_delete_subagent(id)`) defined in
+  `worker::bootstrap_kernel` alongside `rlm(...)` -- bare top-level
+  functions, not methods on an `rlm` namespace object, the same
+  deliberate simplification `rlm(...)` itself already made (see
+  `CLAIMS_AUDIT.md`'s `rlm.md` entry: no `rlm` object of any kind,
+  namespaced or otherwise, exists in kernel globals).
+
+  `handle_delete_subagent`'s `id` is matched against a direct child's
+  `session_id` first, falling back to an exact, unique `name` match --
+  `active-session ID` and `session ID` collapse to the same concept here,
+  same simplification `rlm_child_id` already made. Only a *direct* child
+  of this session may be listed or deleted -- matching "parent-scoped":
+  an unrelated session, or a grandchild admitted by one of this session's
+  own children, is invisible to `list_subagents()` and rejected by
+  `delete_subagent()` the same as an unknown id, not silently accepted.
+  "Cancels or closes the runtime... does not erase the transcript or
+  artifacts on disk" maps exactly onto this project's own `session stop`
+  (`Request::SessionStop`): gracefully shuts the worker down, leaves
+  `state.json`/`transcript.jsonl` untouched. No separate durable
+  tombstone entry is written -- the stopped child's own persisted
+  `status: Stopped`, visible via `list_subagents()`/`session list` from
+  then on, already serves as that record without a second status-
+  tracking mechanism to keep in sync with the first.
+
+  Coverage follows the exact same shape and reasoning as `rlm(...)`
+  itself: a new `#[ignore]`d real-kernel test
+  (`real_kernel_rlm_list_and_delete_subagent_open_typed_host_requests`)
+  proves the kernel-side wiring produces the right `pending_host_request`
+  (`kind`/`payload`) for both calls and returns exactly whatever the host
+  replies with. `handle_list_subagents`/`handle_delete_subagent`
+  themselves are not independently re-tested with a real daemon, for the
+  identical, already-documented infrastructure reason `handle_rlm_run`
+  isn't: they reuse `Request::SessionList`/`Request::SessionStop`, the
+  same request shapes `tests/subagents.rs`'s `session children` coverage
+  and `tests/session_lifecycle.rs`'s `session stop` coverage already
+  exercise end to end, and combining a real kernel with a real daemon in
+  one test still needs `CARGO_BIN_EXE_harness`, still unavailable to a
+  lib crate's own `#[cfg(test)]` modules.
 
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:
