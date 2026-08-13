@@ -354,6 +354,103 @@ daemon/worker split rather than requiring the Python control environment:
   after further prompts on each, and `--mode json`'s `forked_from`
   provenance -- plus a manual pass in this sandbox confirming the same
   end to end against the real compiled binary.
+- [x] **Intra-session tree branching: `id`/`parentId`/active-leaf
+  transcript model** -- this item was previously written off ("one
+  atomic, invasive change with no honest bounded slice to land first,"
+  see the old "Needs a new subsystem" writeup this replaces) on the
+  reasoning that `TranscriptEntry`'s `sequence: u64` is a total order
+  every reader (`build_turns`, `find_compaction_fold_count`'s backward
+  walk, ...) is built to interpret directly, so real branching would
+  need all of them reworked at once. Revisited and actually built,
+  because that framing missed a cheaper move: `sequence` didn't need to
+  stop being a total append order -- what was missing was a *second*
+  field recording each entry's actual predecessor, plus one chosen
+  pointer saying which leaf is currently "the conversation." Once
+  framed that way, this is additive, not invasive.
+
+  New `TranscriptEntry::parent_sequence: Option<u64>` (`#[serde(default)]`)
+  -- parity with `session-format.md`'s `parentId`, addressed via this
+  project's own existing `sequence` identity rather than inventing a
+  separate id scheme. Set once, automatically, by the shared
+  `append_entry` helper (used by both `append` and
+  `append_child_usage_attribution`) to whatever `SessionState::
+  active_leaf_sequence` was at that exact moment -- no caller building a
+  `TranscriptEntry` needs to know active-leaf tracking exists. New
+  `SessionState::active_leaf_sequence: Option<u64>` (`#[serde(default)]`)
+  names the current tip; `append_entry` also advances it to the entry it
+  just wrote, so ordinary linear conversation flow always has
+  `parent_sequence` equal to "the previous entry" with zero extra work
+  anywhere else.
+
+  The backward-compatibility rule that makes this genuinely additive:
+  an entry with `parent_sequence: None` and `sequence > 1` is a *legacy*
+  entry, written before this field existed and defaulted via
+  `#[serde(default)]` -- `active_chain`'s own walk treats that case as
+  an *implicit* link to `sequence - 1`, the flat order every
+  pre-existing transcript already has. Only `sequence == 1` (a genuine
+  root) with `parent_sequence: None` ends the walk for real. This means
+  no session's `transcript.jsonl` ever needs rewriting to backfill real
+  parent links into old entries -- a hard requirement given this
+  project's own established "`transcript.jsonl` is never rewritten or
+  truncated" precedent (already relied on by compaction).
+  `AgentSession::recover` backfills `active_leaf_sequence` from the
+  transcript's last entry when it's still `None` after loading
+  `state.json`, the exact same reconciliation `last_sequence` already
+  gets ("`state.json` is only ever a best-effort cache").
+
+  New `AgentSession::active_chain(&self) -> Vec<&TranscriptEntry>` walks
+  from `active_leaf_sequence` back to the root via `parent_sequence`
+  (falling back to the legacy rule above) and reverses to root-to-leaf
+  order -- "the actual conversation," as opposed to `self.transcript`
+  (every entry ever appended, across every branch, in write order --
+  still the full, unfiltered audit trail `session attach`/
+  `snapshot_event` show). `build_turns` and `compact_now`'s candidate
+  collection both switched from iterating `self.transcript` directly to
+  `self.active_chain()` -- the exact two places the original "out of
+  scope" writeup named as needing to "resolve 'the transcript' against a
+  chosen leaf/path first." Compacting or replying from an inactive
+  branch would otherwise fold or continue history the active
+  conversation never actually had.
+
+  New `AgentSession::set_active_leaf(&mut self, sequence) -> Result<u64>`
+  (`pub(crate)`): validates `sequence` names a real entry anywhere in
+  `self.transcript` (any branch -- switching *to* a different branch is
+  the whole point), then mutates and persists
+  `active_leaf_sequence`, the same "mutate + persist, no transcript
+  entry" shape `rename` already has. It does not itself create a
+  branch; the *next* `append_entry` call is what actually reveals one --
+  if the redirected leaf already has a child down the previously-active
+  path, the new append becomes a second child of that same parent, a
+  real fork. New wire protocol `Request::SessionSetActiveLeaf {
+  session_id, sequence }` / `Response::SessionSetActiveLeafAck {
+  active_leaf_sequence }`, valid on both transports and forwarded from
+  the public daemon socket to the owning worker's private socket
+  unchanged, the same relay `SessionRename`/`SessionCompact` already
+  use.
+
+  Deliberately scoped to data model + protocol/backend mechanism only:
+  no CLI/REPL command calls `set_active_leaf` yet (no `/tree`
+  navigation surface exists to drive it from), matching this project's
+  own established pattern of landing a protocol/backend increment
+  before its CLI surface (`rlm_depth`/`rlm_max_depth` landed the same
+  way, before any CLI exposed them). `/tree` visualization and
+  active-leaf switching from `session_repl` are the next increment;
+  `/clone`'s live-state duplication and branch summaries are the one
+  after that.
+
+  Verified with new unit tests: ordinary linear `append` calls each
+  produce `parent_sequence` equal to the previous entry; `set_active_leaf`
+  followed by an `append` produces two distinct entries sharing the same
+  `parent_sequence` (a real fork) with `active_chain` resolving to only
+  the new branch; `set_active_leaf` with an unknown sequence is rejected
+  as a conflict; and `AgentSession::recover` against a hand-written,
+  pre-feature `state.json`/`transcript.jsonl` pair (no
+  `active_leaf_sequence` field, no `parent_sequence` field on either
+  line) correctly backfills and reconstructs the full linear chain via
+  the legacy fallback rule. The full existing suite (unit + integration)
+  stayed green after switching `build_turns`/`compact_now` onto
+  `active_chain`, confirming no regression to ordinary single-branch
+  sessions.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
@@ -1644,9 +1741,12 @@ attempted here, and not silently implied by anything in
   lands, so there is no window during which a second line could even be
   read, let alone dispatched as steering-vs-queued; this isn't "harder
   in a REPL," it's structurally absent without a real concurrent-input
-  event loop). `/tree` (real intra-session branching) and `/clone`
+  event loop). `/tree`'s own visualization/navigation surface and `/clone`
   (live-state duplication) stay out of scope for the reasons given
-  above and in the medium-effort section's `session fork` entry.
+  above and in the medium-effort section's `session fork` entry --
+  the underlying active-leaf transcript model both would sit on top
+  of is now real, see that entry's own "Intra-session tree branching"
+  writeup.
 
   Investigated the rest of this bullet's original list piece by piece
   rather than leaving it one atomic blob, the same way `/tree`/`/fork`/
@@ -1706,20 +1806,6 @@ attempted here, and not silently implied by anything in
   unlike `/login`'s genuinely missing backend, this one is a tractable
   near-term increment once that verification step happens, not a
   structurally missing subsystem -- still unimplemented today.
-- **Intra-session tree branching** (`/tree`'s underlying `id`/`parentId`/
-  active-leaf JSONL structure inside one session's own transcript, see
-  `session-format.md`). Investigated closely (see the "Session-level
-  forking" entry above for what a closer look actually found) and
-  confirmed still out of scope: `TranscriptEntry`'s `sequence: u64` is a
-  total, linear order interpreted by one meaning everywhere it's read
-  (`build_turns`, `session attach`'s replay, `find_compaction_fold_count`'s
-  backward walk, ...) -- real branching needs every one of those to
-  resolve "the transcript" against a chosen leaf/path first, all at once,
-  not a field addable underneath them the way compaction's own boundary
-  or `session fork`'s own provenance marker were. Unlike those two, this
-  is one atomic, invasive change with no honest bounded slice to land
-  first -- `/tree` visualization and active-leaf switching mid-session
-  stay unimplemented alongside it.
 - **`SYSTEM.md`/`APPEND_SYSTEM.md`** (system-prompt override/append).
   This project has no base system prompt at all to override or append
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"

@@ -338,6 +338,11 @@ impl AgentSession {
             rlm_depth: rlm_depth.unwrap_or(0),
             rlm_max_depth: rlm_max_depth.unwrap_or(DEFAULT_RLM_MAX_DEPTH),
             spawned_from_sequence,
+            // No entries yet -- the first `append_entry` call sets this
+            // to that entry's own `sequence`, matching `active_chain`'s
+            // "no active leaf, no chain" fallback for genuinely empty
+            // transcripts.
+            active_leaf_sequence: None,
         };
         let session = AgentSession {
             state,
@@ -375,6 +380,15 @@ impl AgentSession {
         // case this project's recovery test suite exercises).
         let transcript_last_sequence = transcript.last().map(|e| e.sequence).unwrap_or(0);
         state.last_sequence = state.last_sequence.max(transcript_last_sequence);
+        // Same reconciliation reasoning as `last_sequence` above, for a
+        // session whose own `state.json` predates `active_leaf_sequence`
+        // (or a crash between an append and the state-file rewrite left
+        // it stale): fall back to the transcript's own last entry so
+        // `active_chain` has a real leaf to start from, rather than
+        // treating a non-empty transcript as if it had none.
+        if state.active_leaf_sequence.is_none() {
+            state.active_leaf_sequence = transcript.last().map(|e| e.sequence);
+        }
         state.generation += 1;
         state.status = SessionStatus::Active;
         state.worker_pid = Some(std::process::id());
@@ -1335,21 +1349,27 @@ impl AgentSession {
         Ok(self.mcp_client.as_ref().expect("just set it above"))
     }
 
-    /// Maps the persisted transcript into the turn shape a
-    /// `ModelProvider` expects -- see `provider::ChatTurn`'s own doc
-    /// comment for why this is a separate type from `TranscriptEntry`.
-    /// When `state.compaction` is set, entries at or before its
-    /// `compacted_up_to_sequence` are replaced by one synthetic
-    /// `TurnRole::System` turn carrying the running summary instead of
-    /// being sent verbatim -- `transcript.jsonl`/`self.transcript`
-    /// themselves are untouched either way (see `CompactionState`'s own
-    /// doc comment), so this is the only place compaction is visible to
-    /// the provider. Also where `<state_dir>/AGENTS.md`/`CLAUDE.md` (see
-    /// `read_context_file`) becomes visible, as an even earlier system
-    /// turn -- read fresh on every call (no caching, no persisted state)
-    /// so an edit takes effect on the very next prompt, same as
-    /// `skills::discover`/`prompt_template::discover` already do for
-    /// their own on-disk sources.
+    /// Maps the *active chain* (see [`active_chain`](Self::active_chain))
+    /// into the turn shape a `ModelProvider` expects -- see `provider::
+    /// ChatTurn`'s own doc comment for why this is a separate type from
+    /// `TranscriptEntry`. Deliberately `active_chain()`, not
+    /// `self.transcript` directly: once a session has branched (`session::
+    /// AgentSession::set_active_leaf`), only the path from the root to
+    /// the currently active leaf is a coherent conversation to send a
+    /// provider -- the rest of `self.transcript` is other branches,
+    /// invisible here the same way an un-checked-out git branch is
+    /// invisible to a build. When `state.compaction` is set, entries at
+    /// or before its `compacted_up_to_sequence` are replaced by one
+    /// synthetic `TurnRole::System` turn carrying the running summary
+    /// instead of being sent verbatim -- `transcript.jsonl`/
+    /// `self.transcript` themselves are untouched either way (see
+    /// `CompactionState`'s own doc comment), so this is the only place
+    /// compaction is visible to the provider. Also where `<state_dir>/
+    /// AGENTS.md`/`CLAUDE.md` (see `read_context_file`) becomes visible,
+    /// as an even earlier system turn -- read fresh on every call (no
+    /// caching, no persisted state) so an edit takes effect on the very
+    /// next prompt, same as `skills::discover`/`prompt_template::
+    /// discover` already do for their own on-disk sources.
     fn build_turns(&self) -> Vec<ChatTurn> {
         let boundary = self
             .state
@@ -1380,8 +1400,8 @@ impl AgentSession {
             });
         }
         turns.extend(
-            self.transcript
-                .iter()
+            self.active_chain()
+                .into_iter()
                 .filter(|e| e.sequence > boundary)
                 .map(|entry| {
                     let role = match entry.role {
@@ -1459,9 +1479,14 @@ impl AgentSession {
             .as_ref()
             .map(|c| c.compacted_up_to_sequence)
             .unwrap_or(0);
+        // `active_chain()`, not `self.transcript` directly -- same
+        // "resolve against the active leaf, not every branch" reasoning
+        // `build_turns` already documents; compacting entries from an
+        // inactive branch would fold history the active conversation
+        // never actually had.
         let candidates: Vec<TranscriptEntry> = self
-            .transcript
-            .iter()
+            .active_chain()
+            .into_iter()
             .filter(|e| e.sequence > already_compacted_seq)
             .cloned()
             .collect();
@@ -1559,6 +1584,9 @@ impl AgentSession {
             name,
             usage,
             child_usage_attributed: None,
+            // Overwritten unconditionally by `append_entry` itself --
+            // see that function's own doc comment.
+            parent_sequence: None,
         })
         .await
     }
@@ -1581,6 +1609,8 @@ impl AgentSession {
             name: None,
             usage: None,
             child_usage_attributed: Some(attribution),
+            // Overwritten unconditionally by `append_entry` itself.
+            parent_sequence: None,
         })
         .await
     }
@@ -1593,10 +1623,19 @@ impl AgentSession {
     /// all parameter list would need most of its parameters `None` on
     /// every call from *some* caller) and hand it here for the actual
     /// write.
-    async fn append_entry(&mut self, entry: TranscriptEntry) -> Result<TranscriptEntry> {
+    async fn append_entry(&mut self, mut entry: TranscriptEntry) -> Result<TranscriptEntry> {
+        // Parity with `session-format.md`'s `parentId`: this entry
+        // continues from wherever the active leaf currently points --
+        // `None` only for the session's very first entry ever (`state.
+        // active_leaf_sequence` is `None` until the first `append_entry`
+        // call sets it, right below). The single point of truth for this
+        // link, so no caller building a `TranscriptEntry` needs to know
+        // about active-leaf tracking itself.
+        entry.parent_sequence = self.state.active_leaf_sequence;
         append_transcript_line(&self.session_dir, &entry).await?;
         self.transcript.push(entry.clone());
         self.state.last_sequence = entry.sequence;
+        self.state.active_leaf_sequence = Some(entry.sequence);
         self.state.updated_at_ms = entry.timestamp_ms;
         self.write_state().await?;
         // No receivers is the ordinary "nobody attached right now" case,
@@ -1606,6 +1645,71 @@ impl AgentSession {
             entry: entry.clone(),
         });
         Ok(entry)
+    }
+
+    /// Walks `self.transcript` from `state.active_leaf_sequence` back to
+    /// the root via each entry's own `parent_sequence`, then reverses --
+    /// the actual conversation `build_turns`/compaction operate on, as
+    /// opposed to `self.transcript` itself (every entry ever appended,
+    /// across every branch, in write order -- the full audit trail
+    /// `session attach`/`snapshot_event` still show unfiltered). Empty
+    /// only for a genuinely empty transcript (`active_leaf_sequence` is
+    /// still `None`), which never happens once `prompt` has appended at
+    /// least the user's own turn.
+    ///
+    /// An entry with `parent_sequence: None` whose `sequence` is `> 1`
+    /// is a legacy entry written before this field existed (`#[serde(
+    /// default)]`) -- treated as implicitly continuing from `sequence -
+    /// 1`, the flat order every pre-existing transcript already has, so
+    /// a session created before this feature landed keeps working
+    /// exactly as it always did, with no `transcript.jsonl` rewrite ever
+    /// needed to backfill real values into old entries.
+    fn active_chain(&self) -> Vec<&TranscriptEntry> {
+        let Some(leaf) = self.state.active_leaf_sequence else {
+            return Vec::new();
+        };
+        let by_sequence: std::collections::HashMap<u64, &TranscriptEntry> =
+            self.transcript.iter().map(|e| (e.sequence, e)).collect();
+        let mut chain = Vec::new();
+        let mut cursor = by_sequence.get(&leaf).copied();
+        while let Some(entry) = cursor {
+            chain.push(entry);
+            cursor = match entry.parent_sequence {
+                Some(parent) => by_sequence.get(&parent).copied(),
+                None if entry.sequence > 1 => by_sequence.get(&(entry.sequence - 1)).copied(),
+                None => None,
+            };
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Redirects the active leaf to `sequence`, the entry the *next*
+    /// append will continue from -- `Request::SessionSetActiveLeaf`'s own
+    /// handler. Rejects a `sequence` that doesn't name a real entry in
+    /// this session's own transcript (any branch, not just the currently
+    /// active one -- switching *to* a different branch is the whole
+    /// point). Doesn't itself append a transcript entry or touch
+    /// `self.transcript` -- a pure pointer mutation, the same "mutate +
+    /// persist, no transcript entry" shape `rename` already has. The
+    /// *next* `append_entry` call is what actually reveals the branch:
+    /// if `sequence` already has a child down the previously-active path,
+    /// that append's own `parent_sequence` now creates a second child of
+    /// the same parent -- a real fork, not a field addable independently
+    /// of the append path that produces it.
+    pub(crate) async fn set_active_leaf(&mut self, sequence: u64) -> Result<u64> {
+        if !self.transcript.iter().any(|e| e.sequence == sequence) {
+            return Err(HarnessError::conflict(
+                Context::Session,
+                format!(
+                    "no transcript entry at sequence {sequence} in session {}",
+                    self.state.session_id
+                ),
+            ));
+        }
+        self.state.active_leaf_sequence = Some(sequence);
+        self.write_state().await?;
+        Ok(sequence)
     }
 
     async fn write_state(&self) -> Result<()> {
@@ -1831,6 +1935,13 @@ pub(crate) async fn seed_forked_session(
         // isn't a child `rlm(...)` admitted, so it has no parent message
         // to ever attribute usage back to.
         spawned_from_sequence: None,
+        // Left unset here on purpose: `AgentSession::recover`'s own
+        // "backfill from the transcript's last entry" reconciliation
+        // (the same one a legacy pre-tree-model session gets) picks this
+        // up correctly once `worker::spawn`'s `WorkerMode::Resume` loads
+        // this fork for the first time -- no need to duplicate that
+        // logic here.
+        active_leaf_sequence: None,
     };
     write_state(&session_dir, &state).await
 }
@@ -1916,6 +2027,7 @@ mod tests {
             name: None,
             usage: None,
             child_usage_attributed: None,
+            parent_sequence: None,
         }
     }
 
@@ -2591,6 +2703,177 @@ mod tests {
         assert_eq!(
             recovered.state.forked_from.as_ref().map(|f| f.at_sequence),
             Some(2)
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn ordinary_linear_append_gives_each_entry_the_previous_one_as_its_parent() {
+        let root = temp_state_root("tree-linear-chain");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-linear".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let first = session
+            .append(Role::User, "one".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        let second = session
+            .append(Role::Assistant, "two".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        let third = session
+            .append(Role::User, "three".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(first.parent_sequence, None);
+        assert_eq!(second.parent_sequence, Some(first.sequence));
+        assert_eq!(third.parent_sequence, Some(second.sequence));
+        assert_eq!(session.state.active_leaf_sequence, Some(third.sequence));
+
+        let chain = session.active_chain();
+        assert_eq!(
+            chain.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![first.sequence, second.sequence, third.sequence]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn set_active_leaf_followed_by_an_append_creates_a_real_fork() {
+        let root = temp_state_root("tree-fork");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-fork".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let root_entry = session
+            .append(Role::User, "root".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        let original_child = session
+            .append(
+                Role::Assistant,
+                "original branch".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Rewind to `root_entry` and append again -- this should produce a
+        // second child of `root_entry`, a genuine fork, rather than
+        // continuing from `original_child`.
+        session.set_active_leaf(root_entry.sequence).await.unwrap();
+        let new_child = session
+            .append(
+                Role::Assistant,
+                "new branch".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(original_child.parent_sequence, Some(root_entry.sequence));
+        assert_eq!(new_child.parent_sequence, Some(root_entry.sequence));
+        assert_ne!(original_child.sequence, new_child.sequence);
+
+        // The active chain now resolves to the new branch only -- the old
+        // branch's `original_child` is invisible from here, the same way
+        // an un-checked-out git branch is invisible to a build.
+        let chain = session.active_chain();
+        assert_eq!(
+            chain.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![root_entry.sequence, new_child.sequence]
+        );
+        assert!(!chain.iter().any(|e| e.sequence == original_child.sequence));
+
+        // `self.transcript` (the full audit trail) still has all three
+        // entries, across both branches.
+        assert_eq!(session.transcript.len(), 3);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn set_active_leaf_rejects_an_unknown_sequence() {
+        let root = temp_state_root("tree-unknown-leaf");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-unknown-leaf".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session
+            .append(Role::User, "only entry".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let err = session.set_active_leaf(999).await.unwrap_err();
+        assert!(err.to_string().contains("999"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn recover_backfills_active_leaf_for_a_legacy_session_predating_the_field() {
+        let root = temp_state_root("tree-legacy-backfill");
+        let session_dir = paths::session_dir(&root, "sess-legacy");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // A hand-written `state.json` with no `active_leaf_sequence` field
+        // at all, and a `transcript.jsonl` with no `parent_sequence`
+        // field on either line -- exactly what a session created before
+        // this feature landed looks like on disk.
+        std::fs::write(
+            session_dir.join("state.json"),
+            r#"{"session_id":"sess-legacy","status":"stopped","generation":1,"last_sequence":2,"created_at_ms":0,"updated_at_ms":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            "{\"sequence\":1,\"timestamp_ms\":0,\"role\":\"user\",\"text\":\"hi\"}\n\
+             {\"sequence\":2,\"timestamp_ms\":0,\"role\":\"assistant\",\"text\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let session = AgentSession::recover(
+            &root,
+            "sess-legacy",
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("recovering a legacy session should succeed");
+
+        assert_eq!(session.state.active_leaf_sequence, Some(2));
+        let chain = session.active_chain();
+        assert_eq!(
+            chain.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
         );
 
         std::fs::remove_dir_all(&root).unwrap();

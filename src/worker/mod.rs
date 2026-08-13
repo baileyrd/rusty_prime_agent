@@ -446,6 +446,16 @@ async fn handle_private_connection(
             )
             .await
         }
+        Request::SessionSetActiveLeaf { sequence, .. } => {
+            let active_leaf_sequence = session.lock().await.set_active_leaf(sequence).await?;
+            conn.write_response(
+                Context::Worker,
+                &Response::SessionSetActiveLeafAck {
+                    active_leaf_sequence,
+                },
+            )
+            .await
+        }
         Request::GoalUpdate { action, .. } => {
             let goal = session.lock().await.update_goal(action).await?;
             conn.write_response(Context::Worker, &Response::GoalUpdateAck { goal })

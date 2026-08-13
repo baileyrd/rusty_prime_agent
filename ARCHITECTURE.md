@@ -522,15 +522,13 @@ that a custom name slots into for free.
 ## Session forking (`session fork`)
 
 Bounded parity with a slice of `prime-agent`'s `/tree`/`/fork`/`/clone`
--- see `PARITY.md` for the full story, including why real intra-session
-tree branching (multiple divergent continuations of *one* transcript,
-with an active-leaf pointer) stays out of scope: `TranscriptEntry`'s
-`sequence: u64` is a total, linear order interpreted by one meaning
-everywhere it's read, so branching would need every reader reworked at
-once, not a field addable underneath them. `session fork` is
-**session-level** forking instead: a brand-new, independent session
-whose starting transcript is a copy of an existing session's own
-transcript up through `--at N` (or the whole thing).
+-- see `PARITY.md` for the full story. `session fork` is
+**session-level** forking: a brand-new, independent session whose
+starting transcript is a copy of an existing session's own transcript
+up through `--at N` (or the whole thing). Distinct from the
+**intra-session** branching described in the next section, which
+diverges *within* one session's own transcript instead of creating a
+new session.
 
 New `protocol::ForkedFrom { session_id, at_sequence }` on
 `SessionState`/`SessionSummary`, distinct from `SessionState::
@@ -556,6 +554,68 @@ via `AgentSession::create`; not `Recover`, which would misleadingly
 append a crash-recovery marker) -- `AgentSession::recover`'s ordinary
 full-replay picks up exactly what `seed_forked_session` wrote to disk,
 the same path any other resumed session goes through.
+
+## Intra-session tree branching (active-leaf transcript model)
+
+Parity with `session-format.md`'s "sessions... form a tree structure via
+`id`/`parentId` fields, enabling in-place branching" -- see `PARITY.md`
+for the full increment writeup, including why the original "one atomic,
+invasive change" write-off turned out to be wrong once framed as an
+additive second field rather than a rework of `sequence`'s own meaning.
+
+New `protocol::TranscriptEntry::parent_sequence: Option<u64>` -- this
+project's `parentId` analog, addressed via the existing `sequence`
+identity rather than a new id field. Set automatically by `session::
+AgentSession::append_entry` (the shared low-level append behind both
+`append` and `append_child_usage_attribution`) to whatever
+`SessionState::active_leaf_sequence` was at that moment; `append_entry`
+then advances `active_leaf_sequence` to the entry it just wrote. Ordinary
+linear conversation flow therefore always has `parent_sequence` equal to
+"the previous entry," at zero extra cost to any caller.
+
+Backward compatibility rule: `parent_sequence: None` with `sequence > 1`
+means a legacy entry (written before this field existed, `#[serde(
+default)]`) -- `AgentSession::active_chain`'s walk treats that as an
+*implicit* link to `sequence - 1`, the flat order every pre-existing
+transcript already has. Only `sequence == 1` with `parent_sequence: None`
+ends the walk as a genuine root. This is what keeps the change additive:
+no session's `transcript.jsonl` is ever rewritten to backfill real values
+into old entries, matching this project's existing "the transcript file
+is append-only, never rewritten or truncated" invariant (already relied
+on by compaction). `AgentSession::recover` backfills
+`active_leaf_sequence` from the transcript's last entry if it's still
+`None` after loading `state.json`, the same reconciliation `last_sequence`
+already gets.
+
+`AgentSession::active_chain(&self) -> Vec<&TranscriptEntry>` walks from
+`active_leaf_sequence` back to the root via `parent_sequence` (falling
+back to the legacy rule) and reverses to root-to-leaf order -- "the
+actual conversation," as opposed to `self.transcript` (every entry ever
+appended, across every branch, in write order -- still shown unfiltered
+by `session attach`/`snapshot_event`). `build_turns` and `compact_now`'s
+candidate collection both read `active_chain()` instead of `self.
+transcript` directly, so a reply or a compaction pass only ever sees the
+currently active branch.
+
+`AgentSession::set_active_leaf(&mut self, sequence) -> Result<u64>`
+(`pub(crate)`) validates `sequence` names a real entry anywhere in
+`self.transcript` (any branch) and persists it as the new
+`active_leaf_sequence` -- a pure pointer mutation, the same "mutate +
+persist, no transcript entry" shape `rename` has. A real fork only
+appears once the *next* `append_entry` call lands: if the redirected leaf
+already has a child down the previously-active path, the new append
+becomes a second child of that same parent. New wire protocol
+`Request::SessionSetActiveLeaf { session_id, sequence }` / `Response::
+SessionSetActiveLeafAck { active_leaf_sequence }`, forwarded from the
+public daemon socket to the owning worker's private socket unchanged --
+the same relay `SessionRename`/`SessionCompact` already use.
+
+No CLI/REPL command calls `set_active_leaf` yet -- this increment is
+deliberately data model + protocol/backend only, matching the pattern
+`rlm_depth`/`rlm_max_depth` set (landing before any CLI exposed them).
+`/tree` navigation and active-leaf switching from `session_repl` are the
+next increment; `/clone`'s live-state duplication and branch summaries
+are the one after that.
 
 ## REPL commands: `/file`, `/fork`, `/export`
 

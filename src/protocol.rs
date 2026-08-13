@@ -153,11 +153,25 @@ pub enum Request {
         session_id: String,
         instructions: Option<String>,
     },
+    /// Parity with `session-format.md`'s active-leaf concept: redirects
+    /// `session_id`'s own `SessionState::active_leaf_sequence` to
+    /// `sequence` -- the entry the *next* append continues from. Valid on
+    /// both transports, forwarded to the owning worker unchanged, same
+    /// reasoning as `SessionRename`/`SessionCompact`. Rejects a `sequence`
+    /// that doesn't name a real entry in this session's own transcript
+    /// (`session::AgentSession::set_active_leaf`'s own doc comment). Not
+    /// itself a transcript entry or a client-facing CLI/REPL command yet
+    /// -- see `PARITY.md`'s intra-session-branching entry for what this
+    /// increment covers versus `/tree` navigation, a later one.
+    SessionSetActiveLeaf {
+        session_id: String,
+        sequence: u64,
+    },
     /// `session fork <id> [--at N]` -- bounded parity with a slice of
     /// `prime-agent`'s `/fork` (see `PARITY.md`'s "Tree-structured
     /// session data model" entry for exactly what's NOT attempted: no
-    /// `/tree` visualization, no active-leaf switching mid-session, no
-    /// `/clone`). Public transport only, unlike `SessionRename`/
+    /// `/tree` visualization, no `/clone`). Public transport only, unlike
+    /// `SessionRename`/
     /// `SessionCompact` -- this creates a brand-new, independent session
     /// (its own directory, own worker) rather than mutating
     /// `session_id`'s, so there's no "owning worker" to forward it to;
@@ -314,6 +328,9 @@ pub enum Response {
     SessionCompactAck {
         compacted: bool,
         summary: Option<String>,
+    },
+    SessionSetActiveLeafAck {
+        active_leaf_sequence: u64,
     },
     ScheduleAdded {
         schedule_id: String,
@@ -595,6 +612,23 @@ pub struct TranscriptEntry {
     /// pre-existing-transcript reason as `usage`.
     #[serde(default)]
     pub child_usage_attributed: Option<ChildUsageAttribution>,
+    /// Parity with `session-format.md`'s `parentId`: which entry (by its
+    /// own `sequence`) this one continues from, set once at append time
+    /// to whatever `SessionState::active_leaf_sequence` was at that
+    /// moment -- ordinary linear conversation flow always has this equal
+    /// to "the previous entry," and a real branch appears only once
+    /// `session::AgentSession::set_active_leaf` has redirected the active
+    /// leaf to an earlier point before the next append. `None` means one
+    /// of two things, disambiguated by `sequence`: a genuine root
+    /// (`sequence == 1`, the very first entry a session ever gets), or a
+    /// legacy entry written before this field existed (`sequence > 1`,
+    /// `#[serde(default)]`) -- `session::AgentSession::active_chain`'s own
+    /// walk treats the latter as an *implicit* link to `sequence - 1`
+    /// (the flat order every pre-existing transcript already has),
+    /// staying fully backward-compatible without ever rewriting
+    /// `transcript.jsonl` to backfill real values into old entries.
+    #[serde(default)]
+    pub parent_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +746,20 @@ pub struct SessionState {
     /// that parent message.
     #[serde(default)]
     pub spawned_from_sequence: Option<u64>,
+    /// Parity with `session-format.md`'s "sessions... form a tree
+    /// structure via `id`/`parentId` fields, enabling in-place
+    /// branching": which transcript entry (by its own `sequence`, this
+    /// project's stand-in for a separate message-id concept -- see
+    /// `TranscriptEntry::parent_sequence`'s own doc comment) is the
+    /// current tip of the conversation `AgentSession::prompt`/
+    /// `build_turns` continue from. `None` only for a genuinely empty
+    /// transcript (no entries appended yet) or a session whose own
+    /// `state.json` predates this field -- `AgentSession::recover`
+    /// reconciles the latter the same way it already does for
+    /// `last_sequence`. `#[serde(default)]` for that same pre-existing-
+    /// `state.json` reason every other field added after Phase 1 has it.
+    #[serde(default)]
+    pub active_leaf_sequence: Option<u64>,
 }
 
 /// Provenance for a session created by `session fork <id> [--at N]`
