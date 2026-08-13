@@ -92,6 +92,37 @@ fn an_auth_json_entry_flips_that_provider_to_configured_without_running_its_comm
     );
 }
 
+/// A `providers.json`-registered custom provider is listed alongside the
+/// built-in ones, and its derived `<NAME>_API_KEY` env var flips it to
+/// `configured` the same way a built-in provider's own `*_API_KEY` does
+/// -- proving the registration is real end-to-end plumbing, not just
+/// `providers::load` parsing in isolation.
+#[test]
+fn a_registered_custom_provider_is_listed_and_its_derived_env_var_configures_it() {
+    let state_dir = common::TempDir::new("model-list-custom-provider");
+    std::fs::write(
+        state_dir.path().join("providers.json"),
+        r#"{"my-vllm": {"base_url": "http://127.0.0.1:8000/v1"}}"#,
+    )
+    .unwrap();
+
+    let unconfigured = run_with_env(state_dir.path(), &[]);
+    common::assert_success("model list", &unconfigured);
+    assert!(
+        common::stdout_string(&unconfigured).contains("my-vllm\tnot configured"),
+        "got: {}",
+        common::stdout_string(&unconfigured)
+    );
+
+    let configured = run_with_env(state_dir.path(), &[("MY_VLLM_API_KEY", "sk-test")]);
+    common::assert_success("model list", &configured);
+    assert!(
+        common::stdout_string(&configured).contains("my-vllm\tconfigured"),
+        "got: {}",
+        common::stdout_string(&configured)
+    );
+}
+
 #[test]
 fn json_mode_emits_a_structured_provider_list() {
     let state_dir = common::TempDir::new("model-list-json");

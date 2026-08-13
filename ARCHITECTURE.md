@@ -48,6 +48,7 @@ project's current shape.
 | `tool_runtime` | `ToolRuntime` trait boundary -- see below |
 | `settings` | `<state_dir>/settings.json` read/parse (`load`) -- see below |
 | `auth` | `<state_dir>/auth.json` read/parse plus `!command` key resolution (`load`/`resolve_key`) -- see below |
+| `providers` | `<state_dir>/providers.json` read/parse for custom/arbitrary OpenAI-compatible provider registration (`load`) -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
 ## Dependency stack
@@ -361,17 +362,43 @@ value) the trimmed stdout of running the rest as a shell command
 because there is exactly one local caller.
 
 `rp_server::resolve_auth_env(state_root)` is the only caller: for every
-`OPTIONAL_PROVIDERS` entry whose env var isn't already set in the
-daemon's own environment, it resolves an `auth.json` entry (if any) into
-an `(api_key_env, key)` pair. `ensure_running` hands each pair straight
-to the spawned `rp-server` child via `Command::env`, never
-`std::env::set_var`-ing the daemon's own process -- an `auth.json` edit
-takes effect on the next sidecar spawn without a daemon restart.
-`write_config` activates a `[providers.*]` block when either the env var
-or a resolved `auth.json` entry configures it; `known_providers`
-(`harness model list`) only checks *presence* of an `auth.json` entry,
-never resolving a `!command`, so a plain listing can't run an arbitrary
-command as a side effect.
+provider `rp_server::all_providers` returns (see the next section) whose
+env var isn't already set in the daemon's own environment, it resolves
+an `auth.json` entry (if any) into an `(api_key_env, key)` pair.
+`ensure_running` hands each pair straight to the spawned `rp-server`
+child via `Command::env`, never `std::env::set_var`-ing the daemon's own
+process -- an `auth.json` edit takes effect on the next sidecar spawn
+without a daemon restart. `write_config` activates a `[providers.*]`
+block when either the env var or a resolved `auth.json` entry configures
+it; `known_providers` (`harness model list`) only checks *presence* of
+an `auth.json` entry, never resolving a `!command`, so a plain listing
+can't run an arbitrary command as a side effect.
+
+## `providers.json` (custom provider registration)
+
+Parity with letting a session point at any self-hosted OpenAI-compatible
+endpoint (a vLLM server, LM Studio, a company-internal proxy) -- see
+`PARITY.md` for the full story, including the confirmation against
+`rusty_provider`'s own real router source that an arbitrary provider
+*name* is exactly the mechanism it already supports. `providers::
+load(state_root)` reads `<state_dir>/providers.json` into a `{provider
+name -> {base_url, kind}}` map (`kind` optional, defaults to
+`"openai"`), same permissive-parse stance every other config file in
+this project takes.
+
+`rp_server::all_providers(state_root)` merges this with the hardcoded
+`OPTIONAL_PROVIDERS` const into the one list `write_config`/
+`known_providers`/`resolve_auth_env` all iterate now, instead of the
+bare const directly -- a custom entry reusing a reserved name (a
+built-in provider's own name, or `"ollama"`) is silently dropped, so it
+can never collide into a duplicate `[providers.*]` TOML table
+`rp-server` would reject. A registered provider's env var is derived as
+`<NAME>_API_KEY` (`rp_server::custom_provider_api_key_env`,
+non-alphanumerics folded to `_`) -- `provider.rs`/`cli.rs`/`client.rs`
+needed no changes at all, since `--model <name>/<model>` was already an
+opaque string forwarded straight through to `rp-server`, and `auth.rs`
+needed no changes either, since it was already a plain name-keyed map
+that a custom name slots into for free.
 
 ## Known gaps
 
