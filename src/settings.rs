@@ -39,6 +39,15 @@ pub struct Settings {
     pub compact_trigger_tokens: Option<usize>,
     #[serde(default)]
     pub compact_keep_recent_tokens: Option<usize>,
+    /// `"dark"`/`"light"` (this project's two built-in themes) or a
+    /// path to a custom theme JSON file -- parity with `prime-agent`'s
+    /// own `theme` settings key. See `theme::resolve`'s own doc
+    /// comment for exactly how this is interpreted, and `PARITY.md`'s
+    /// "Themes: token spec + TUI renderer" entry for what's rendered
+    /// with it and what isn't. Read once at `session repl` startup, the
+    /// same "no live reload" stance the two fields above already have.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// Reads and parses `<state_root>/settings.json`. Never fails: a
@@ -91,6 +100,14 @@ mod tests {
         let settings = load(&root);
         assert_eq!(settings.compact_trigger_tokens, Some(1234));
         assert_eq!(settings.compact_keep_recent_tokens, Some(56));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parses_the_theme_field() {
+        let root = temp_state_root("theme-field");
+        std::fs::write(root.join("settings.json"), r#"{"theme": "light"}"#).unwrap();
+        assert_eq!(load(&root).theme, Some("light".to_string()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

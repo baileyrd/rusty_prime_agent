@@ -768,6 +768,41 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         }
     }
 
+    // Parity with a bounded slice of `prime-agent`'s theme system --
+    // see `PARITY.md`'s "Themes: token spec + TUI renderer" entry for
+    // the full story, including a real caveat: this project's own
+    // token spec is closely modeled on, but not byte-for-byte verified
+    // against, `prime-agent`'s actual `docs/themes.md` (unavailable in
+    // this sandbox). Loaded once here, not live-reloaded, the same
+    // "read `settings.json` once at startup" stance every other setting
+    // already has. `colors_on` gates every colorized print below --
+    // `false` for piped/non-interactive stdio (every one of this
+    // project's own tests) or `NO_COLOR`, matching raw mode's own
+    // `termctl::is_tty()` gate exactly.
+    let (theme, theme_warning) =
+        crate::theme::resolve(crate::settings::load(state_root).theme.as_deref());
+    let colors_on = mode == OutputMode::Text && crate::theme::colors_enabled();
+    if let Some(warning) = theme_warning {
+        println!(
+            "{}",
+            crate::theme::colorize(&warning, theme.token("warning"), colors_on)
+        );
+    } else if colors_on {
+        // Only announced when colors are actually active (a real
+        // terminal, `NO_COLOR` unset) -- every one of this project's
+        // own tests pipes stdio, so this never fires there, and a
+        // piped/non-interactive run has no use for a note about a
+        // rendering mode it isn't using anyway.
+        println!(
+            "{}",
+            crate::theme::colorize(
+                &format!("(theme: {})", theme.name),
+                theme.token("dim"),
+                true
+            )
+        );
+    }
+
     // Set by `/file <path>`, consumed (and cleared) by the next line that
     // actually sends a prompt -- a REPL-only, bounded slice of
     // `prime-agent`'s TUI-side "file reference" feature: no client-side
@@ -953,7 +988,14 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
                 Wake::Reader(Ok(Some(l))) => {
                     if !l.trim().is_empty() {
                         let _guard = stdout_lock.lock().unwrap();
-                        println!("(queued -- will run once the current reply finishes)");
+                        println!(
+                            "{}",
+                            crate::theme::colorize(
+                                "(queued -- will run once the current reply finishes)",
+                                theme.token("muted"),
+                                colors_on,
+                            )
+                        );
                         drop(_guard);
                         queue.push_back(l);
                     }
@@ -1267,8 +1309,13 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             // elsewhere in this project.
             if current.is_some() || !queue.is_empty() {
                 println!(
-                    "a reply is still generating or messages are queued -- let those finish \
-                     before switching sessions"
+                    "{}",
+                    crate::theme::colorize(
+                        "a reply is still generating or messages are queued -- let those \
+                         finish before switching sessions",
+                        theme.token("warning"),
+                        colors_on,
+                    )
                 );
                 continue;
             }
@@ -1283,10 +1330,24 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             };
             match create_session(state_root, meta).await {
                 Ok(new_id) => {
-                    println!("switched to new session {new_id}");
+                    println!(
+                        "{}",
+                        crate::theme::colorize(
+                            &format!("switched to new session {new_id}"),
+                            theme.token("success"),
+                            colors_on,
+                        )
+                    );
                     session_id = new_id;
                 }
-                Err(e) => println!("failed to create a new session: {e}"),
+                Err(e) => println!(
+                    "{}",
+                    crate::theme::colorize(
+                        &format!("failed to create a new session: {e}"),
+                        theme.token("error"),
+                        colors_on,
+                    )
+                ),
             }
             continue;
         }
@@ -1304,15 +1365,27 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             // doesn't exist.
             if current.is_some() || !queue.is_empty() {
                 println!(
-                    "a reply is still generating or messages are queued -- let those finish \
-                     before switching sessions"
+                    "{}",
+                    crate::theme::colorize(
+                        "a reply is still generating or messages are queued -- let those \
+                         finish before switching sessions",
+                        theme.token("warning"),
+                        colors_on,
+                    )
                 );
                 continue;
             }
             match fetch_transcript_snapshot(state_root, target).await {
                 Ok(transcript) => {
                     session_id = target.to_string();
-                    println!("resumed session {session_id}");
+                    println!(
+                        "{}",
+                        crate::theme::colorize(
+                            &format!("resumed session {session_id}"),
+                            theme.token("success"),
+                            colors_on,
+                        )
+                    );
                     match mode {
                         OutputMode::Json => print_json(&serde_json::json!({
                             "type": "repl_snapshot",
@@ -1325,7 +1398,14 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
                         }
                     }
                 }
-                Err(e) => println!("failed to resume {target}: {e}"),
+                Err(e) => println!(
+                    "{}",
+                    crate::theme::colorize(
+                        &format!("failed to resume {target}: {e}"),
+                        theme.token("error"),
+                        colors_on,
+                    )
+                ),
             }
             continue;
         }

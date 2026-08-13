@@ -629,7 +629,9 @@ above:
   `--prompt-template <path>`, `--theme <path>`, `--no-context-files`.**
   -- **False**, all of them -- skills/prompt-templates exist only via
   fixed on-disk discovery directories, with no path-flag override
-  surface, and Extensions/Themes don't exist as subsystems.
+  surface; Extensions doesn't exist as a subsystem; a theme is now
+  selectable, but only via `settings.json`'s `theme` field, not a
+  `--theme <path>` CLI flag (which stays absent).
 - **Autonomous options: `--autonomous-max-continuations`,
   `--autonomous-gate-retries`, `--autonomous-gate-timeout-ms`,
   `--autonomous-max-tokens`.** -- **Partial.** `--max-turns
@@ -979,14 +981,17 @@ tables:
   instead of nested.
 - **`compaction.reserveTokens`/`compaction.enabled`.** -- **False**,
   both -- no reserve concept, no toggle.
-- **`defaultProvider`/`defaultModel`/`defaultThinkingLevel`, `theme`,
+- **`theme`.** -- **Closed.** `Settings` now has a `theme: Option<String>`
+  field (`"dark"`/`"light"`, or a path to a custom theme JSON file) --
+  see `PARITY.md`'s "Themes: token spec + TUI renderer" entry.
+- **`defaultProvider`/`defaultModel`/`defaultThinkingLevel`,
   update-check settings, `telemetry.*`, `retry.*`, `branchSummary.*`,
   `steeringMode`/`followUpMode`, `terminal.*`/`images.*`, `shellPath`,
   `idleEvictionMinutes`, `sessionDir`, `enabledModels`,
   `markdown.codeBlockIndent`, resource-array settings (`packages`,
   `extensions`, `skills`, `prompts`, `themes`).** -- **False, all of
   them.** None exist as `Settings` fields -- confirmed by the struct's
-  complete two-field definition.
+  complete field list (three fields as of `theme`'s addition above).
 - **Two-tier global+project precedence with nested merge.** --
   **False.** Global-only, single file, no merge logic, already stated
   as deliberate in `PARITY.md`.
@@ -1004,14 +1009,23 @@ default-export factory receiving an `ExtensionAPI`, `pi.registerTool()`/
 `registerCommand()`/`registerShortcut()`/`registerProvider()`/`on(event,
 handler)` for ~25 named lifecycle events with documented payload shapes),
 and `themes.md` documents a full JSON token spec (51 required color
-tokens across 6 categories, 4 value formats). Neither is implemented
-here -- **False** as implemented, unchanged -- but the *reasoning* for
-why this stays unattempted needs updating: it's not "no spec exists
-anywhere to bound against," it's "a spec exists in prime-agent's own
-docs, but building against it still needs the interactive TUI first for
-Themes (nothing to render tokens onto) and is a large surface for
-Extensions relative to this project's current CLI/daemon shape." See the
-`PARITY.md` fix landed alongside this entry.
+tokens across 6 categories, 4 value formats -- a live fetch attempt of
+that file, made while scoping the eventual implementation, disagreed
+with itself across repeated calls on the exact category/token count;
+see `PARITY.md`'s "Themes: token spec + TUI renderer" entry for the
+full story). Extensions is still **False** as implemented -- the
+*reasoning* for why it stays unattempted needed updating (it's not "no
+spec exists anywhere to bound against," it's "a spec exists in
+prime-agent's own docs, but is a large surface relative to this
+project's current CLI/daemon shape"), but nothing has actually been
+built. **Themes is now Partial**: a bounded token spec plus a minimal
+ANSI-rendering layer landed (`src/theme.rs`, wired into a handful of
+`session_repl`'s own output points, `settings.json`'s new `theme`
+field) -- real colored terminal output where there was previously
+none, though only for the plain-text output this project's own REPL
+already produces (no markdown/syntax/diff rendering exists to color,
+so most of the 52-token schema validates but isn't consumed). See the
+`PARITY.md` entries for both.
 
 ## tui.md
 
