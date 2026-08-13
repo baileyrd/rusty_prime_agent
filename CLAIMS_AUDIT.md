@@ -557,8 +557,15 @@ above:
 
 - **Interactive-mode UI (startup header, `--verbose`, footer, `/usage`),
   editor features (`@` fuzzy search, Tab completion, image paste,
-  external-editor hotkey).** -- **False/N/A**, all of it -- `session_repl`
-  is a plain line-at-a-time stdin loop with no editor layer.
+  external-editor hotkey).** -- **False/N/A, one clause now partial.**
+  `session_repl` is still a plain line-at-a-time REPL with no rich
+  editor layer -- no `@` fuzzy search, no Tab completion, no image
+  paste, no external-editor hotkey, no startup header/footer/`/usage`,
+  all still absent. **Partial now**: it's no longer a *cooked-mode-only*
+  stdin loop -- when connected to a real terminal it puts the terminal
+  into raw mode and does its own byte-level echo/backspace/cancel
+  editing (`termctl`, see `ARCHITECTURE.md`), the foundation those
+  editor features would build on, without any of them existing yet.
 - **Slash-command table (23 commands).** -- **Partial, one clause now
   closed.** Only `/quit` (aliased `/exit`), `/compact`, `/heartbeat`, a
   bounded `/fork`/`/file`/`/export`/`/tree` exist (the last **closed**

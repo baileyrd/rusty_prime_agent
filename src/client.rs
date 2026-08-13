@@ -19,6 +19,7 @@ use crate::protocol::{
     GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessNoteKind, HarnessState,
     Request, Response, Role, SessionEvent, SessionState, SessionStatus, TranscriptEntry,
 };
+use crate::termctl;
 use crate::transport;
 
 /// `Response`/`SessionEvent` are plain derived-`Serialize` data (strings,
@@ -770,10 +771,25 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
     // followed by one of those doesn't silently drop it.
     let mut pending_file_content: Option<String> = None;
 
-    use std::io::BufRead;
+    // Raw mode when connected to a real interactive terminal (parity
+    // with `prime-agent`'s interactive TUI's own foundation -- see
+    // `termctl`'s own module doc comment and `PARITY.md`'s "Interactive
+    // TUI: raw-mode rendering foundation" entry) -- every one of this
+    // project's own tests pipes stdin/stdout, so `termctl::is_tty()`
+    // reports `false` there and the loop below falls through to the
+    // exact same `read_line`-based behavior `BufRead::lines()` gave
+    // before this increment, unchanged. A `RawModeGuard::enable()`
+    // failure (e.g. some other, unanticipated non-terminal fd shape)
+    // degrades the same way: silently fall back to cooked-mode
+    // reading rather than treat a terminal-control failure as fatal to
+    // an otherwise-working REPL.
+    let raw_guard = if termctl::is_tty() {
+        termctl::RawModeGuard::enable().ok()
+    } else {
+        None
+    };
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| HarnessError::io(Context::Cli, None, e))?;
+    while let Some(line) = next_repl_line(&stdin, raw_guard.is_some())? {
         let text = line.trim();
         if text.is_empty() {
             continue;
@@ -989,6 +1005,100 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         }
     }
     Ok(())
+}
+
+/// One line of `session_repl` input, from whichever source is active --
+/// `read_raw_line` when `raw_active` (a real terminal, in raw mode), or
+/// the same blocking-read-until-newline behavior `BufRead::lines()` gave
+/// before this increment otherwise (every one of this project's own
+/// tests pipes stdin, so this is the path they all still exercise,
+/// unchanged). `Ok(None)` at EOF either way -- the same "loop just ends"
+/// signal the previous `for line in stdin.lock().lines()` gave.
+fn next_repl_line(stdin: &std::io::Stdin, raw_active: bool) -> Result<Option<String>> {
+    if raw_active {
+        return read_raw_line(stdin);
+    }
+    use std::io::BufRead;
+    let mut buf = String::new();
+    let n = stdin
+        .lock()
+        .read_line(&mut buf)
+        .map_err(|e| HarnessError::io(Context::Cli, None, e))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    while buf.ends_with('\n') || buf.ends_with('\r') {
+        buf.pop();
+    }
+    Ok(Some(buf))
+}
+
+/// Reads one line from a raw-mode terminal, byte by byte, doing this
+/// project's own minimal echo/editing -- raw mode disables the
+/// terminal's own line buffering and local echo (`termctl::
+/// RawModeGuard`'s own doc comment), so both become this function's job
+/// instead. Deliberately minimal, the actual "raw-mode rendering
+/// foundation" this increment delivers rather than the rich editor a
+/// later one builds on top of it: printable bytes are echoed and
+/// appended, Backspace/Delete erases the last byte (visually and from
+/// the buffer), `Ctrl-C` cancels the current line (prints `^C`, starts a
+/// fresh one -- the same behavior most REPLs already give `Ctrl-C` at an
+/// empty-ish prompt) rather than exiting the process, `Ctrl-D` on an
+/// empty line signals EOF (the same meaning `Ctrl-D` already has at a
+/// cooked-mode prompt), and Enter (CR or LF) submits. No multi-line
+/// editing, no cursor movement within the line, no history, no
+/// completion -- see `PARITY.md`'s "Interactive TUI" entries for why
+/// those are later, separate increments built on top of this one, not
+/// bundled into it. Accumulates raw bytes and decodes lossily at Enter
+/// rather than tracking UTF-8 boundaries as they arrive -- correct for
+/// well-formed input, and multi-byte sequences still render correctly
+/// since each byte is echoed immediately as typed, the same way a real
+/// terminal emulator assembles a UTF-8 sequence from bytes arriving one
+/// at a time.
+fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
+    use std::io::{Read, Write};
+    let mut locked = stdin.lock();
+    let mut out = std::io::stdout();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = locked
+            .read(&mut byte)
+            .map_err(|e| HarnessError::io(Context::Cli, None, e))?;
+        if n == 0 {
+            // The underlying fd closed mid-line -- treat like `Ctrl-D`
+            // on an empty line: end the REPL.
+            return Ok(None);
+        }
+        match byte[0] {
+            b'\r' | b'\n' => {
+                let _ = out.write_all(b"\r\n");
+                let _ = out.flush();
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            0x03 => {
+                buf.clear();
+                let _ = out.write_all(b"^C\r\n");
+                let _ = out.flush();
+            }
+            0x04 if buf.is_empty() => {
+                let _ = out.write_all(b"\r\n");
+                let _ = out.flush();
+                return Ok(None);
+            }
+            0x7f | 0x08 => {
+                if buf.pop().is_some() {
+                    let _ = out.write_all(b"\x08 \x08");
+                    let _ = out.flush();
+                }
+            }
+            b => {
+                buf.push(b);
+                let _ = out.write_all(&[b]);
+                let _ = out.flush();
+            }
+        }
+    }
 }
 
 /// Parses `/fork`'s own trailing `[--at N] [--name TEXT]` -- a small,

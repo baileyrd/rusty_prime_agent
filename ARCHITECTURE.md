@@ -716,6 +716,59 @@ interpreter-state serialization), a genuinely different and much larger
 mechanism than anything branch summaries touched, so it stays
 unimplemented.
 
+## Raw-mode terminal control (`termctl`) -- interactive TUI foundation
+
+First of several increments toward `prime-agent`'s real interactive TUI
+(panes, cursor control, live re-rendering) -- see `PARITY.md`'s own
+"Interactive TUI: raw-mode rendering foundation" entry for the full
+writeup, including the real-pseudo-terminal verification proving `Ctrl-C`
+is genuinely handled by this project's own code rather than delivered as
+`SIGINT`. Scoped narrowly: raw mode plus the minimal live re-rendering it
+enables (manual byte-level echo/backspace/cancel), not the rich editor
+(multiline input, `@` fuzzy file search, tab completion) a later,
+separate increment builds on top of it.
+
+`src/termctl.rs`: hand-rolled direct `libc`/`windows-sys` FFI
+(`procutil.rs`'s own precedent for "a handful of small, direct syscalls,
+not a dependency"), not a `crossterm`-style terminal-UI crate.
+`termctl::is_tty()` requires both stdin *and* stdout to be a real
+interactive terminal (`libc::isatty` on unix, `GetConsoleMode` succeeding
+on Windows) -- every one of this project's own tests pipes both
+(`Stdio::piped()`), so this reports `false` under test and nothing below
+engages; raw mode is additive for a real interactive caller only.
+
+`termctl::RawModeGuard::enable()` applies the standard raw-mode recipe
+directly via `termios`/`tcgetattr`/`tcsetattr` on unix (clears
+`ICANON`/`ECHO`/`ISIG`/`IEXTEN` on `c_lflag`, `IXON`/`ICRNL`/`BRKINT`/
+`INPCK`/`ISTRIP` on `c_iflag`, `OPOST` on `c_oflag`, sets `VMIN=1`/
+`VTIME=0`) and the equivalent `GetConsoleMode`/`SetConsoleMode` input-mode
+flags on Windows (`ENABLE_LINE_INPUT`/`ENABLE_ECHO_INPUT`/
+`ENABLE_PROCESSED_INPUT` cleared), restoring the original mode on `Drop`
+-- including an early return or panic unwind, so a crashed REPL never
+leaves the caller's shell stuck in raw mode. The flag-computation itself
+(`termctl::make_raw`) is factored out as a pure function specifically so
+it's unit-testable without a real terminal, since `enable`'s own
+`tcgetattr`/`tcsetattr` calls need one to succeed against. Deliberately
+excludes terminal-size querying (`TIOCGWINSZ`/
+`GetConsoleScreenBufferInfo`) -- nothing here needs it yet; left for
+whichever later increment (the rich editor) actually needs the
+terminal's width.
+
+`client::session_repl`'s stdin loop reads through `next_repl_line`/
+`read_raw_line` when `termctl::is_tty()`, falling straight back to the
+pre-existing blocking-read behavior otherwise (unchanged, still what
+every test exercises): byte-by-byte reading with minimal manual editing
+(printable bytes echoed and appended, Backspace/Delete erases the last
+byte, `Ctrl-C` cancels the current line and prints `^C` rather than
+exiting -- `ISIG` being cleared means the terminal never delivers
+`SIGINT` for it, this project's own read loop handles the raw `0x03`
+byte instead -- `Ctrl-D` on an empty line signals EOF, Enter submits).
+Only the *how one line gets read* changed; `session_repl`'s own command
+dispatch (`/heartbeat`, `/compact`, `/file`, `/fork`, `/tree`,
+`/branch-summary`, `/export`, ...) is untouched, layered underneath the
+existing loop the same way `/tree` layered onto it earlier rather than a
+rewrite of it.
+
 ## REPL commands: `/file`, `/fork`, `/export`, `/tree`, `/branch-summary`
 
 Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/

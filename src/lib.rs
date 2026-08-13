@@ -63,6 +63,7 @@ mod schedule;
 mod settings;
 mod sha256;
 mod skills;
+mod termctl;
 mod tools;
 mod transport;
 mod worker;
