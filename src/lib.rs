@@ -133,6 +133,11 @@ pub async fn run(args: &[String]) -> Result<()> {
             session_id,
             instructions,
         } => client::session_compact(&state_root, session_id, instructions, output_mode).await,
+        cli::Command::SessionFork {
+            session_id,
+            at_sequence,
+            name,
+        } => client::session_fork(&state_root, session_id, at_sequence, name, output_mode).await,
         cli::Command::ScheduleAdd {
             session_id,
             text,

@@ -458,6 +458,44 @@ opaque string forwarded straight through to `rp-server`, and `auth.rs`
 needed no changes either, since it was already a plain name-keyed map
 that a custom name slots into for free.
 
+## Session forking (`session fork`)
+
+Bounded parity with a slice of `prime-agent`'s `/tree`/`/fork`/`/clone`
+-- see `PARITY.md` for the full story, including why real intra-session
+tree branching (multiple divergent continuations of *one* transcript,
+with an active-leaf pointer) stays out of scope: `TranscriptEntry`'s
+`sequence: u64` is a total, linear order interpreted by one meaning
+everywhere it's read, so branching would need every reader reworked at
+once, not a field addable underneath them. `session fork` is
+**session-level** forking instead: a brand-new, independent session
+whose starting transcript is a copy of an existing session's own
+transcript up through `--at N` (or the whole thing).
+
+New `protocol::ForkedFrom { session_id, at_sequence }` on
+`SessionState`/`SessionSummary`, distinct from `SessionState::
+parent_id` (recursive subagents relate whole sessions by *ownership*;
+this relates them by *shared transcript history*). `session::
+snapshot_for_fork(session_dir, at_sequence)` reads a source session's
+`state.json`/`transcript.jsonl` straight off disk (`catalog::scan`'s own
+"files are the source of truth" reasoning, so this works even if the
+source's worker isn't currently running) and truncates, erroring loudly
+if `at_sequence` is past the transcript's real end. `session::
+seed_forked_session` writes a fresh `state.json`/`transcript.jsonl` pair
+for the new session id -- carrying forward `model`/`thinking`/`tools`/
+`runtime` from the source, but deliberately not `goal`/`harness` (both
+are narrative fields only accurate against the source's *full* history,
+which a truncated copy may not match).
+
+`daemon::handle_session_fork` is the only caller: unlike `SessionRename`/
+`SessionCompact` (forwarded to an existing session's own worker), a fork
+creates a brand-new session, so the daemon handles it directly, the same
+shape `handle_session_new` already has. It spawns the new worker with
+`WorkerMode::Resume` (not `New`, which always starts an empty transcript
+via `AgentSession::create`; not `Recover`, which would misleadingly
+append a crash-recovery marker) -- `AgentSession::recover`'s ordinary
+full-replay picks up exactly what `seed_forked_session` wrote to disk,
+the same path any other resumed session goes through.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

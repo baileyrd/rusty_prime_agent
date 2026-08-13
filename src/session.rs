@@ -38,7 +38,7 @@ use rusty_tokio::sync::broadcast;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
-    CompactionState, GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote,
+    CompactionState, ForkedFrom, GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote,
     HarnessSnapshot, HarnessState, Request, Role, ScheduleKind, SessionEvent, SessionState,
     SessionStatus, ToolCallRequest, TranscriptEntry,
 };
@@ -307,6 +307,7 @@ impl AgentSession {
             tools,
             runtime,
             compaction: None,
+            forked_from: None,
         };
         let session = AgentSession {
             state,
@@ -1068,6 +1069,96 @@ fn read_state(session_dir: &Path) -> Result<SessionState> {
     serde_json::from_str(&text).map_err(|e| HarnessError::json(Context::Session, Some(path), e))
 }
 
+/// Reads a source session's own persisted state and transcript directly
+/// from disk -- no daemon/worker connection involved, the same "files
+/// are the source of truth" reasoning `catalog::scan` already relies on
+/// -- truncated to `at_sequence` if given. Used by `daemon::
+/// handle_session_fork` to snapshot a fork point before seeding a
+/// brand-new session directory with the result (see
+/// [`seed_forked_session`]). Errors (a conflict, not a panic) if
+/// `at_sequence` names a point past the transcript's real end --
+/// computed as `max(state.last_sequence, transcript.last().sequence)`,
+/// the same "state.json is only a best-effort cache" reasoning
+/// `AgentSession::recover` already uses, so a source session whose
+/// worker crashed between an `append` and its own `write_state` call
+/// still reports its true last sequence here.
+pub(crate) fn snapshot_for_fork(
+    session_dir: &Path,
+    at_sequence: Option<u64>,
+) -> Result<(SessionState, Vec<TranscriptEntry>)> {
+    let state = read_state(session_dir)?;
+    let mut transcript = read_transcript(session_dir)?;
+    if let Some(at_sequence) = at_sequence {
+        let real_last_sequence = state
+            .last_sequence
+            .max(transcript.last().map(|e| e.sequence).unwrap_or(0));
+        if at_sequence > real_last_sequence {
+            return Err(HarnessError::conflict(
+                Context::Session,
+                format!(
+                    "no transcript entry at or before sequence {at_sequence} \
+                     (this session's last sequence is {real_last_sequence})"
+                ),
+            ));
+        }
+        transcript.retain(|e| e.sequence <= at_sequence);
+    }
+    Ok((state, transcript))
+}
+
+/// Seeds a brand-new session directory with `entries` (a prefix of some
+/// other session's own transcript, from [`snapshot_for_fork`]) plus a
+/// fresh `state.json` carrying forward `source`'s model/thinking/tools/
+/// runtime configuration -- deliberately NOT `goal`/`harness`, whose
+/// narrative content is only accurate as of `source`'s *current* full
+/// history, not necessarily this fork's truncated one (see
+/// `ForkedFrom`'s own doc comment).
+///
+/// `worker::spawn`'s `WorkerMode::Resume` reads this back via
+/// `AgentSession::recover`, the same as resuming any other stopped
+/// session -- there's no `WorkerMode::New`-shaped path that could take a
+/// non-empty starting transcript (`AgentSession::create` always starts
+/// `last_sequence` at 0 and never touches `transcript.jsonl`), so this
+/// writes exactly what a normal session's own `append`/`write_state`
+/// calls would have produced over time, then lets `recover`'s ordinary
+/// full-replay pick it up like any other session a worker is resuming.
+pub(crate) async fn seed_forked_session(
+    state_root: &Path,
+    new_session_id: &str,
+    name: Option<String>,
+    source: &SessionState,
+    entries: Vec<TranscriptEntry>,
+    forked_from: ForkedFrom,
+) -> Result<()> {
+    let session_dir = paths::session_dir(state_root, new_session_id);
+    paths::ensure_dir(Context::Session, &session_dir)?;
+    let last_sequence = entries.last().map(|e| e.sequence).unwrap_or(0);
+    for entry in &entries {
+        append_transcript_line(&session_dir, entry).await?;
+    }
+    let now = now_ms();
+    let state = SessionState {
+        session_id: new_session_id.to_string(),
+        name,
+        status: SessionStatus::Active,
+        worker_pid: None,
+        generation: 0,
+        last_sequence,
+        created_at_ms: now,
+        updated_at_ms: now,
+        model: source.model.clone(),
+        goal: None,
+        harness: HarnessState::default(),
+        parent_id: None,
+        thinking: source.thinking.clone(),
+        tools: source.tools.clone(),
+        runtime: source.runtime.clone(),
+        compaction: None,
+        forked_from: Some(forked_from),
+    };
+    write_state(&session_dir, &state).await
+}
+
 async fn write_state(session_dir: &Path, state: &SessionState) -> Result<()> {
     let path = paths::state_file_path(session_dir);
     let state = state.clone();
@@ -1386,6 +1477,123 @@ mod tests {
             compact_keep_recent_tokens(&root),
             DEFAULT_COMPACT_KEEP_RECENT_TOKENS
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn snapshot_for_fork_truncates_the_transcript_at_the_given_sequence() {
+        let root = temp_state_root("fork-snapshot-truncate");
+        let mut session = AgentSession::create(
+            &root,
+            "source".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .unwrap();
+        session.prompt("first".to_string()).await.unwrap();
+        session.prompt("second".to_string()).await.unwrap();
+
+        let session_dir = paths::session_dir(&root, "source");
+        let (state, entries) = snapshot_for_fork(&session_dir, Some(2)).unwrap();
+        assert_eq!(state.session_id, "source");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.sequence <= 2));
+
+        let (_, all_entries) = snapshot_for_fork(&session_dir, None).unwrap();
+        assert_eq!(all_entries.len(), 4);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn snapshot_for_fork_rejects_a_sequence_past_the_real_end() {
+        let root = temp_state_root("fork-snapshot-past-end");
+        let mut session = AgentSession::create(
+            &root,
+            "source".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .unwrap();
+        session.prompt("only turn".to_string()).await.unwrap();
+
+        let session_dir = paths::session_dir(&root, "source");
+        let err = snapshot_for_fork(&session_dir, Some(999)).unwrap_err();
+        assert!(err.to_string().contains("999"), "got: {err}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn seed_forked_session_produces_a_session_recover_can_replay() {
+        let root = temp_state_root("fork-seed-recover");
+        let mut source = AgentSession::create(
+            &root,
+            "source".to_string(),
+            NewSessionMeta {
+                model: Some("ollama/qwen2.5:0.5b".to_string()),
+                thinking: Some("low".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .unwrap();
+        source.prompt("hello".to_string()).await.unwrap();
+
+        let source_dir = paths::session_dir(&root, "source");
+        let (source_state, entries) = snapshot_for_fork(&source_dir, None).unwrap();
+        seed_forked_session(
+            &root,
+            "forked",
+            Some("my fork".to_string()),
+            &source_state,
+            entries,
+            ForkedFrom {
+                session_id: "source".to_string(),
+                at_sequence: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        let recovered = AgentSession::recover(
+            &root,
+            "forked",
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.transcript.len(), 2);
+        assert_eq!(recovered.state.name.as_deref(), Some("my fork"));
+        // Configuration carries forward from the source...
+        assert_eq!(
+            recovered.state.model.as_deref(),
+            Some("ollama/qwen2.5:0.5b")
+        );
+        assert_eq!(recovered.state.thinking.as_deref(), Some("low"));
+        // ...but narrative state deliberately does not, see `ForkedFrom`'s
+        // own doc comment.
+        assert!(recovered.state.goal.is_none());
+        assert_eq!(
+            recovered
+                .state
+                .forked_from
+                .as_ref()
+                .map(|f| f.session_id.as_str()),
+            Some("source")
+        );
+        assert_eq!(
+            recovered.state.forked_from.as_ref().map(|f| f.at_sequence),
+            Some(2)
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

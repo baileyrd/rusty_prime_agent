@@ -90,6 +90,14 @@ pub enum Command {
         session_id: String,
         instructions: Option<String>,
     },
+    /// `harness session fork <id> [--at N] [--name NAME]` -- bounded
+    /// parity with a slice of `prime-agent`'s `/fork`. See
+    /// `protocol::Request::SessionFork`'s own doc comment.
+    SessionFork {
+        session_id: String,
+        at_sequence: Option<u64>,
+        name: Option<String>,
+    },
     /// `harness session rpc <id>` -- parity with `prime-agent --mode
     /// rpc`. See `client::session_rpc`'s own doc comment.
     SessionRpc {
@@ -389,6 +397,25 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     } else {
                         Some(instructions.join(" "))
                     },
+                })
+            }
+            Some("fork") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session fork` requires a session id"))?;
+                let rest: Vec<&String> = it.collect();
+                let at_sequence = scan_named_flag(&rest, "--at")?
+                    .map(|v| {
+                        v.parse::<u64>()
+                            .map_err(|_| usage(format!("--at requires an integer, got {v:?}")))
+                    })
+                    .transpose()?;
+                let name = scan_named_flag(&rest, "--name")?;
+                Ok(Command::SessionFork {
+                    session_id,
+                    at_sequence,
+                    name,
                 })
             }
             Some("schedule") => parse_schedule(&mut it),

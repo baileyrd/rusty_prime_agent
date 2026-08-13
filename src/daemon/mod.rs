@@ -18,7 +18,7 @@ use crate::catalog;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::procutil;
-use crate::protocol::{Request, Response, SessionEvent, SessionState, SessionStatus};
+use crate::protocol::{ForkedFrom, Request, Response, SessionEvent, SessionState, SessionStatus};
 use crate::transport::{self, LineStream};
 use crate::worker::{self, WorkerMode};
 
@@ -277,6 +277,14 @@ impl Supervisor {
                 self.handle_session_compact(&mut conn, session_id, instructions)
                     .await
             }
+            Request::SessionFork {
+                session_id,
+                at_sequence,
+                name,
+            } => {
+                self.handle_session_fork(&mut conn, session_id, at_sequence, name)
+                    .await
+            }
             Request::ScheduleAdd {
                 session_id,
                 text,
@@ -450,6 +458,145 @@ impl Supervisor {
         }
         conn.write_response(Context::Daemon, &Response::SessionNew { session_id })
             .await
+    }
+
+    /// `session fork <id> [--at N]` -- see `protocol::Request::
+    /// SessionFork`'s own doc comment for the design. Handled directly
+    /// by the daemon, not forwarded to `session_id`'s own worker: unlike
+    /// `SessionRename`/`SessionCompact` (which mutate an existing
+    /// session the worker already owns), this reads `session_id`'s
+    /// transcript straight off disk (`session::snapshot_for_fork` -- the
+    /// same "files are the source of truth" reasoning `catalog::scan`
+    /// already relies on, so this works whether or not `session_id`'s
+    /// own worker happens to be running right now) and spawns a brand-
+    /// new, independent worker for the result, the same shape
+    /// `handle_session_new` already uses.
+    async fn handle_session_fork(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        at_sequence: Option<u64>,
+        name: Option<String>,
+    ) -> Result<()> {
+        let source_dir = paths::session_dir(&self.state_root, &session_id);
+        if !paths::state_file_path(&source_dir).exists() {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("unknown session {session_id}"),
+                        conflict: true,
+                    },
+                )
+                .await;
+        }
+        let (source_state, entries) =
+            match crate::session::snapshot_for_fork(&source_dir, at_sequence) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return conn
+                        .write_response(
+                            Context::Daemon,
+                            &Response::Error {
+                                message: err.to_string(),
+                                conflict: true,
+                            },
+                        )
+                        .await
+                }
+            };
+        let forked_from = ForkedFrom {
+            session_id: session_id.clone(),
+            at_sequence: entries.last().map(|e| e.sequence).unwrap_or(0),
+        };
+        let new_session_id = crate::session::new_session_id();
+        if let Err(err) = crate::session::seed_forked_session(
+            &self.state_root,
+            &new_session_id,
+            name.clone(),
+            &source_state,
+            entries,
+            forked_from,
+        )
+        .await
+        {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("failed to seed forked session: {err}"),
+                        conflict: false,
+                    },
+                )
+                .await;
+        }
+        // Same reasoning as `handle_session_new`: `--tools mcp` needs a
+        // running sidecar even with no `--model` set.
+        if source_state.model.is_some() || source_state.tools.as_deref() == Some("mcp") {
+            if let Err(err) = crate::rp_server::ensure_running(&self.state_root).await {
+                return conn
+                    .write_response(
+                        Context::Daemon,
+                        &Response::Error {
+                            message: format!("failed to start rp-server sidecar: {err}"),
+                            conflict: false,
+                        },
+                    )
+                    .await;
+            }
+        }
+        // `WorkerMode::Resume`, not `New`: `seed_forked_session` already
+        // wrote a real `state.json`/`transcript.jsonl` for this session
+        // id, the same shape any other stopped session has -- `Resume`
+        // is `AgentSession::recover` without the crash-recovery marker
+        // `Recover` would (misleadingly) append, exactly right for a
+        // session that was never actually running before now.
+        if let Err(err) = worker::spawn(
+            &self.exe_path,
+            &self.state_root,
+            &new_session_id,
+            WorkerMode::Resume,
+            crate::session::NewSessionMeta {
+                name,
+                model: source_state.model.clone(),
+                goal: None,
+                parent_id: None,
+                thinking: source_state.thinking.clone(),
+                tools: source_state.tools.clone(),
+                runtime: source_state.runtime.clone(),
+            },
+        )
+        .await
+        {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("failed to start worker: {err}"),
+                        conflict: false,
+                    },
+                )
+                .await;
+        }
+        let socket_path = paths::worker_socket_path(&self.state_root, &new_session_id);
+        if let Err(err) = worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await {
+            return conn
+                .write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: format!("worker did not become ready: {err}"),
+                        conflict: false,
+                    },
+                )
+                .await;
+        }
+        conn.write_response(
+            Context::Daemon,
+            &Response::SessionNew {
+                session_id: new_session_id,
+            },
+        )
+        .await
     }
 
     async fn handle_session_list(&self, conn: &mut LineStream) -> Result<()> {
