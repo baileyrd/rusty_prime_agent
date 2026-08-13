@@ -751,6 +751,10 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
 /// make progress on while waiting for the next line, the same reasoning
 /// every other blocking `std::fs` call in this crate already leans on.
 pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    // `mut` for `/new`/`/resume` below -- both switch which session this
+    // same REPL process operates on for the rest of the run, rather than
+    // requiring a fresh `session repl <id>` invocation.
+    let mut session_id = session_id;
     let transcript = fetch_transcript_snapshot(state_root, &session_id).await?;
     match mode {
         OutputMode::Json => print_json(&serde_json::json!({
@@ -1188,6 +1192,143 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if let Some(name) = text
+            .strip_prefix("/name ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // `/name` -- `session rename` itself already exists as a
+            // top-level `harness session rename <id> <name>` command;
+            // this is just wiring the same client-side call into the
+            // REPL loop, the identical shape `/fork`/`/tree` above
+            // already have.
+            session_rename(state_root, session_id.clone(), Some(name.to_string()), mode).await?;
+            continue;
+        }
+        if text == "/refine" {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // `/refine` -- the Continual Harness's own `session refine
+            // <id>` already exists as a top-level command (see
+            // `PARITY.md`'s "Continual Harness" entry); wiring it into
+            // the loop the same way `/tree`/`/compact` above already
+            // are.
+            session_refine(state_root, session_id.clone(), mode).await?;
+            continue;
+        }
+        if text == "/session" {
+            // Bounded slice of `prime-agent`'s `/session` picker: lists
+            // every session (the same output `harness session list`
+            // gives), not the full interactive search/sort/rename/
+            // delete-via-trash picker `sessions.md` documents -- there's
+            // no soft-delete primitive anywhere in this project
+            // (`session stop` stops a running worker but never removes
+            // its on-disk state) and no interactive picker UI (`termctl`
+            // has no cursor-positioning primitives yet), so a live
+            // dropdown to pick *from* isn't buildable either. Use
+            // `/resume <id>` below to actually switch to one of the
+            // listed sessions.
+            session_list(state_root, mode).await?;
+            continue;
+        }
+        if text == "/model" {
+            // Bounded slice of `prime-agent`'s `/model` -- lists this
+            // environment's configured providers (the same output
+            // `harness model list` gives), not mid-session model
+            // switching: a session's model is fixed at `session new`
+            // time, and there is no `Request` variant or daemon/worker
+            // handler anywhere in this project to change it mid-session
+            // (see `PARITY.md`'s "Needs a new subsystem" section).
+            model_list(state_root, false, mode).await?;
+            continue;
+        }
+        if text == "/reload" {
+            // Not a missing subsystem, unlike most of this bullet's
+            // siblings: `session::build_turns` already re-reads
+            // `AGENTS.md`/`CLAUDE.md`/`SYSTEM.md` fresh on every single
+            // turn (see that function's own doc comment), so there is
+            // nothing stale here to actually reload -- this just states
+            // that in words instead of silently doing nothing for a
+            // command a `prime-agent` user might reasonably still type.
+            println!("context files are already re-read fresh on every turn -- nothing to reload");
+            continue;
+        }
+        if text == "/new" || text.starts_with("/new ") {
+            // Switches this same REPL process to operate on a brand-new
+            // session instead of `<id>` -- bounded parity with
+            // `prime-agent`'s `/new`. Only the session-creation call
+            // itself is reused (`create_session`, the same helper
+            // `session_new` calls); everything else `session new`'s own
+            // CLI flags support (`--model`/`--goal`/`--thinking`/`--tools`/
+            // `--runtime`) is deliberately left out of this REPL slice --
+            // an optional display name is the only argument, the same
+            // "extract the tractable mechanism, leave the rich surface
+            // out" bound `session spawn`/prompt templates already use
+            // elsewhere in this project.
+            if current.is_some() || !queue.is_empty() {
+                println!(
+                    "a reply is still generating or messages are queued -- let those finish \
+                     before switching sessions"
+                );
+                continue;
+            }
+            let new_name = text.strip_prefix("/new").unwrap_or("").trim();
+            let meta = crate::session::NewSessionMeta {
+                name: if new_name.is_empty() {
+                    None
+                } else {
+                    Some(new_name.to_string())
+                },
+                ..Default::default()
+            };
+            match create_session(state_root, meta).await {
+                Ok(new_id) => {
+                    println!("switched to new session {new_id}");
+                    session_id = new_id;
+                }
+                Err(e) => println!("failed to create a new session: {e}"),
+            }
+            continue;
+        }
+        if let Some(target) = text
+            .strip_prefix("/resume ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Switches this same REPL process to operate on an existing
+            // other session instead of `<id>` -- bounded parity with
+            // `prime-agent`'s `/resume`/`-r [path|id]`. Validates the
+            // target exists (an unknown id reports the same conflict
+            // `session attach` would) before actually switching, so a
+            // typo never leaves the loop pointed at a session that
+            // doesn't exist.
+            if current.is_some() || !queue.is_empty() {
+                println!(
+                    "a reply is still generating or messages are queued -- let those finish \
+                     before switching sessions"
+                );
+                continue;
+            }
+            match fetch_transcript_snapshot(state_root, target).await {
+                Ok(transcript) => {
+                    session_id = target.to_string();
+                    println!("resumed session {session_id}");
+                    match mode {
+                        OutputMode::Json => print_json(&serde_json::json!({
+                            "type": "repl_snapshot",
+                            "transcript": transcript,
+                        })),
+                        OutputMode::Text => {
+                            for entry in &transcript {
+                                print_entry(entry);
+                            }
+                        }
+                    }
+                }
+                Err(e) => println!("failed to resume {target}: {e}"),
+            }
+            continue;
+        }
         let text_to_send = match pending_file_content.take() {
             Some(prefix) => format!("{prefix}{text}"),
             None => text.to_string(),
@@ -1387,6 +1528,13 @@ const REPL_SLASH_COMMANDS: &[&str] = &[
     "/tree",
     "/branch-summary",
     "/export",
+    "/name",
+    "/refine",
+    "/session",
+    "/model",
+    "/reload",
+    "/new",
+    "/resume",
 ];
 
 /// The result of a successful Tab completion: replace everything in the

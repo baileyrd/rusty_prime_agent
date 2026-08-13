@@ -92,6 +92,211 @@ fn repl_queues_lines_typed_while_a_reply_is_still_in_flight() {
 }
 
 #[test]
+fn repl_name_command_renames_the_current_session() {
+    let state_dir = common::TempDir::new("repl-name");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/name Renamed\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("renamed to Renamed"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("Renamed"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_refine_command_adds_a_harness_note() {
+    let state_dir = common::TempDir::new("repl-refine");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hello\n/refine\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("refine: added memory note"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_session_command_lists_every_session() {
+    let state_dir = common::TempDir::new("repl-session-list");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+    let other_id = common::session_new(state_dir.path(), Some("other"));
+
+    let out = run_repl(state_dir.path(), &session_id, "/session\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&session_id), "got: {stdout}");
+    assert!(stdout.contains(&other_id), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_model_command_lists_configured_providers() {
+    let state_dir = common::TempDir::new("repl-model-list");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/model\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ollama"), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_reload_command_explains_context_files_are_already_fresh() {
+    let state_dir = common::TempDir::new("repl-reload");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/reload\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already re-read fresh on every turn"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_new_command_switches_this_repl_to_a_brand_new_session() {
+    let state_dir = common::TempDir::new("repl-new");
+    common::daemon_start(state_dir.path());
+    let original_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &original_id, "/new second\nhello\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("switched to new session"), "got: {stdout}");
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+
+    // "hello" must have landed on the *new* session, not the original one.
+    let original_listing = common::run(state_dir.path(), &["session", "list"]);
+    let original_stdout = common::stdout_string(&original_listing);
+    let original_line = original_stdout
+        .lines()
+        .find(|l| l.starts_with(&original_id))
+        .unwrap_or("");
+    assert!(original_line.contains("turns=0"), "got: {original_stdout}");
+    assert!(
+        original_stdout.contains("second") && original_stdout.contains("turns=2"),
+        "got: {original_stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_resume_command_switches_this_repl_to_an_existing_session() {
+    let state_dir = common::TempDir::new("repl-resume");
+    common::daemon_start(state_dir.path());
+    let session_a = common::session_new(state_dir.path(), None);
+    let session_b = common::session_new(state_dir.path(), None);
+
+    // Two separate REPL runs, not one: `/resume` and the follow-up
+    // prompt sent together in a single burst can race the same
+    // "queued behind an in-flight prompt" window
+    // `repl_new_refuses_to_switch_while_a_message_is_still_queued_
+    // behind_it` deliberately exercises -- an earlier version of this
+    // test hit that guard by accident when "hello a" was piped in the
+    // same burst as `/resume`. Each run below starts idle, so its own
+    // first line dispatches immediately with nothing queued behind it.
+    let out = run_repl(state_dir.path(), &session_a, "hello a\n");
+    common::assert_success("session repl", &out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("echo: hello a"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let input = format!("/resume {session_b}\nhello b\n");
+    let out = run_repl(state_dir.path(), &session_a, &input);
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("resumed session"), "got: {stdout}");
+    assert!(stdout.contains("echo: hello b"), "got: {stdout}");
+
+    let listing = common::run(state_dir.path(), &["session", "list"]);
+    let listing_stdout = common::stdout_string(&listing);
+    let a_line = listing_stdout
+        .lines()
+        .find(|l| l.starts_with(&session_a))
+        .unwrap_or("");
+    let b_line = listing_stdout
+        .lines()
+        .find(|l| l.starts_with(&session_b))
+        .unwrap_or("");
+    assert!(a_line.contains("turns=2"), "got: {listing_stdout}");
+    assert!(b_line.contains("turns=2"), "got: {listing_stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_resume_command_with_an_unknown_id_reports_a_conflict_and_stays_put() {
+    let state_dir = common::TempDir::new("repl-resume-unknown");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/resume sess-bogus\nhello\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("failed to resume"), "got: {stdout}");
+    // Never switched -- "hello" still landed on the original session.
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=2"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_new_refuses_to_switch_while_a_message_is_still_queued_behind_it() {
+    // "hello" starts a real in-flight prompt; "/new" and "world" both
+    // arrive while it's still generating and get queued behind it (the
+    // same reliable-in-practice race `repl_queues_lines_typed_while_a_
+    // reply_is_still_in_flight` already exercises). Once "hello"
+    // finishes, "/new" is dequeued and dispatched -- but "world" is
+    // still sitting in the queue behind it, so `/new` must refuse to
+    // switch sessions rather than silently strand "world".
+    let state_dir = common::TempDir::new("repl-new-guard");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "hello\n/new second\nworld\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("let those finish before switching sessions"),
+        "got: {stdout}"
+    );
+    assert!(!stdout.contains("switched to new session"), "got: {stdout}");
+    // Both prompts landed on the *original* session.
+    assert!(stdout.contains("echo: hello"), "got: {stdout}");
+    assert!(stdout.contains("echo: world"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=4"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn repl_stops_at_an_explicit_exit_line_without_reaching_eof() {
     let state_dir = common::TempDir::new("repl-exit");
     common::daemon_start(state_dir.path());

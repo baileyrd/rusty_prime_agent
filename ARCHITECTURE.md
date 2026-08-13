@@ -948,6 +948,38 @@ Two real hazards surfaced building this, not assumed away:
   commands -- see `PARITY.md`'s own entry for why that residual gap is
   stated rather than silently left uncovered.
 
+## Slash-command surface
+
+Every REPL slash command wires directly into an existing top-level
+`client::` function -- no daemon/worker/protocol change for any of
+them. Five just call an existing function once, the same one-line shape
+`/tree`/`/compact` already established: `/name <text>` →
+`session_rename`, `/refine` → `session_refine`, `/session` →
+`session_list` (every session, not `prime-agent`'s own full interactive
+picker), `/model` → `model_list` (configured providers, not mid-session
+switching), `/reload` → a plain confirmation (`session::build_turns`
+already re-reads context files fresh every turn; there's no staleness
+to actually fix).
+
+`/new [name]` and `/resume <id>` are the one real exception: they
+change *which session* the rest of this same REPL process operates on,
+so `client::session_repl`'s own `session_id` parameter is a `let mut`
+local rather than fixed for the whole function. `/new` calls the same
+`create_session` helper `client::session_new` itself uses, with only an
+optional display name -- every other creation-time flag is left out of
+this REPL slice on purpose. `/resume <id>` calls `fetch_transcript_snapshot`
+to both validate the target exists and get its transcript to replay, in
+one call -- an unknown id reports a conflict and the loop stays on its
+current session rather than switching to nothing.
+
+Both guard against increment #79's own queue: `if current.is_some() ||
+!queue.is_empty() { ... refuse ... }` before switching. Without this, a
+message that was queued (behind an earlier in-flight prompt) alongside
+`/new`/`/resume` itself would silently land on whichever session ends
+up active once the switch completes -- surprising, and specifically the
+kind of cross-increment interaction worth guarding against explicitly
+rather than leaving as an accident of evaluation order.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

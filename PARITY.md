@@ -952,6 +952,93 @@ daemon/worker split rather than requiring the Python control environment:
   line -- a startup race in the pre-existing raw-mode foundation from
   task #76, not something this increment introduced, and not reachable
   by any real human typing at a real terminal.)
+- [x] **Interactive TUI: full slash-command surface.** A scoping pass
+  over `prime-agent`'s own ~23-command slash table (rather than treating
+  "and more" from `CLAIMS_AUDIT.md`'s own earlier partial listing as the
+  final word) sorted every remaining named command into three real
+  buckets: commands with an existing `client::` function ready to wire
+  in with zero new capability, commands buildable with real (if
+  non-trivial) restructuring, and commands genuinely blocked on a
+  missing subsystem this project doesn't have.
+
+  **Wired in, zero new capability, same one-call shape every prior REPL
+  command uses** (`/fork`/`/tree`/`/compact` above): `/name <text>` →
+  the existing `session_rename`; `/refine` → the existing
+  `session_refine` (the Continual Harness, see that entry above);
+  `/session` → the existing `session_list`, a bounded slice of
+  `prime-agent`'s `/session` picker (lists every session, the same as
+  `harness session list`; not the full interactive search/sort/rename/
+  delete-via-trash surface `sessions.md` documents -- there's no soft-
+  delete primitive anywhere in this project, and no interactive picker
+  UI, the same `termctl` cursor-positioning gap the rich-editor entry
+  above already names); `/model` → the existing `model_list`, a bounded
+  slice of `prime-agent`'s `/model` (lists configured providers, not
+  mid-session switching -- see "Needs a new subsystem" below); `/reload`
+  → not a missing-wiring gap at all, just a REPL command confirming in
+  words what `session::build_turns` already does every single turn
+  (re-reads `AGENTS.md`/`CLAUDE.md`/`SYSTEM.md` fresh) -- investigated
+  rather than assumed stale, since a literal "nothing to reload" surprise
+  is worse than silence for a command a `prime-agent` user might
+  reasonably still type out of habit.
+
+  **Built with real restructuring, not just wiring**: `/new [name]` and
+  `/resume <id>`, bounded parity with `prime-agent`'s own `/new`/
+  `/resume` (`-c`/`-r [path|id]`). Both switch which session *this same
+  REPL process* operates on for the rest of the run -- `session_repl`'s
+  own `session_id` parameter had to become a `let mut` local (previously
+  fixed for the whole function) for either to be possible at all. `/new`
+  reuses `create_session` (the same helper `session_new` itself calls)
+  with only an optional display name -- every other `session new` flag
+  (`--model`/`--goal`/`--thinking`/`--tools`/`--runtime`) is deliberately
+  left out of this REPL slice, the same "extract the tractable
+  mechanism, leave the rich surface out" bound `session spawn`/prompt
+  templates already use elsewhere. `/resume <id>` validates the target
+  exists (`fetch_transcript_snapshot`, the same call the REPL's own
+  startup snapshot uses) before actually switching, so a typo never
+  leaves the loop pointed at a session that doesn't exist -- reported the
+  same conflict `session attach` would give, not a silent no-op. Both
+  refuse to switch while a prompt is in flight or a message is still
+  queued behind the switch command itself (`current.is_some() ||
+  !queue.is_empty()`, increment #79's own state) rather than silently
+  stranding a queued follow-up on whichever session happened to be
+  active when it finally got sent -- a real interaction between this
+  increment and the previous one, found by reasoning through what queued
+  input means for a command that changes *which session* subsequent
+  input targets, not assumed away.
+
+  **Genuinely new capability, not previously named by their own bullet**
+  -- worth stating honestly rather than leaving as an unlabeled gap:
+  **`/model <name>`** (mid-session model switching) and **`/effort
+  <level>`** (mid-session thinking-level cycling) both need a real
+  protocol change (a new `Request` variant plus daemon/worker handling
+  to mutate an already-running session's model/thinking-level) that
+  doesn't exist in any form today -- model and thinking level are fixed
+  at `session new` time, full stop. **`/usage`** needs a token/cost data
+  model that was never tracked in the first place: no
+  `usage_tokens`/`token_usage`/`cost_usd` field exists anywhere in
+  `protocol.rs`/`session.rs` (confirmed by direct search, not inferred),
+  so there's nothing for a `/usage` command to display even in a bounded
+  form. **`/mcp login|logout`** needs an MCP-server-scoped enable/disable
+  primitive that doesn't exist either -- MCP tool access is unconditional
+  today, on or off only at the whole-session `--tools mcp` level.
+
+  Verified with 9 new CI-safe `tests/repl.rs` integration tests: one per
+  trivially-wired command (`/name`, `/refine`, `/session`, `/model`,
+  `/reload`), one proving `/new` actually switches sessions (the new
+  session gets the turn, the original session's turn count stays at
+  zero), one proving `/resume` switches to a real existing session and
+  reports a conflict (staying on the current session) for an unknown id,
+  and one proving the busy-guard: a message queued behind `/new` itself
+  (both queued while an earlier prompt is still in flight, the same
+  reliable-in-practice race increment #79's own test exercises) makes
+  `/new` refuse to switch, and the queued message correctly lands on the
+  *original* session once dequeued. One test-authoring lesson from
+  writing these, not a product bug: an earlier draft of the `/resume`
+  test piped its setup prompt and the `/resume` line in the same burst,
+  accidentally triggering the exact busy-guard race the *other* new test
+  deliberately exercises -- split into two separate REPL runs (an idle
+  REPL's own first line never races anything) once the cause was
+  understood, rather than loosening the guard to make the test pass.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
@@ -2253,6 +2340,21 @@ attempted here, and not silently implied by anything in
   "Bounded candidates" batches' own "cancel primitive" entry), not
   something the REPL's own input-handling increment can absorb as a
   side effect.
+- **Mid-session `/model`/`/effort` switching, `/usage`, `/mcp
+  login|logout`.** Surfaced (not previously named as their own bullet)
+  while scoping the "full slash-command surface" entry above. Model and
+  thinking level are fixed at `session new` time -- no `Request` variant
+  or daemon/worker handler exists to mutate either on an already-running
+  session, so `/model <name>`/`/effort <level>` each need a real
+  protocol change, not just REPL wiring (the bare, read-only `/model`
+  that lists configured providers is done -- see the entry above).
+  `/usage` needs a token/cost data model that plainly doesn't exist: no
+  `usage_tokens`/`token_usage`/`cost_usd` field anywhere in
+  `protocol.rs`/`session.rs`, confirmed by direct search rather than
+  inferred from a missing command. `/mcp login|logout` needs an
+  MCP-server-scoped enable/disable primitive that also doesn't exist --
+  MCP tool access is unconditional today, on or off only at the whole-
+  session `--tools mcp` level.
 - `/clone` (live-state duplication) stays out of scope for
   the reasons given above and in the medium-effort section's `session
   fork` entry -- a running kernel connection or MCP session dies with
