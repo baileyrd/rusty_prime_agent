@@ -2558,6 +2558,62 @@ daemon/worker split rather than requiring the Python control environment:
   "you still have to act to actually reach the new code" caveat
   `/login`'s own entry above already established for an `auth.json`
   edit.
+- [x] **Telemetry: opt-in settings + local-only stub.** `CLAIMS_AUDIT.md`'s
+  own `settings.md` audit previously confirmed `telemetry.*` entirely
+  absent from `Settings` -- checked directly against the struct's
+  complete field list, not inferred. `prime-agent`'s real telemetry
+  presumably configures *where* usage events get sent, to some analytics
+  collector this project has no equivalent of -- the same "nothing on
+  the other end" shape `/login`'s missing OAuth backend and
+  `self_update`'s missing release channel both already have, two entries
+  above. Rather than inventing a fake destination to send anything to,
+  this builds the one honest thing that's actually implementable without
+  one: an explicit opt-in toggle plus a genuine, structurally
+  local-only sink.
+
+  `Settings` gains one new field, `telemetry_enabled: Option<bool>`
+  (`None`/`Some(false)` both mean off -- opt-in, not opt-out, matching
+  this entry's own title). New `src/telemetry.rs`: `telemetry::
+  record(state_root, event, session_id, data)` checks that setting
+  fresh on every call (no caching, same as every other `settings::load`
+  consumer) and, only when it's `true`, appends one JSON line to
+  `<state_root>/telemetry.jsonl`. "Local-only" is a structural property
+  of the module, not a configuration choice worth re-checking later --
+  there is no HTTP client, no collector URL, no network call anywhere in
+  `telemetry.rs` at all, confirmed by the module's own small size rather
+  than merely asserted; enabling telemetry can only ever grow a local
+  file, and nothing in this project ever reads it back out.
+
+  Two event kinds wired from real call sites, not fabricated for this
+  feature: `session_created` (one event per new session, from
+  `AgentSession::create` -- not `recover`, the same "new root session
+  only" precedent `NewSessionMeta::goal`'s own doc comment already
+  established for goal seeding) and `prompt` (one event per completed
+  `prompt_with_images` call, recording `ok` and how many tool-call
+  rounds it took, on both the success and error path -- the public
+  method is now a thin wrapper around a renamed `..._inner` that does
+  the actual work, so the telemetry call runs exactly once per turn
+  regardless of which of the loop's several return points was taken).
+  Failures writing the file are silently swallowed -- a telemetry write
+  must never turn an otherwise-successful session operation into a
+  failure.
+
+  Verified two ways: `src/telemetry.rs`'s own unit tests exercise
+  `record` directly (writes nothing when unset, writes nothing when
+  explicitly `false`, appends one well-formed JSON line per call when
+  `true`, omits `session_id` when `None`), and a new `tests/telemetry.rs`
+  drives the real daemon/worker/`EchoProvider` path end to end: telemetry
+  off by default writes nothing, explicitly `false` writes nothing, and
+  `true` produces both a `session_created` and a `prompt` event in
+  `telemetry.jsonl` with the real session id and a `tool_rounds` count
+  that actually reflects what happened.
+
+  Still genuinely absent: any event for `session recover`/`session
+  stop`/tool-call-level granularity, an anonymous installation ID (or
+  any ID at all -- events carry a real session id, not an anonymized
+  one), any aggregation/summary view over the raw JSONL, and any actual
+  transmission anywhere -- there is nothing to disable for privacy
+  beyond simply never setting `telemetry_enabled` in the first place.
 
 ## Needs a new subsystem
 

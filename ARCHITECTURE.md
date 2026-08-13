@@ -530,6 +530,35 @@ hardcoded default -- one more fallback tier under what was already there,
 not a new precedence model. Global only, same cwd-visibility reason
 `skills::discover`/`read_context_file` are.
 
+## Telemetry (`telemetry_enabled`, `telemetry.jsonl`)
+
+Bounded, opt-in parity with a slice of `prime-agent`'s own `telemetry.*`
+settings key family -- see `PARITY.md` for the full story, including why
+the real thing (configuring where events get sent) doesn't translate:
+this project has no analytics collector to send anything to.
+
+`Settings::telemetry_enabled: Option<bool>` (`settings.json`, same
+permissive load as every other field there) gates `telemetry::
+record(state_root, event, session_id, data)` -- checked fresh on every
+call, no caching. Off (`None`/`Some(false)`, the default) is a pure
+no-op; `Some(true)` appends one JSON line (`{"ts_ms", "event",
+"session_id", ...data}`) to `<state_root>/telemetry.jsonl`. No network
+code exists anywhere in `telemetry.rs` -- "local-only" is a structural
+property of the module, not a setting that could be flipped to send
+data elsewhere.
+
+Two call sites, both inside `session.rs`: `AgentSession::create` records
+`session_created` once (not `recover` -- a resumed session isn't a new
+one), and `AgentSession::prompt_with_images` records one `prompt` event
+per completed turn with `{"ok": bool, "tool_rounds": u32}`. The public
+`prompt_with_images` is now a thin wrapper around a renamed
+`prompt_with_images_inner`, so the telemetry call runs exactly once
+regardless of which of the tool-calling loop's several return points
+produced the result, on both the success and error path. Failures
+writing the file (missing directory, serialization error) are silently
+swallowed inside `record` itself -- telemetry is never allowed to turn
+an otherwise-successful session operation into a failure.
+
 ## `auth.json`
 
 Parity with `prime-agent`'s own `auth.json` -- see `PARITY.md` for the

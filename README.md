@@ -340,17 +340,29 @@ on every read (no restart needed):
 {
   "compact_trigger_tokens": 4000,
   "compact_keep_recent_tokens": 1500,
-  "theme": "dark"
+  "theme": "dark",
+  "telemetry_enabled": false
 }
 ```
 
-Covers the two automatic-compaction thresholds plus `theme` (parity with
-`prime-agent`'s own `settings.json`, narrower today). An env var still
-wins when both are set; a missing or malformed file is treated as "no
-settings" rather than an error. Global only, same cwd-visibility reason
-`--runtime ipython` skills and context files don't have a project-local
-tier either. Unlike the two compaction fields (checked fresh on every
-read), `theme` is read once at `session repl` startup -- no live reload.
+Covers the two automatic-compaction thresholds, `theme`, and
+`telemetry_enabled` (parity with `prime-agent`'s own `settings.json`,
+narrower today). An env var still wins when both are set; a missing or
+malformed file is treated as "no settings" rather than an error. Global
+only, same cwd-visibility reason `--runtime ipython` skills and context
+files don't have a project-local tier either. Unlike the two compaction
+fields (checked fresh on every read), `theme` is read once at `session
+repl` startup -- no live reload.
+
+`telemetry_enabled` is opt-in: absent or `false` (the default) means
+nothing is ever recorded. Set it to `true` and this project appends one
+JSON line per event -- `session_created` (once per new session) and
+`prompt` (once per completed turn, with `ok`/`tool_rounds`) -- to
+`<state-dir>/telemetry.jsonl`. Nothing is ever sent anywhere: there's no
+collector this project's telemetry could report to (unlike
+`prime-agent`'s own, presumably-hosted `telemetry.*`), so "local-only" is
+a structural fact about this feature, not a promise about a network call
+that just happens to be disabled.
 
 `theme` is `"dark"`/`"light"` (this project's two built-ins) or a path to
 a custom theme JSON file (`{"name", "vars", "colors"}`, every one of a

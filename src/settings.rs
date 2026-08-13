@@ -21,13 +21,13 @@
 //! rather than copying `prime-agent`'s own camelCase verbatim -- a
 //! deliberate consistency choice, not an oversight.
 //!
-//! The only fields today are the two compaction thresholds -- the only
-//! tunables this project has that make sense as a persistent default
-//! rather than a one-off override. `prime-agent`'s own `settings.json`
+//! Fields today: the two compaction thresholds, `theme` (see `theme`'s
+//! own module doc comment), and `telemetry_enabled` (see `telemetry`'s
+//! own module doc comment). `prime-agent`'s own `settings.json` still
 //! covers real estate this project has no equivalent knob for at all
-//! (`enabled`/telemetry, retry policy, ...) and isn't attempted here;
-//! more fields can be added the same way these two were, as this
-//! project grows more tunables worth persisting.
+//! (retry policy, `branchSummary.*`, ...) and isn't attempted here; more
+//! fields can be added the same way these were, as this project grows
+//! more tunables worth persisting.
 
 use std::path::Path;
 
@@ -48,6 +48,16 @@ pub struct Settings {
     /// same "no live reload" stance the two fields above already have.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Opt-in switch for the local-only telemetry stub -- parity with a
+    /// bounded slice of `prime-agent`'s own `telemetry.*` settings key
+    /// family. `None`/`Some(false)` (the default -- unset reads as off,
+    /// same "absent means not configured" stance every other `Option`
+    /// field here already has) means `telemetry::record` never writes
+    /// anything; only an explicit `Some(true)` turns it on. See
+    /// `telemetry`'s own module doc comment for what "local-only" means
+    /// structurally, not just as a configuration choice.
+    #[serde(default)]
+    pub telemetry_enabled: Option<bool>,
 }
 
 /// Reads and parses `<state_root>/settings.json`. Never fails: a
@@ -108,6 +118,22 @@ mod tests {
         let root = temp_state_root("theme-field");
         std::fs::write(root.join("settings.json"), r#"{"theme": "light"}"#).unwrap();
         assert_eq!(load(&root).theme, Some("light".to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parses_the_telemetry_enabled_field() {
+        let root = temp_state_root("telemetry-field");
+        std::fs::write(root.join("settings.json"), r#"{"telemetry_enabled": true}"#).unwrap();
+        assert_eq!(load(&root).telemetry_enabled, Some(true));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn telemetry_enabled_defaults_to_none_when_absent() {
+        let root = temp_state_root("telemetry-field-absent");
+        std::fs::write(root.join("settings.json"), "{}").unwrap();
+        assert_eq!(load(&root).telemetry_enabled, None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

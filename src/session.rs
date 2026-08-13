@@ -401,6 +401,18 @@ impl AgentSession {
             has_pre_tool_call_hook: false,
         };
         session.write_state().await?;
+        // Opt-in, local-only telemetry -- see `telemetry`'s own module
+        // doc comment. A no-op unless `settings.json` has
+        // `"telemetry_enabled": true`; `create` (not `recover`) is the
+        // one moment a session genuinely comes into existence, the same
+        // "new root session only" precedent `NewSessionMeta::goal`'s own
+        // doc comment already established for goal seeding.
+        crate::telemetry::record(
+            state_root,
+            "session_created",
+            Some(&session.state.session_id),
+            serde_json::json!({}),
+        );
         Ok(session)
     }
 
@@ -536,16 +548,43 @@ impl AgentSession {
     /// through `build_turns`/the provider call the same way `text`
     /// already is; `prompt` itself is just this with `images: None`, so
     /// every existing caller (and every existing test) is unaffected.
+    ///
+    /// A thin wrapper around [`prompt_with_images_inner`](Self::
+    /// prompt_with_images_inner) that records one opt-in, local-only
+    /// `"prompt"` telemetry event (see `telemetry`'s own module doc
+    /// comment) after every call, success or failure -- a `match`
+    /// instead of `?` specifically so the telemetry call still runs on
+    /// the error path, then the original `Result` is returned unchanged.
     pub async fn prompt_with_images(
         &mut self,
         text: String,
         images: Option<Vec<String>>,
+    ) -> Result<TranscriptEntry> {
+        let mut tool_rounds = 0u32;
+        let result = self
+            .prompt_with_images_inner(text, images, &mut tool_rounds)
+            .await;
+        crate::telemetry::record(
+            &self.state_root,
+            "prompt",
+            Some(&self.state.session_id),
+            serde_json::json!({"ok": result.is_ok(), "tool_rounds": tool_rounds}),
+        );
+        result
+    }
+
+    async fn prompt_with_images_inner(
+        &mut self,
+        text: String,
+        images: Option<Vec<String>>,
+        tool_rounds: &mut u32,
     ) -> Result<TranscriptEntry> {
         self.append_user_turn_with_images(text, images).await?;
         let tools = self.enabled_tool_defs().await?;
 
         const MAX_TOOL_ROUNDS: usize = 8;
         for _ in 0..MAX_TOOL_ROUNDS {
+            *tool_rounds += 1;
             self.maybe_compact().await?;
             let turns = self.build_turns();
             let ProviderResponse { reply, usage } = self.provider.respond(&turns, &tools).await?;
