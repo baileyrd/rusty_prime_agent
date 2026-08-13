@@ -75,6 +75,11 @@ pub enum Command {
     SessionPrompt {
         session_id: String,
         text: String,
+        /// `--image <path>` (repeatable) -- parity with a bounded slice
+        /// of `prime-agent`'s image-paste feature. See
+        /// `protocol::TranscriptEntry::images`'s own doc comment for the
+        /// shape these get loaded into.
+        image_paths: Vec<String>,
     },
     SessionStop {
         session_id: String,
@@ -383,13 +388,36 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     .next()
                     .cloned()
                     .ok_or_else(|| usage("`session prompt` requires a session id"))?;
-                let text: Vec<String> = it.cloned().collect();
-                if text.is_empty() {
-                    return Err(usage("`session prompt` requires prompt text"));
+                // `--image <path>` is repeatable and can appear anywhere
+                // among the free-text words, unlike `scan_named_flag`'s
+                // own single-occurrence assumption -- so this is parsed
+                // by hand rather than reusing it, the same "only write a
+                // bespoke parser when the shared one's shape doesn't fit"
+                // reasoning `/fork`'s own REPL argument parser uses.
+                let rest: Vec<String> = it.cloned().collect();
+                let mut image_paths = Vec::new();
+                let mut text_words = Vec::new();
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "--image" {
+                        let path = rest
+                            .get(i + 1)
+                            .cloned()
+                            .ok_or_else(|| usage("--image requires a value"))?;
+                        image_paths.push(path);
+                        i += 2;
+                    } else {
+                        text_words.push(rest[i].clone());
+                        i += 1;
+                    }
+                }
+                if text_words.is_empty() && image_paths.is_empty() {
+                    return Err(usage("`session prompt` requires prompt text or --image"));
                 }
                 Ok(Command::SessionPrompt {
                     session_id,
-                    text: text.join(" "),
+                    text: text_words.join(" "),
+                    image_paths,
                 })
             }
             Some("stop") => {

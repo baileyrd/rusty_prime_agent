@@ -293,8 +293,12 @@ impl Supervisor {
             Request::SessionAttach { session_id } => {
                 self.handle_session_attach(&mut conn, session_id).await
             }
-            Request::SessionPrompt { session_id, text } => {
-                self.handle_session_prompt(&mut conn, session_id, text)
+            Request::SessionPrompt {
+                session_id,
+                text,
+                images,
+            } => {
+                self.handle_session_prompt(&mut conn, session_id, text, images)
                     .await
             }
             Request::SessionStop { session_id } => {
@@ -890,6 +894,7 @@ impl Supervisor {
                 &Request::SessionPrompt {
                     session_id: session_id.to_string(),
                     text,
+                    images: None,
                 },
             )
             .await?;
@@ -1028,6 +1033,7 @@ impl Supervisor {
         conn: &mut LineStream,
         session_id: String,
         text: String,
+        images: Option<Vec<String>>,
     ) -> Result<()> {
         let socket_path = match self.resolve_worker(conn, &session_id).await? {
             Some(p) => p,
@@ -1037,7 +1043,11 @@ impl Supervisor {
         private
             .write_request(
                 Context::Worker,
-                &Request::SessionPrompt { session_id, text },
+                &Request::SessionPrompt {
+                    session_id,
+                    text,
+                    images,
+                },
             )
             .await?;
         let response = private

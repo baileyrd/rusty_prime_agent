@@ -480,8 +480,22 @@ impl AgentSession {
     /// assistant note instead of erroring, so the client still gets a
     /// coherent ack.
     pub async fn prompt(&mut self, text: String) -> Result<TranscriptEntry> {
-        self.append(Role::User, text, None, None, None, None)
-            .await?;
+        self.prompt_with_images(text, None).await
+    }
+
+    /// Identical to [`prompt`](Self::prompt) except the user's own turn
+    /// can carry `images` alongside its text -- parity with a bounded
+    /// slice of `prime-agent`'s image-paste feature, see `PARITY.md`'s
+    /// own "Interactive TUI: image paste support" entry. Threaded
+    /// through `build_turns`/the provider call the same way `text`
+    /// already is; `prompt` itself is just this with `images: None`, so
+    /// every existing caller (and every existing test) is unaffected.
+    pub async fn prompt_with_images(
+        &mut self,
+        text: String,
+        images: Option<Vec<String>>,
+    ) -> Result<TranscriptEntry> {
+        self.append_user_turn_with_images(text, images).await?;
         let tools = self.enabled_tool_defs().await?;
 
         const MAX_TOOL_ROUNDS: usize = 8;
@@ -1229,6 +1243,7 @@ impl AgentSession {
             &Request::SessionPrompt {
                 session_id: to_id.clone(),
                 text: prefixed,
+                images: None,
             },
         )
         .await?;
@@ -1386,6 +1401,7 @@ impl AgentSession {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                images: None,
             });
         }
         if let Some(compaction) = &self.state.compaction {
@@ -1398,6 +1414,7 @@ impl AgentSession {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                images: None,
             });
         }
         turns.extend(
@@ -1426,6 +1443,7 @@ impl AgentSession {
                         tool_calls: entry.tool_calls.clone(),
                         tool_call_id: entry.tool_call_id.clone(),
                         name: entry.name.clone(),
+                        images: entry.images.clone(),
                     }
                 }),
         );
@@ -1528,6 +1546,7 @@ impl AgentSession {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: None,
         }];
         // This call's own `usage` isn't recorded anywhere: it produces a
         // `Role::System` compaction-summary entry, not a `Role::
@@ -1580,6 +1599,7 @@ impl AgentSession {
             timestamp_ms: now_ms(),
             role,
             text,
+            images: None,
             tool_calls,
             tool_call_id,
             name,
@@ -1587,6 +1607,34 @@ impl AgentSession {
             child_usage_attributed: None,
             // Overwritten unconditionally by `append_entry` itself --
             // see that function's own doc comment.
+            parent_sequence: None,
+            branch_summary: None,
+        })
+        .await
+    }
+
+    /// The one caller that needs `images` on its own append --
+    /// `prompt_with_images`'s user turn. Kept as its own small method
+    /// (rather than adding an `images` parameter to `append` itself, which
+    /// every other caller would then have to pass `None` for, and which
+    /// would push `append` past clippy's 7-argument limit) since nothing
+    /// else in this project ever builds a non-`None`-images entry.
+    async fn append_user_turn_with_images(
+        &mut self,
+        text: String,
+        images: Option<Vec<String>>,
+    ) -> Result<TranscriptEntry> {
+        self.append_entry(TranscriptEntry {
+            sequence: self.state.last_sequence + 1,
+            timestamp_ms: now_ms(),
+            role: Role::User,
+            text,
+            images,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            usage: None,
+            child_usage_attributed: None,
             parent_sequence: None,
             branch_summary: None,
         })
@@ -1606,6 +1654,7 @@ impl AgentSession {
             timestamp_ms: now_ms(),
             role: Role::System,
             text: String::new(),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -1645,7 +1694,7 @@ impl AgentSession {
         // not an error -- the transcript write above is what actually
         // makes this turn durable.
         let _ = self.events.send(SessionEvent::Turn {
-            entry: entry.clone(),
+            entry: Box::new(entry.clone()),
         });
         Ok(entry)
     }
@@ -1767,6 +1816,7 @@ impl AgentSession {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: None,
         }];
         let summary = match self.provider.respond(&ask, &[]).await?.reply {
             ProviderReply::Text(text) => text,
@@ -1793,6 +1843,7 @@ impl AgentSession {
             timestamp_ms: now_ms(),
             role: Role::System,
             text: String::new(),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -2160,6 +2211,7 @@ mod tests {
             timestamp_ms: 0,
             role: Role::User,
             text: text.to_string(),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -3187,6 +3239,67 @@ mod tests {
         assert_eq!(recorded.entry_count, 1);
         assert_eq!(recorded.summary, summary);
         assert_eq!(session.state.active_leaf_sequence, Some(appended.sequence));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn prompt_with_images_persists_images_on_the_user_turn_and_reaches_the_provider() {
+        let root = temp_state_root("prompt-with-images");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-prompt-images".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let images = vec![
+            "data:image/png;base64,AAAA".to_string(),
+            "data:image/png;base64,BBBB".to_string(),
+        ];
+        let reply = session
+            .prompt_with_images("what's in these?".to_string(), Some(images.clone()))
+            .await
+            .unwrap();
+
+        // `EchoProvider` mentions the image count it saw on the request
+        // it was actually given -- proof `images` reached `build_turns`/
+        // the provider call, not just the persisted entry.
+        assert!(reply.text.contains("[+2 images]"), "got: {}", reply.text);
+
+        let user_entry = session
+            .transcript
+            .iter()
+            .find(|e| e.role == Role::User)
+            .expect("a user entry should exist");
+        assert_eq!(user_entry.images, Some(images));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn ordinary_prompt_carries_no_images() {
+        let root = temp_state_root("prompt-without-images");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-prompt-no-images".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session.prompt("hello".to_string()).await.unwrap();
+        let user_entry = session
+            .transcript
+            .iter()
+            .find(|e| e.role == Role::User)
+            .expect("a user entry should exist");
+        assert_eq!(user_entry.images, None);
 
         std::fs::remove_dir_all(&root).unwrap();
     }

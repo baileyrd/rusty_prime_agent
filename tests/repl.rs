@@ -375,3 +375,68 @@ fn repl_leaves_an_at_token_untouched_when_the_path_does_not_exist() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Parity with a bounded slice of `prime-agent`'s image-paste feature --
+/// see `PARITY.md`'s own "Interactive TUI: image paste support" entry.
+/// An `@<path>` token naming a real image file is left in the text as
+/// written (unlike a text-file reference, which gets inlined) and its
+/// content is instead carried out-of-band to the provider -- `EchoProvider`
+/// mentions the image count it actually received, proving the image
+/// reached `build_turns`/the provider call, not just that the REPL
+/// recognized the extension.
+#[test]
+fn repl_at_image_reference_is_attached_out_of_band_not_inlined() {
+    let state_dir = common::TempDir::new("repl-at-image");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let image = state_dir.path().join("photo.png");
+    std::fs::write(&image, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+    let image_str = image.to_str().unwrap();
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        &format!("what's in @{image_str} please\n"),
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("echo: what's in @{image_str} please [+1 image]")),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// `/file <path>` on an image path queues it the same out-of-band way
+/// `@<path>` does, instead of `/file`'s own ordinary text-inlining
+/// behavior -- see `pending_images`'s own doc comment.
+#[test]
+fn repl_file_command_on_an_image_path_queues_it_as_an_image() {
+    let state_dir = common::TempDir::new("repl-file-image");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let image = state_dir.path().join("shot.jpg");
+    std::fs::write(&image, [1, 2, 3, 4]).unwrap();
+    let image_str = image.to_str().unwrap();
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        &format!("/file {image_str}\ndescribe it\n"),
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("queued {image_str} as an image")),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("echo: describe it [+1 image]"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}

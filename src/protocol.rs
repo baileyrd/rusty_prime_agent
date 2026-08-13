@@ -119,6 +119,13 @@ pub enum Request {
     SessionPrompt {
         session_id: String,
         text: String,
+        /// Parity with a bounded slice of `prime-agent`'s image-paste
+        /// feature -- see `TranscriptEntry::images`'s own doc comment.
+        /// `None`/empty for every existing caller (the ordinary
+        /// text-only prompt path); populated only by the REPL's own
+        /// `/file`/`@`-reference image handling and `session prompt
+        /// --image <path>`.
+        images: Option<Vec<String>>,
     },
     /// Parity with `prime-agent stop <agent>`: gracefully shut down one
     /// session's worker without touching any other session or the
@@ -515,7 +522,11 @@ pub enum SessionEvent {
         transcript: Vec<TranscriptEntry>,
     },
     /// One new transcript entry appended after the snapshot was taken.
-    Turn { entry: TranscriptEntry },
+    /// Boxed for the same reason `Snapshot::state` is: `TranscriptEntry`
+    /// (now carrying `images` on top of its original fields) tripped
+    /// clippy's `large_enum_variant` against `SessionEvent`'s other,
+    /// much smaller variants.
+    Turn { entry: Box<TranscriptEntry> },
     /// A visible marker appended after recovering from a worker crash
     /// (daemon.md: "appends a visible recovery marker to the
     /// transcript").
@@ -625,6 +636,19 @@ pub struct TranscriptEntry {
     pub timestamp_ms: u64,
     pub role: Role,
     pub text: String,
+    /// Parity with a bounded slice of `prime-agent`'s image-paste
+    /// feature -- see `PARITY.md`'s "Interactive TUI: image paste
+    /// support" entry for the full story, including why `rp-server`'s
+    /// own multimodal wire types were already real (the missing half was
+    /// entirely this project's own text-only shapes). Each entry is a
+    /// `data:<mime>;base64,<...>` URI -- the exact shape `rp-server`'s
+    /// `ContentPart::ImageUrl` (and, through it, every backend it fronts)
+    /// already accepts inline, so no new wire shape was needed on that
+    /// side, only this field on this project's own persisted entry.
+    /// `#[serde(default)]` for the same pre-existing-transcript reason
+    /// every field added after Phase 1 has it.
+    #[serde(default)]
+    pub images: Option<Vec<String>>,
     /// Set only on a `Role::Assistant` entry that's a tool-call request
     /// (`text` is empty in that case) -- `#[serde(default)]` so
     /// `transcript.jsonl` files written before Increment 3 still parse.

@@ -423,3 +423,152 @@ fn ollama_provider_includes_agents_md_as_system_context() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// PNG/zlib CRC32, used only by this file's `write_solid_color_png` test
+/// fixture builder below -- hand-rolled rather than pulled in as a
+/// dependency for one test-only fixture, same "narrow, self-contained
+/// encoding concern" reasoning as `client.rs`'s own hand-rolled base64
+/// encoder.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// zlib's Adler-32, needed for the zlib wrapper around the PNG `IDAT`
+/// chunk's (uncompressed, "stored" DEFLATE block) payload.
+fn adler32(data: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(chunk_type);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+/// Builds a real, valid, decodable solid-color PNG -- not just bytes that
+/// merely start with the PNG magic number (that's all `tests/repl.rs`'s
+/// fixtures need, since those only exercise this project's own path/
+/// extension-based detection). This test needs a real vision model to
+/// actually decode pixel content, so the fixture has to be genuine:
+/// uncompressed ("stored") DEFLATE blocks inside a real zlib stream keep
+/// this self-contained (no new dependency) while still producing bytes
+/// any real PNG decoder accepts.
+fn write_solid_color_png(path: &std::path::Path, width: u32, height: u32, rgb: [u8; 3]) {
+    let mut raw = Vec::with_capacity((height * (1 + width * 3)) as usize);
+    let mut row = Vec::with_capacity((1 + width * 3) as usize);
+    row.push(0); // filter type: None
+    for _ in 0..width {
+        row.extend_from_slice(&rgb);
+    }
+    for _ in 0..height {
+        raw.extend_from_slice(&row);
+    }
+
+    let mut zlib = Vec::with_capacity(raw.len() + 8);
+    zlib.extend_from_slice(&[0x78, 0x01]); // zlib header: deflate, fastest
+    assert!(
+        raw.len() <= 0xFFFF,
+        "fixture too large for one stored block"
+    );
+    zlib.push(0x01); // BFINAL=1, BTYPE=00 (stored), byte-aligned
+    zlib.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+    zlib.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit depth, RGB, defaults
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    png_chunk(&mut png, b"IHDR", &ihdr);
+    png_chunk(&mut png, b"IDAT", &zlib);
+    png_chunk(&mut png, b"IEND", &[]);
+
+    std::fs::write(path, png).unwrap();
+}
+
+/// Real end-to-end proof of image-paste support (`--image`, see
+/// `PARITY.md`'s "Interactive TUI: image paste support" entry) actually
+/// reaching a real vision model, not just `EchoProvider`'s CI-safe
+/// `[+N image(s)]` echo (see `tests/image_paste.rs` for that half).
+/// Needs a real multimodal model -- `moondream` (`ollama pull moondream`)
+/// is small enough to run in this sandbox and does describe solid colors
+/// reliably in practice. Deliberately `#[ignore]`d for the same infra
+/// reasons as this file's other tests; run with e.g.:
+///
+/// ```sh
+/// RUSTY_PRIME_AGENT_MODEL=ollama/moondream:latest \
+///     cargo test --test ollama_provider ollama_provider_describes_a_real_image \
+///     -- --ignored --test-threads=1
+/// ```
+#[test]
+#[ignore]
+fn ollama_provider_describes_a_real_image() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL").expect(
+        "set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/moondream:latest) to run this ignored test",
+    );
+
+    let state_dir = common::TempDir::new("ollama-image-e2e");
+    let image_path = state_dir.path().join("red.png");
+    write_solid_color_png(&image_path, 64, 64, [220, 20, 20]);
+
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+
+    let out = common::run(
+        state_dir.path(),
+        &[
+            "session",
+            "prompt",
+            &session_id,
+            "--image",
+            image_path.to_str().unwrap(),
+            "What color is this image? Reply with one word.",
+        ],
+    );
+    common::assert_success("session prompt --image", &out);
+    let ack = common::stdout_string(&out);
+    assert!(
+        !ack.contains("] assistant: echo:"),
+        "reply looks like EchoProvider's output, not a real model's -- got: {ack}"
+    );
+    assert!(
+        ack.to_lowercase().contains("red"),
+        "expected the real vision model to identify the solid red image, got: {ack}"
+    );
+
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let snapshot = lines.join("\n");
+    assert!(
+        snapshot.contains("data:image/png;base64,"),
+        "expected the user entry to carry the base64 image, got: {snapshot}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
