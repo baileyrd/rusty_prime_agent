@@ -319,14 +319,20 @@ points worth calling out individually:
   byte-exact against a real `ipykernel`.
 - **Three Jupyter channels: shell, iopub, control -- control used
   specifically so a host-request reply doesn't deadlock a running
-  cell's `execute_request`.** -- **False, and this is the direct root
-  cause of the earlier "typed host request" finding.** `ipython_runtime.rs`
-  connects only `shell` and `iopub` sockets -- there is no control-channel
-  connection at all. This is exactly why `HEARTBEAT_MARKER` is a stdout
-  hack instead of a real host-request protocol: the mechanism
-  `rlm-runtime.md` describes for avoiding a shell-channel deadlock
-  (replying on `control` instead) isn't available here because the
-  control channel was never wired up.
+  cell's `execute_request`.** -- **Now True (was False).** Originally
+  found False: `ipython_runtime.rs` connected only `shell`/`iopub`, the
+  direct root cause of `HEARTBEAT_MARKER` being a stdout hack instead of
+  a real host-request protocol. **Closed**: `control` (DEALER, same
+  6-frame `<IDS|MSG>` framing as `shell`, confirmed by direct raw-socket
+  probing against a real `ipykernel` before writing any Rust) is now
+  connected in `start()`, with `send_control`/`recv_control` sharing
+  `build_signed_message` with `send_shell`/`recv_shell`. Given real,
+  immediate use in `shutdown()` (a graceful `shutdown_request` before
+  the process-kill fallback, also verified against a real kernel) rather
+  than sitting unused until the host-request protocol lands. The
+  `HEARTBEAT_MARKER` stdout hack is untouched for now -- generalizing it
+  into a real `host.request` comm protocol over this channel is the next
+  increment.
 - **Usage/cost attribution: child assistant usage folded into the parent
   turn via a `child_usage_attributed` transcript entry.** -- **False.**
   Confirmed absent by grep -- `session spawn` creates a fully independent

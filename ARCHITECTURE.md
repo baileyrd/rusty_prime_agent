@@ -224,8 +224,8 @@ process, never executes anything) unless it opts in via `session new
 --runtime ipython`, in which case it gets `ipython_runtime::
 IpythonKernelRuntime` -- a real, spawned Jupyter/IPython kernel
 subprocess (`python3 -m ipykernel_launcher`), driven over a hand-rolled
-ZMTP 3.0 client (`zmtp.rs`, NULL mechanism, `shell`/`iopub` sockets only)
-with HMAC-SHA256-signed messages (`sha256.rs`) -- see `PARITY.md`'s RLM
+ZMTP 3.0 client (`zmtp.rs`, NULL mechanism, `shell`/`iopub`/`control`
+sockets) with HMAC-SHA256-signed messages (`sha256.rs`) -- see `PARITY.md`'s RLM
 programming model entry for the full story (what was originally planned,
 what a `zeromq` crate `cargo tree` check ruled out, and what the
 hand-rolled alternative actually covers/still defers). `worker::

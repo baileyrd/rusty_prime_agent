@@ -748,11 +748,31 @@ daemon/worker split rather than requiring the Python control environment:
   request -- the fix checks `parent_header.msg_id` against the
   `execute_request`'s own `msg_id`, the same correlation a real Jupyter
   client performs, to tell a request's own iopub traffic apart from
-  everything else on the same broadcast socket. Only `shell`+`iopub` are
-  opened; `stdin` (kernel-side `input()`), `control` (interrupt/
-  `shutdown_request`), and `heartbeat` aren't implemented for this pass, so
-  `shutdown` tears the kernel down with a plain process kill rather than a
-  graceful control-channel request. The kernel subprocess is deliberately
+  everything else on the same broadcast socket.
+
+  **Later increment: the `control` channel.** `shell`+`iopub`+`control`
+  are now all opened (`stdin`/`heartbeat` remain out of scope). `control`
+  exists specifically to carry `comm_open`/`comm_msg` host-request replies
+  without deadlocking a running `shell` cell -- `rlm-runtime.md`'s own
+  stated reason for a second channel (`shell` processes messages
+  serially, so a reply sent there for a request that originated mid-cell
+  would never be read until that cell's own `execute_request` finished).
+  Confirmed by direct raw-socket probing against a real `ipykernel`
+  before writing any Rust that `control` answers with the exact same
+  6-frame `<IDS|MSG>` shape `shell` does, so `send_shell`/`recv_shell`'s
+  signing logic was factored into a shared `build_signed_message` rather
+  than duplicated for `send_control`/`recv_control`. Given real,
+  immediate use rather than sitting unused until the host-request
+  protocol itself lands: `shutdown` now attempts a graceful
+  `shutdown_request` over `control` first (bounded, best-effort --
+  confirmed by the same probing that the kernel replies
+  `{"status":"ok","restart":false}` and exits on its own), falling back
+  to the same plain process kill either way. The `HEARTBEAT_MARKER`
+  stdout hack (`session::execute_python_tool_call`) is untouched for
+  now -- generalizing it into a real `host.request` comm protocol over
+  this channel, and using that for a kernel-callable `rlm(...)`, is
+  tracked as the next increment in this series. The kernel subprocess is
+  deliberately
   left un-detached (unlike every other spawned process this project
   manages): it's meant to live and die with the one worker/session that
   owns it, which also means `ipykernel`'s own parent-poller kills it for
@@ -783,7 +803,9 @@ daemon/worker split rather than requiring the Python control environment:
   pointing `RUSTY_PRIME_AGENT_IPYTHON_BIN` at a binary name that can't
   exist.
 
-  Explicitly still not implemented: interrupt/cancel (needs `control`),
+  Explicitly still not implemented: interrupt/cancel (the `control`
+  channel itself is now wired, but nothing sends `interrupt_request` over
+  it yet -- a running cell still can't be cancelled mid-execution),
   kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
   `execute_result`'s `data` only ever reads `text/plain` here), and
   multi-kernel pooling beyond one kernel per session. Real `prime-agent`
