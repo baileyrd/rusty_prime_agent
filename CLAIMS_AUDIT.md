@@ -12,7 +12,20 @@ detailed than `PARITY.md`'s entries for the same features.
 The first pass below covers `prime-agent`'s top-level marketing copy and
 `architecture.md`. A second pass extends the same treatment to the four
 detailed docs `architecture.md` links out to: `daemon.md`,
-`agent-connection.md`, `rlm-runtime.md`, and `long-running-agents.md`.
+`agent-connection.md`, `rlm-runtime.md`, and `long-running-agents.md`. A
+third pass recursively follows every doc link reachable from `README.md`
+-- `README.md`'s own "Documentation" links plus `docs/index.md`'s full
+listing -- covering every remaining doc in `packages/coding-agent/docs/`:
+`quickstart.md`, `usage.md`, `sessions.md`, `session-format.md`, `rlm.md`,
+`skills.md`, `compaction.md`, `prompt-templates.md`, `json.md`, `rpc.md`,
+`acp.md`, `mcp-integrations.md`, `sdk.md`, `providers.md`,
+`custom-provider.md`, `models.md`, `settings.md`, `extensions.md`,
+`themes.md`, and `tui.md`. Docs that are pure OS/tooling setup
+instructions with no runtime-behavior claims to check (`keybindings.md`,
+`packages.md`, `shell-aliases.md`, `terminal-setup.md`, `termux.md`,
+`tmux.md`, `windows.md`, `development.md`) were read but produced no
+checkable claims and are omitted below.
+
 Claims that only describe TypeScript-specific implementation details
 (exact class/file names, benchmark scripts) with no architecturally
 meaningful analog to check are marked **N/A** rather than forced into a
@@ -385,6 +398,449 @@ points worth calling out individually:
   exists -- compaction is triggered automatically inside `maybe_compact`
   or not at all; the model cannot request it from code.
 
+## README additions (CLI command list, "Built for Long-Running Work")
+
+Claims not already covered by the marketing-copy/architecture passes
+above:
+
+- **"`prime-agent agents` -- Browse running, idle, and saved sessions."**
+  -- **Partial.** `session list` returns every session regardless of
+  status (Active/Stopped/Crashed all show up), but it's a flat text/JSON
+  dump, not a browsable picker.
+- **"`prime-agent attach <agent>` -- Reattach to a running session."** --
+  **True, and broader.** `session attach <id>` transparently respawns a
+  `Stopped` session or recovers a `Crashed` one via `ensure_worker_running`
+  (`src/daemon/mod.rs:175-204`) -- covers what upstream splits across
+  `attach` and `--resume`.
+- **"`prime-agent --resume <path|id>` -- Resume a saved session."** --
+  **False as a distinct flag.** No `--resume`/`-r` flag exists anywhere
+  in `cli.rs`; no path-based addressing exists at all, only UUIDs.
+- **"`prime-agent status`."** -- **True.** `daemon status` reports
+  `protocol_version`/`pid`/`generation`/`sessions_active`.
+- **"`prime-agent doctor [--fix]`."** -- **False.** Confirmed absent.
+- **"`prime-agent update [--force]`."** -- **False/N/A.** No self-update
+  subcommand exists.
+- **"`prime-agent shutdown [--force]`."** -- **Partial.** `daemon
+  shutdown` does stop every active worker and the `rp-server` sidecar,
+  matching the substance, but there's no `--force` flag -- shutdown is
+  always unconditional.
+- **"Direct agent-to-agent communication: ...can discover one another,
+  exchange messages, and steer active work."** -- **Partial.** `session
+  message`/`session children` deliver directly, but "steer active work"
+  has no analog -- `session_repl`'s stdin loop is fully synchronous, so
+  there's no way for one agent's message to interrupt another's in-flight
+  turn.
+
+## quickstart.md
+
+- **`ANTHROPIC_API_KEY` env var / `/login` API-key path.** -- **True in
+  substance** for the env-var half (`auth.json` with env-var precedence
+  already covered); OAuth `/login` already confirmed False.
+- **"Restart, or run `/reload`, after changing context files."** --
+  **Partial.** Restarting works (context files are re-read fresh every
+  `build_turns` call); no `/reload` command exists in `session_repl`.
+- **`prime-agent @README.md "Summarize this"` (`@file` CLI arguments).**
+  -- **False.** No `@`-prefixed file-argument parsing exists; `Print`
+  takes only free-text argv.
+- **Image paste, `!command` shell passthrough, `/model`/`/effort`
+  scoped-model cycling.** -- **False**, all three -- no image content
+  type, no `!`-dispatch, and model/thinking-level are fixed at `session
+  new` time with no mid-session change.
+- **"Continue Later": `-c`/`-r [path|id]`.** -- **False as top-level
+  flags** -- covered functionally by `session list` + `session attach`
+  instead.
+- **Non-interactive mode: `-p`, piped stdin, `--mode json`/`rpc`.** --
+  **Partial.** All exist and work, but `print_once` (`src/client.rs:
+  123-170`) never reads or merges piped stdin -- `text` comes only from
+  argv.
+
+## usage.md
+
+- **Interactive-mode UI (startup header, `--verbose`, footer, `/usage`),
+  editor features (`@` fuzzy search, Tab completion, image paste,
+  external-editor hotkey).** -- **False/N/A**, all of it -- `session_repl`
+  is a plain line-at-a-time stdin loop with no editor layer.
+- **Slash-command table (23 commands).** -- **Partial.** Only `/quit`
+  (aliased `/exit`), `/compact`, `/heartbeat`, a bounded `/fork`/`/file`/
+  `/export` exist. `/login`, `/model`, `/effort`, `/resume`, `/new`,
+  `/name`, `/session`, `/tree`, `/clone`, `/share`, `/reload`, and more
+  are absent from the REPL; some (`/refine`, `rename`) exist only as
+  top-level CLI subcommands instead.
+- **`/export [file]` exports to HTML.** -- **Partial.** `/export <path>`
+  exists but writes pretty-printed JSON, not HTML.
+- **`/share` (upload as a private gist).** -- **False**, already tracked
+  in `PARITY.md` ("nothing on the other end to send it to").
+- **Message queue (Enter=steering, Alt+Enter=follow-up, queue
+  reordering).** -- **False**, consistent with the already-tracked
+  "steering vs. follow-up queuing structurally absent" finding.
+- **Session flags: `-c`, `-r [path|id]`, `--no-session`, `--fork
+  <path|id>`.** -- **Partial.** None exist as top-level flags; `--fork`
+  exists only as the `session fork <id>` subcommand, keyed by UUID not
+  path.
+- **CLI command list: `agents`, `list [--all]`, `attach`, `stop`,
+  `rename`, `send`, `schedule`, `status`, `doctor`, `shutdown [--force]`,
+  `package install/remove/list/update`, `update [--force]`, `config`.**
+  -- **Partial.** `list`/`attach`/`stop`/`rename`/`schedule`/`status`/
+  `shutdown` map to real subcommands. `send` maps to `session message`
+  but requires an existing parent/child relationship rather than
+  addressing any agent freely. `doctor`, `update`, `package *`, and
+  `config` are all absent.
+- **Model options: `--provider`, `--model`, `--api-key`, `--thinking`,
+  `--models` (cycling).** -- **Partial.** `--model provider/id` and
+  `--thinking low|medium|high` exist. No `--provider` flag (provider is
+  only ever embedded in the `"provider/model"` string), no `--api-key`
+  flag, no `--models` cycling.
+- **Tool options: `--tools`/`-t <list>`, `--no-builtin-tools`,
+  `--no-tools`.** -- **Partial.** `--tools read|mcp` exists but accepts
+  only those two closed values, no short alias, no negation flags.
+- **Resource options: `-e`/`--extension`, `--skill <path>`,
+  `--prompt-template <path>`, `--theme <path>`, `--no-context-files`.**
+  -- **False**, all of them -- skills/prompt-templates exist only via
+  fixed on-disk discovery directories, with no path-flag override
+  surface, and Extensions/Themes don't exist as subsystems.
+- **Autonomous options: `--autonomous-max-continuations`,
+  `--autonomous-gate-retries`, `--autonomous-gate-timeout-ms`,
+  `--autonomous-max-tokens`.** -- **Partial.** `--max-turns
+  --max-time --quality-gate` all exist and run for real. No gate-retry/
+  gate-timeout tracking (one gate, checked every turn) and no
+  token-budget flag at all (this project's own doc comment says so
+  explicitly).
+- **`--cwd`, `--system-prompt`, `--append-system-prompt`, `--offline`.**
+  -- **False**, none exist; no working-directory override, and (per the
+  `SYSTEM.md` gap) no system-prompt object to replace or append to.
+
+## sessions.md
+
+- **"Sessions auto-save to `~/.prime/agent/sessions/`. Each session is a
+  JSONL file with a tree structure."** -- **Partial.** Auto-saves too,
+  but as a per-session *directory* (`state.json` + `transcript.jsonl`),
+  not one flat JSONL file -- and no tree structure (see session-format.md
+  below).
+- **Session picker (search, sort toggle, rename, delete-via-trash).** --
+  **False.** No interactive picker exists; `session list` is a flat
+  print and there's no delete command at all (only manual directory
+  removal).
+- **`/tree`/`/fork`/`/clone` comparison.** -- **Partial**, only the
+  `/fork` column has a real (bounded) analog -- `session fork` matches
+  reasonably well; `/tree` and `/clone` have none, already tracked as
+  structurally out of scope.
+
+## session-format.md
+
+- **"Sessions... form a tree structure via `id`/`parentId` fields,
+  enabling in-place branching."** -- **False.** `TranscriptEntry` has
+  only a linear `sequence: u64`, no `id`/`parentId` fields at all.
+- **File location: one `<session-id>.jsonl` file per session.** --
+  **False.** A directory with separate `state.json`
+  (pointer/recovery metadata) and `transcript.jsonl` (append-only log).
+- **Session version field / migration history (v1 -> v2 -> v3).** --
+  **N/A.** No version field exists; backward compatibility is handled
+  field-by-field via `#[serde(default)]` instead.
+- **Message type union (`UserMessage`/`AssistantMessage`/
+  `ToolResultMessage`/`BashExecutionMessage`/`BranchSummaryMessage`/
+  `CompactionSummaryMessage`, typed content blocks, per-message `Usage`
+  with cost).** -- **Partial.** `TranscriptEntry` has a flat `role`
+  enum (plus an extra `System` role upstream doesn't have) and a single
+  `text: String` field -- no typed content-block array, no image
+  content, and no per-message usage/cost object anywhere.
+- **`BranchSummaryEntry`, `ChildUsageAttributionEntry`, `LabelEntry`,
+  `AgentStatusEntry`, `GitStateEntry`.** -- **False.** None exist --
+  each depends on the tree structure, an extension system, or child
+  usage attribution, all already confirmed absent.
+
+## rlm.md
+
+- **The callable `rlm` object preloaded in kernel globals
+  (`await rlm(...)`, `.list_subagents()`, `.delete_subagent()`,
+  `.host_request(...)`).** -- **False**, entirely. `bootstrap_kernel`
+  only ever defines `rlm_heartbeat`; no `rlm` name of any kind exists in
+  kernel globals. This sharpens the earlier finding by naming the exact
+  missing primitive (`host_request`) rather than just "no `rlm(...)`."
+- **`goal`/`agent_message`/`compact` skills all calling
+  `rlm.host_request(...)`.** -- **False**, confirmed each has zero
+  kernel presence -- goal/compaction/messaging are all CLI/daemon-level
+  only.
+- **Child usage attribution, parent-scoped registry surviving
+  compaction/restart, recursion depth limits.** -- **False/N/A**,
+  already settled, reconfirmed with no new evidence.
+- **Automatic compaction preserving kernel state.** -- **True.** The
+  kernel process is untouched by compaction, which only changes
+  `build_turns`'s provider-facing output.
+
+## skills.md
+
+- **Agent Skills standard validation (`name` format/length rules,
+  directory-match check, lenient warnings on violation).** -- **False.**
+  `skills::discover` only ever reads the `description` field; `name`,
+  length rules, and the directory-match check are never read or
+  validated, and there's no warning mechanism of any kind.
+- **`disable-model-invocation: true` + `/skill:name` explicit invoke.**
+  -- **False.** Neither half exists -- the field is never read, and no
+  `/skill:name` command surface exists anywhere.
+- **"Skills with missing description are not loaded."** -- **False**,
+  inverted: a dedicated unit test
+  (`a_skill_with_no_description_field_still_discovers_with_none`) proves
+  a skill with no `description` still discovers fine.
+- **Multiple discovery locations (global, project, package manifest,
+  `settings.json` array, `--skill` flag, built-in shipped skills).** --
+  **False.** Only one directory is ever scanned (global tier only,
+  already documented as deliberate) -- no project tier, no manifest
+  tier, no settings array, no CLI flag, and no skills ship built-in.
+- **Python-backed skills: `pyproject.toml`, per-skill `src/` layout,
+  editable install into a kernel venv, `[project.scripts]` CLI
+  wrapper.** -- **False**, none of it. `bootstrap_kernel` does a bare
+  `sys.path.insert` onto the flat skills directory -- no venv, no
+  install step, no dependency management, no `pyproject.toml` detection
+  at all. A skill here is "a directory with `SKILL.md`" whose sibling
+  `.py` files happen to be importable, not the packaged contract
+  skills.md describes.
+- **Built-in skills (`prime-intellect`, `skill-creator`, `websearch`)
+  shipping by default.** -- **False.** No built-in skills ship at all.
+
+## compaction.md
+
+- **Trigger formula `contextTokens > contextWindow - reserveTokens`,
+  configurable `reserveTokens`.** -- **Partial.** A trigger genuinely
+  fires automatically, but against one flat threshold
+  (`compact_trigger_tokens`, default 6,000) compared to a rough
+  `len()/4` token estimate -- no per-model context-window catalog and
+  no separate reserve concept; one number plays both roles.
+- **`keepRecentTokens` walk-backward-accumulate algorithm (default
+  20,000).** -- **True in mechanism, false in default.**
+  `find_compaction_fold_count` does exactly this walk, but the default
+  is 2,000, and token counts use the same rough estimate, not a real
+  tokenizer.
+- **Split-turn handling (never cut mid-turn or between a tool call and
+  its result; two-summary merge).** -- **False.** The fold walk treats
+  every transcript entry identically regardless of role -- a cut can
+  land immediately after a tool-call entry, separating it from its
+  result.
+- **Structured summary format (`## Goal`/`## Progress`/etc. sections,
+  `<read-files>`/`<modified-files>` tags).** -- **False.** The
+  summarization prompt just asks for "an updated, concise summary... no
+  preamble" -- no structured template, no file-tracking tags.
+- **`compaction.enabled` settings toggle.** -- **False.** No toggle
+  exists; the only way to suppress auto-compaction is to never
+  configure a real model.
+- **Kernel-callable `compact.status()`/`compact.run(...)`.** --
+  **False**, already settled, reconfirmed against `bootstrap_kernel`
+  directly (defines nothing named `compact`).
+
+## prompt-templates.md
+
+- **Filename-as-command, `description`/`argument-hint` frontmatter.**
+  -- **True.**
+- **"`description` optional; falls back to the body's first line."** --
+  **False.** No fallback exists -- a missing `description` is just
+  `None`.
+- **Argument grammar `$1`/`$2`/`$@`/`$ARGUMENTS`/`${@:N}`/`${@:N:L}`.**
+  -- **True, verbatim.** `expand_args` implements this exactly --
+  already noted in `PARITY.md` as matching upstream's own grammar.
+- **Discovery: global + project-local directories, package manifest
+  tier, `settings.json` array, `--prompt-template` flag,
+  `--no-prompt-templates`.** -- **Partial.** The global-plus-project-
+  local pair is real and matches precedence exactly; no manifest tier,
+  no settings array, no CLI flags.
+
+## json.md
+
+- **`--mode json` event vocabulary (`agent_start`/`turn_start`/
+  `message_update` with streaming deltas/`tool_execution_*`/etc.).** --
+  **False.** None of these event names exist; this project's `--mode
+  json` instead prints its own existing `Request`/`Response`/
+  `SessionEvent` wire types as JSON lines -- a much smaller,
+  non-streaming vocabulary (`ProviderReply` is a complete reply or
+  complete tool-call batch, never a partial delta).
+- **Session header first line (`{"type":"session","version":3,...}`
+  with `cwd`/`timestamp`).** -- **False.** Different shape entirely
+  (`session_attach_started`, no version/cwd/timestamp fields).
+
+## rpc.md
+
+- **Request/response correlation via an `id` field; generic
+  `{"type":"response","command":...,"success":...}` envelope.** --
+  **False.** No correlation-id field anywhere; every response is
+  directly tagged by its own `type`, and errors are one shared
+  `Response::Error{message, conflict}` variant, not a per-command
+  `success:false` echo.
+- **JSONL framing (LF-only, `\r` stripped).** -- **True**, incidentally
+  -- `transport::LineStream` already does exactly this, though it's the
+  same framing every subcommand uses, not something built to match this
+  spec.
+- **Full command set (~30 commands: `steer`, `abort`, `cycle_model`,
+  `bash`, `fork`, `clone`, `export_html`, etc.).** -- **False** for the
+  overwhelming majority -- only `session_prompt`, `session_compact`,
+  and `session_fork` have any real analog; the rest of `protocol::
+  Request`'s variants don't map to this list at all, and this list's
+  other ~27 entries have no analog in `protocol::Request`.
+- **`Model` object (`contextWindow`, `cost`, `reasoning`, `input`
+  modalities).** -- **False.** The actual model-catalog entry carries
+  only `id`/`owned_by`/`context_length` -- no pricing, reasoning-support,
+  or modality fields.
+
+## acp.md
+
+Genuinely new information -- `PARITY.md` only knew ACP was deferred
+pending a wire-shape spike, without the shapes themselves. All findings
+below are **N/A** (zero ACP code exists), reported as reference for a
+future spike:
+
+- Transport: one JSON-RPC 2.0 message per line, NDJSON on stdin/stdout
+  -- the same LF-delimited-JSON framing `transport.rs` already
+  implements, a smaller adaptation than a from-scratch protocol.
+- Exactly five methods (`initialize`, `session/new`, `session/prompt`,
+  `session/cancel`, `session/close`), one session per connection.
+- `session/update` mapping (assistant text -> `agent_message_chunk`,
+  tool start/finish -> `tool_call`/`tool_call_update`, an IPython cell
+  specifically as a `tool_call` of kind `execute`) maps directly onto
+  the real `execute_python` tool with no new abstraction -- confirms
+  `PARITY.md`'s own guess that a non-streaming `ProviderReply` could
+  still emit one legal `session/update` chunk per turn.
+- **New concrete blocker found:** `protocol::Request` has no
+  cancel/abort primitive of any kind -- `session/cancel` (and rpc.md's
+  `abort`) would need one added first, independent of ACP itself.
+  `max_tokens` as a stop reason also has no honest backing today, since
+  no token usage is tracked anywhere (the same root gap as autonomous
+  mode's missing token budget).
+
+## mcp-integrations.md
+
+- **"MCP integrations are Python-backed skills the model `import`s
+  inside the kernel."** -- **False**, architecturally the opposite:
+  `--tools mcp` exposes MCP tools as ordinary offered tools in the
+  tool-calling loop, not as skill packages the model imports.
+- **`mcpServers` config in `settings.json` (per-server `type`/`url`/
+  `oauth`/`headers`/`enabled`).** -- **False/N/A.** No such concept
+  exists; `--tools mcp` talks to exactly one fixed endpoint (`rp-server`'s
+  own built-in gateway), configured on `rp-server`'s own side, not a
+  rusty_prime_agent-owned settings surface.
+- **Enable-by-login lifecycle (`/login` -> OAuth, `auth.json` keyed
+  `mcp:<name>`, `/mcp login|logout`).** -- **False/N/A.** No `/login`,
+  no `/mcp` subcommand, no OAuth; MCP tool access is unconditional
+  whenever `--tools mcp` is passed and `rp-server` is reachable.
+
+## sdk.md
+
+- **`AgentSession` interface (`steer`, `followUp`, `subscribe`,
+  `setModel`, `cycleModel`, `navigateTree`, `abort`, `dispose`).** --
+  **False** as a matching shape. The embeddable layer is just
+  `AgentSession::create` + `.prompt(text)` -- none of those methods
+  exist, and compaction is automatic-only, not caller-invokable.
+- **`defineTool()`.** -- **Partial.** The equivalent is implementing
+  `ToolRuntime`/`ModelProvider` yourself and passing a `Box<dyn
+  ToolRuntime>` -- same underlying idea, no single-function
+  registration API.
+- **`AgentSessionRuntime` with `newSession`/`switchSession`/`fork`/
+  `importFromJsonl` session-replacement API.** -- **False.** No
+  stateful runtime-replacement object exists; `dispatch_one_shot` is a
+  single request/response call.
+- **API-key resolution priority: runtime override > `auth.json` > env
+  var > fallback resolver.** -- **False, reversed.** The actual
+  precedence is env var beats `auth.json`, the opposite order, with no
+  runtime-override tier at all.
+
+## providers.md
+
+- **Subscription-based OAuth providers.** -- **False**, already
+  tracked.
+- **Provider table (23 named backends).** -- **Partial.** Only 4 have a
+  built-in entry (`openai`/`anthropic`/`gemini`/`groq`) plus Ollama
+  unconditionally; the other ~19 have no built-in wiring at all
+  (hand-registerable via `providers.json` as a generic entry, but none
+  pre-configured or named).
+- **"Auth file credentials take priority over environment variables."**
+  -- **False, and inverted.** `resolve_auth_env` explicitly skips
+  `auth.json` once the matching env var is set -- env var wins, the
+  opposite of the documented precedence. This is a real, deliberate
+  divergence already stated plainly in `PARITY.md`'s own `auth.json`
+  entry, not an oversight -- but it means this specific upstream
+  sentence is false as a description of actual behavior here.
+- **Key resolution: shell command, env-var-name indirection, or
+  literal.** -- **Partial.** Literal and `!command` both work; the
+  env-var-name-indirection form does not -- any non-`!`-prefixed string
+  is sent as a literal value, so `{"key": "MY_KEY"}` would ship the
+  literal string `"MY_KEY"` as a credential rather than looking up an
+  env var of that name.
+- **Cloud providers (Azure/Bedrock/Cloudflare/Vertex-specific auth
+  flows).** -- **False.** Zero cloud-specific code exists anywhere.
+
+## custom-provider.md / models.md
+
+Direct analog is `providers.json`'s `CustomProvider` struct (`base_url`,
+`kind` only). Checked field-by-field against both docs' configuration
+tables:
+
+- **`ProviderConfig`/Model-config fields (`name`, `apiKey`, `api`,
+  `streamSimple`, `headers`, `authHeader`, `models[]`, `oauth`,
+  `reasoning`, `thinkingLevelMap`, `input[]`, `cost`, `contextWindow`,
+  `maxTokens`, `compat`).** -- **False, essentially all of them.**
+  `CustomProvider` has exactly two fields; there is no per-model
+  configuration object anywhere in the registration path at all.
+- **Thinking-level map (`off`/`minimal`/`low`/`medium`/`high`/
+  `xhigh`, six levels).** -- **False.** The CLI flag accepts only
+  `low`/`medium`/`high` -- three levels, no per-model override.
+- **Overriding a built-in provider by reusing its name (upsert-by-id
+  merge).** -- **False, inverted.** A custom entry reusing a built-in
+  provider's name is silently *dropped*, not merged -- confirmed by a
+  dedicated unit test.
+- **Custom OAuth (`oauth.login`/`refreshToken`), custom streaming API.**
+  -- **False/N/A.** No streaming abstraction and no OAuth concept exist
+  anywhere in the `ModelProvider` trait.
+
+## settings.md
+
+`Settings` has exactly two fields (`compact_trigger_tokens`,
+`compact_keep_recent_tokens`). Checked every key-family the doc lists:
+
+- **`compaction.keepRecentTokens`.** -- **Partial/True.** Real, direct
+  match in semantics, different default (2,000 vs. 20,000) and flat
+  instead of nested.
+- **`compaction.reserveTokens`/`compaction.enabled`.** -- **False**,
+  both -- no reserve concept, no toggle.
+- **`defaultProvider`/`defaultModel`/`defaultThinkingLevel`, `theme`,
+  update-check settings, `telemetry.*`, `retry.*`, `branchSummary.*`,
+  `steeringMode`/`followUpMode`, `terminal.*`/`images.*`, `shellPath`,
+  `idleEvictionMinutes`, `sessionDir`, `enabledModels`,
+  `markdown.codeBlockIndent`, resource-array settings (`packages`,
+  `extensions`, `skills`, `prompts`, `themes`).** -- **False, all of
+  them.** None exist as `Settings` fields -- confirmed by the struct's
+  complete two-field definition.
+- **Two-tier global+project precedence with nested merge.** --
+  **False.** Global-only, single file, no merge logic, already stated
+  as deliberate in `PARITY.md`.
+
+## extensions.md / themes.md
+
+**Important correction to `PARITY.md`'s existing reasoning.**
+`PARITY.md`'s Extensions entry currently states "there's no manifest
+format, no registration API, no capability list anywhere in this
+project's own reach to bound a first increment against" -- searched
+against *this project's own* docs, which is accurate. But `prime-agent`'s
+own `extensions.md`/`themes.md` **do** contain a concrete spec:
+`extensions.md` documents a full manifest/registration format (a
+default-export factory receiving an `ExtensionAPI`, `pi.registerTool()`/
+`registerCommand()`/`registerShortcut()`/`registerProvider()`/`on(event,
+handler)` for ~25 named lifecycle events with documented payload shapes),
+and `themes.md` documents a full JSON token spec (51 required color
+tokens across 6 categories, 4 value formats). Neither is implemented
+here -- **False** as implemented, unchanged -- but the *reasoning* for
+why this stays unattempted needs updating: it's not "no spec exists
+anywhere to bound against," it's "a spec exists in prime-agent's own
+docs, but building against it still needs the interactive TUI first for
+Themes (nothing to render tokens onto) and is a large surface for
+Extensions relative to this project's current CLI/daemon shape." See the
+`PARITY.md` fix landed alongside this entry.
+
+## tui.md
+
+Confirms `PARITY.md`'s existing conclusion straightforwardly: describes
+a full component framework (`Component`/`Focusable` interfaces,
+overlay positioning, built-in widgets) that presupposes the real
+interactive terminal UI `PARITY.md` already scoped separately as
+"needs a new subsystem." Nothing here reveals a smaller spec than that
+-- there's no way to build any of it without the TUI event loop
+underneath first. **False/N/A** throughout, nothing new to flag.
+
 ## Candidate follow-ups
 
 Findings above that describe a real, bounded gap rather than an
@@ -438,6 +894,75 @@ work, not yet decided or scheduled:
       per-worker dedup keyed by a client-supplied request id, rejecting
       an exact duplicate rather than double-enqueuing -- durability
       across a worker crash is a separably larger step.
+
+From the recursive doc-tree pass:
+
+- [ ] **A protocol-level cancel/abort `Request` variant.** `protocol.rs`
+      has no cancellation primitive of any kind today. Surfaced
+      independently by two different docs (rpc.md's `abort`, acp.md's
+      `session/cancel`) as a real prerequisite gap, not just an RPC
+      nicety -- worth its own bounded slice regardless of whether RPC
+      mode or a future ACP spike ever get there.
+- [ ] **Fix, or explicitly document, the `auth.json`-vs-env-var
+      precedence inversion.** `providers.md` states the auth file takes
+      priority over environment variables; `resolve_auth_env` does the
+      opposite (env var always wins, `auth.json` never even consulted
+      once the var is set) -- already a deliberate, stated design choice
+      in `PARITY.md`'s own `auth.json` entry, but worth a one-line note
+      there marking it as a permanent divergence from upstream's
+      documented contract rather than an open gap.
+- [ ] **Env-var-name indirection in `auth::resolve_key`.** Only literal
+      and `!command` forms exist; upstream's third form (`{"key":
+      "MY_KEY"}` meaning "look up this named env var") is silently
+      treated as a literal today, which would ship a garbage literal
+      string as a credential if anyone copied that pattern from
+      upstream's own docs. Bounded fix: try `std::env::var(raw)` when
+      `raw` matches a bare-identifier shape and isn't `!`-prefixed,
+      falling back to literal otherwise.
+- [ ] **Skill frontmatter validation beyond `description`.** `skills::
+      discover` only ever reads `description`; `name`/`license`/
+      `compatibility`/`disable-model-invocation` are silently ignored.
+      `frontmatter::parse` already returns the full field map -- a
+      bounded slice adds the remaining fields plus lenient (warn, don't
+      fail) validation surfaced through `harness skill list`.
+- [ ] **`disable-model-invocation` + a `/skill:name` explicit-invoke
+      command.** Two small, separable pieces: skip a flagged skill in
+      the `execute_python` tool description, and a `/skill:name [args]`
+      `session_repl` command in the same shape as the existing `/fork`/
+      `/export` commands.
+- [ ] **Turn-boundary-aware compaction cut points.** `find_compaction_
+      fold_count` folds by raw entry count with no role awareness --
+      a cut can land immediately after a tool-call entry, separating it
+      from its result. Bounded fix: after computing the naive cut index,
+      walk to the nearest `User`/`Assistant`-role boundary instead.
+- [ ] **Persist compaction `instructions` on `CompactionState`.**
+      `compact_now` already receives `instructions` as a parameter but
+      never stores it -- one more `Option<String>` field alongside
+      `summary`/`compacted_at_ms` closes this.
+- [ ] **A `compaction.enabled` settings toggle.** Today the only way to
+      suppress automatic compaction is to never configure a real model.
+      One more `Option<bool>` field on `Settings` plus one check in
+      `maybe_compact`, following the exact precedent the two existing
+      compaction fields already set.
+- [ ] **An interactive session browser (`prime-agent agents`-style).**
+      `session list` already returns the right data (every status
+      tier); a bounded slice adds a simple filter/select-to-attach text
+      picker on top, no new data source needed.
+- [ ] **Resume-by-partial-ID convenience.** Sessions are addressed only
+      by full UUID today; a small prefix-match helper ahead of `session
+      attach`/`session fork` would need no protocol change.
+- [ ] **`daemon shutdown --force`.** Currently unconditional; a `--force`
+      flag distinguishing "graceful `WorkerShutdown` to every session"
+      from "skip the round trip and just clean up sockets" is a small
+      addition to the existing handler.
+- [ ] **A `--no-session`/ephemeral-mode flag.** No such flag exists on
+      `session new`/`-p` today; would skip `state.json`/`transcript.jsonl`
+      persistence, reusing the in-memory `AgentSession::create` path the
+      embeddable SDK already established for a non-daemon caller.
+- [ ] **Piped-stdin merging for `-p`.** `print_once` never reads stdin
+      today; a bounded slice checks `stdin().is_terminal()` and, if
+      piped, merges it into `text` before the existing `SessionNew`/
+      `SessionPrompt` calls -- no protocol change needed.
 
 Not candidates -- structurally out of scope, same reasoning as
 `PARITY.md`'s "Needs a new subsystem" section: prompt-as-a-variable,

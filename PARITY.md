@@ -1137,38 +1137,44 @@ attempted here, and not silently implied by anything in
 
 - **Extensions.** Named in this bullet's original heading alongside
   "skills"/"themes" (skills now done, see the medium-effort section
-  above) with no further elaboration anywhere in this project's own docs
-  -- re-investigated closely rather than left as a bare assumption,
-  since every other item on this list turned out to have *some* real
-  spec to bound against once actually looked for. The search came up
-  with exactly one concrete trace anywhere in this codebase: RPC mode's
-  own "Explicitly not implemented" note (see that entry above) names an
-  "Extension UI sub-protocol (`select`/`confirm`/`input`/`editor`
-  dialogs)". That's real, but it describes a UI-facing dialog surface an
-  *already-registered* extension would call to prompt a human (pick from
-  a list, yes/no, free text, an editor buffer) -- structurally the
-  mirror image of everything "extension-shaped" this project has
-  actually built (`ToolRuntime`/`ModelProvider` trait implementability
-  for an embedding host, MCP tools the *model* invokes, skills the model
-  `import`s): all three of those are model- or embedder-initiated;
-  dialogs are UI-initiated, asking a human something. It is not itself a
-  specification of what an extension *is*, how one registers, or what
-  else besides dialogs it could add -- there's no manifest format, no
-  registration API, no capability list anywhere in this project's own
-  reach to bound a first increment against. Implementing just the four
-  dialog RPC verbs, with nothing in this codebase ever positioned to
-  invoke them, would be indistinguishable from the RPC mode entry's
-  already-tracked "rest of `rpc.md`'s command surface" gap under a
-  different heading -- double-counting one gap as two, not a genuine new
-  increment. Stays genuinely undefined, not silently dropped.
-- **Themes.** Same conclusion as Extensions, reached the same way: no
-  trace anywhere in this project's own docs beyond the same original
-  "Skills, extensions, themes" heading skills eventually got carved out
-  of. No format, no palette/token spec, no rendering surface this
-  project has (a plain-text CLI/REPL has no theming surface to begin
-  with; the interactive TUI a theme would apply to is itself a separate,
-  already-tracked, not-yet-attempted item, see below) -- nothing to
-  scope a bounded increment against.
+  above). An earlier pass here searched only *this project's own* docs
+  and the stray "Extension UI sub-protocol" mention under RPC mode's
+  "Explicitly not implemented" note, found no manifest/registration/
+  capability spec in either, and concluded the whole surface was
+  "genuinely undefined." **Correction, found by reading `prime-agent`'s
+  own `docs/extensions.md` directly (`CLAIMS_AUDIT.md`'s recursive
+  doc-tree pass) rather than relying on a stray cross-reference:** a
+  concrete spec does exist, just not in this project's own reach --
+  `extensions.md` documents a real manifest/registration format (a
+  default-export factory receiving an `ExtensionAPI`,
+  `pi.registerTool()`/`registerCommand()`/`registerShortcut()`/
+  `registerProvider()`/`on(event, handler)` for roughly 25 named
+  lifecycle events with documented payload shapes) and a real capability
+  list (custom LLM-callable tools, event interception, the dialog-based
+  user-interaction surface the earlier pass already found, custom
+  commands, session persistence, custom rendering). So the "nothing to
+  bound a first increment against" framing was wrong -- a first
+  increment (e.g. one blocking pre-tool-call hook plus one custom-
+  command registration point against this project's own `tool_runtime`/
+  CLI dispatch) is genuinely scopable now. It stays unimplemented all
+  the same: this is a large surface to build a registration/event system
+  for relative to this project's current CLI/daemon shape, and doing it
+  justice would mean picking a real subset rather than a first,
+  necessarily-incomplete slice masquerading as "extensions support" --
+  a deliberate scope decision now, not an absence-of-spec one.
+- **Themes.** Same correction as Extensions, same source: `prime-agent`'s
+  own `docs/themes.md` documents a full, concrete JSON token spec (51
+  required color tokens across 6 categories, 4 value formats: hex,
+  256-color, a `vars` reference, or an empty-string default) -- the
+  earlier "no format, no palette/token spec... nothing to scope a
+  bounded increment against" framing was wrong about spec *existence*.
+  It's right about there being nothing to build *first*, though, for a
+  different reason than originally stated: this project has no theming
+  surface to apply tokens to at all (a plain-text CLI/REPL has none; the
+  interactive TUI a theme would render through is itself a separate,
+  already-tracked, not-yet-attempted item below) -- a theme spec is
+  inert without a renderer to consume it, so this stays blocked on the
+  TUI item, not on missing spec.
 - **The interactive TUI itself** (a real terminal UI -- panes, cursor
   control, live re-rendering) and the pieces of its rich editor/
   message-queue surface that genuinely need one: **image paste** (zero
