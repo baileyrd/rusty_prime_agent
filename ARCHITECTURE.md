@@ -496,6 +496,31 @@ append a crash-recovery marker) -- `AgentSession::recover`'s ordinary
 full-replay picks up exactly what `seed_forked_session` wrote to disk,
 the same path any other resumed session goes through.
 
+## REPL commands: `/file`, `/fork`, `/export`
+
+Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/
+message-queue features -- see `PARITY.md` for the full story, including
+which pieces of that surface (image paste, steering vs. follow-up
+queuing, `/tree`, `/clone`, `/share`) don't have a bounded slice and
+why. All three live in `client::session_repl`'s own stdin loop, the
+same shape `/heartbeat`/`/compact` already established: a REPL-only
+line command calling directly into an existing client-side function,
+no daemon/worker/protocol change.
+
+`/file <path>` reads a local file and stashes its content in a
+`pending_file_content: Option<String>` local to the loop, consumed (and
+cleared) by the next line that actually calls `send_prompt` -- an
+intervening `/heartbeat`/`/compact`/`/fork` line doesn't drop it.
+`/fork [--at N] [--name TEXT]` calls the already-existing `client::
+session_fork` (see "Session forking" above) directly; its own small
+argument parser (`parse_repl_fork_args`) exists because `cli::
+scan_named_flag` is private to `cli.rs` and shaped around a full argv
+slice, not one already-stripped REPL line. `/export <path>` re-fetches
+the session's current transcript and writes it as pretty-printed JSON
+via `serde_json::to_string_pretty` -- the same already-`Serialize`
+`TranscriptEntry` `--mode json` already renders, no new format
+invented.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

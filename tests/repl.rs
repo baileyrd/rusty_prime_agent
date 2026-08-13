@@ -208,3 +208,119 @@ fn repl_replays_prior_transcript_before_reading_new_input() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// Bounded parity with `prime-agent`'s TUI-side file-reference feature
+/// -- see `session_repl`'s own `pending_file_content` doc comment.
+#[test]
+fn repl_file_command_queues_content_into_the_next_prompt() {
+    let state_dir = common::TempDir::new("repl-file");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let file_path = state_dir.path().join("notes.txt");
+    std::fs::write(&file_path, "the secret ingredient is basil").unwrap();
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        &format!("/file {}\nwhat's the secret?\n", file_path.display()),
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("queued"), "got: {stdout}");
+    assert!(
+        stdout.contains("the secret ingredient is basil") && stdout.contains("what's the secret?"),
+        "got: {stdout}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_file_command_on_a_missing_file_reports_an_error_and_sends_nothing() {
+    let state_dir = common::TempDir::new("repl-file-missing");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/file does-not-exist.txt\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("failed to read"), "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=0"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// Bounded parity with `prime-agent`'s TUI-side `/fork` -- wires the
+/// already-existing `session fork` client call into the REPL loop.
+#[test]
+fn repl_fork_command_creates_a_new_session_from_the_current_one() {
+    let state_dir = common::TempDir::new("repl-fork");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session_id, "hello");
+
+    let mut child = Command::new(common::bin())
+        .args(["--mode", "json", "session", "repl", &session_id])
+        .env("RUSTY_PRIME_AGENT_HOME", state_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn harness session repl");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"/fork --name my-fork\n")
+        .expect("write repl input");
+    let out = child.wait_with_output().expect("wait for repl to exit");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let forked_line = stdout
+        .lines()
+        .find(|l| l.contains("\"type\":\"session_new\""))
+        .unwrap_or_else(|| panic!("expected a session_new line, got: {stdout}"));
+    let value: serde_json::Value = serde_json::from_str(forked_line).unwrap();
+    let forked_id = value["session_id"].as_str().unwrap().to_string();
+    assert_ne!(forked_id, session_id);
+
+    let listing = common::session_list(state_dir.path());
+    assert!(
+        listing.contains(&format!("{forked_id}\tactive\tmy-fork")),
+        "got: {listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// Bounded parity with `prime-agent`'s TUI-side `/export` -- writes the
+/// current transcript to a local file as pretty-printed JSON.
+#[test]
+fn repl_export_command_writes_the_transcript_to_a_file() {
+    let state_dir = common::TempDir::new("repl-export");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session_id, "hello");
+
+    let export_path = state_dir.path().join("exported.json");
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        &format!("/export {}\n", export_path.display()),
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("exported 2 turn(s)"), "got: {stdout}");
+
+    let exported = std::fs::read_to_string(&export_path).expect("exported file exists");
+    let value: serde_json::Value = serde_json::from_str(&exported).expect("valid JSON");
+    let entries = value.as_array().expect("exported transcript is an array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["text"], "hello");
+    assert_eq!(entries[1]["text"], "echo: hello");
+
+    common::daemon_shutdown(state_dir.path());
+}
