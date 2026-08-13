@@ -102,6 +102,82 @@ conditioned differently than the claim implies).
   named concept exists here; subagents are ordinary sessions with a
   recorded `parent_id`, nothing separately "retained."
 
+## Architecture overview (system diagram + prompt execution flow)
+
+`prime-agent`'s architecture doc describes a client/supervisor/worker
+split with a flowchart and a prompt-execution sequence diagram. Checked
+each labeled component and edge against this project's actual daemon/
+worker/session code.
+
+- **`AgentConnection` (client-side execution boundary).** -- **True in
+  substance, no matching name.** `src/client.rs`'s functions
+  (`session_prompt`, `session_attach`, `session_repl`, ...) play exactly
+  this role -- they own rendering/stdin, never execute a prompt
+  themselves, and talk to the daemon over `transport::connect`. There's
+  no single `AgentConnection` type; it's a set of free functions sharing
+  the same daemon-socket pattern.
+- **Daemon supervisor -- routing, attachments, recovery.** -- **True.**
+  `src/daemon/mod.rs`'s `handle_session_attach`/`handle_session_prompt`
+  open a fresh connection to the target session's private `worker.sock`
+  per request and proxy responses/events back to the client connection
+  -- this matches the diagram's `S->>W` routing step directly, not just
+  in spirit.
+- **Catalog process -- saved-session scans.** -- **False as "process."**
+  `src/catalog.rs`'s own module doc says so explicitly: the reference
+  architecture runs this as a separate subprocess, but this project runs
+  it in-process inside the supervisor, citing the project's Phase 1
+  "modular monolith" constraint -- a deliberate, already-documented
+  divergence, not an oversight.
+- **Session worker: "one root session tree"** (one `AgentSessionRuntime`
+  hosting a root `AgentSession`, a `Scheduler`, a root IPython kernel,
+  and RLM child runtimes as descendants, all inside one process). --
+  **False.** `worker::run` (`src/worker/mod.rs:190`) takes exactly one
+  `session_id` and builds exactly one `AgentSession` -- there is no
+  runtime object that owns a tree of child sessions in-process.
+  `session spawn` (`src/client.rs:351`, the subagent mechanism) creates
+  a fully independent session through the ordinary `create_session` path
+  -- its own daemon-spawned worker process, its own `worker.sock` -- and
+  links it to the parent only via the `parent_id` field and later
+  daemon-routed `session message` calls. A parent's worker process has
+  no in-process handle to any child's runtime at all.
+- **"IPython is the model-facing control environment. Typed host
+  requests return authoritative operations to the TypeScript session."**
+  -- **Partial.** The kernel is real and model-facing for `--runtime
+  ipython` sessions (see the RLM section above). But there is no general
+  typed request/response channel from kernel code back to the Rust host.
+  The only kernel-to-host signal that exists is the single hardcoded
+  stdout marker (`HEARTBEAT_MARKER`, `src/session.rs:56`) used
+  exclusively to trigger `trigger_heartbeat` -- a one-off convention, not
+  a general "typed host request" protocol a kernel call could use for
+  other authoritative operations.
+- **"Workers and kernels are separate processes for lifecycle and
+  failure containment, not security sandboxes. They normally run with
+  the same operating-system permissions as the client."** -- **True.**
+  Workers are spawned as `harness __worker-main` subprocesses
+  (`src/worker/mod.rs`), kernels as their own subprocess under
+  `IpythonKernelRuntime`; neither uses any sandboxing/privilege-dropping
+  mechanism, same as the client's own OS user.
+- **Prompt execution sequence diagram** (`U -> C -> S -> W -> A -> P`,
+  streamed back through the same chain, transcript appended, "opt
+  IPython tool call" branching into a "typed host request" vs. "ordinary
+  execution" alternative). -- **True for the outer flow, false for the
+  inner branch.** The client/daemon/worker/`AgentSession`/provider chain,
+  transcript append, and event streaming back to the client all match
+  what `handle_session_prompt`/`AgentSession::prompt` actually do,
+  including the "generation-aware events" detail (`SessionState.
+  generation`, `src/protocol.rs:531`, bumped on every respawn precisely
+  so attach-stream cursors can detect it). The "typed host request" arm
+  of the IPython branch does not exist as a general mechanism, per the
+  point above -- only the heartbeat marker special case does.
+- **"From the session queue onward, the same execution and persistence
+  path is used when a prompt comes from a heartbeat, cron schedule, goal
+  continuation, autonomous mode, or another agent instead of an attached
+  user."** -- **True.** Heartbeats and schedules fire through the
+  daemon's background schedule loop into an ordinary `Request::
+  SessionPrompt`; `session_autonomous`'s goal continuation and `session
+  message` both send ordinary `SessionPrompt`s too -- none of these
+  sources bypass `AgentSession::prompt`.
+
 ## Candidate follow-ups
 
 Findings above that describe a real, bounded gap rather than an
@@ -122,6 +198,14 @@ work, not yet decided or scheduled:
       need to synthesize skill *logic*) -- would close the "built-in
       skill creator" gap without requiring the model to author working
       Python on its own.
+- [ ] **Generalize the heartbeat marker into a real typed host-request
+      channel.** Currently one hardcoded stdout marker for one specific
+      trigger. If a second kernel-to-host authoritative operation is
+      ever needed, a small tagged-JSON-on-stdout convention (marker +
+      one JSON payload, parsed the same way `extract_heartbeat_marker`
+      already parses `marker + every`) would generalize this without
+      much new machinery -- not worth building ahead of a second actual
+      caller, so left as a candidate rather than started.
 
 Not candidates -- structurally out of scope, same reasoning as
 `PARITY.md`'s "Needs a new subsystem" section: prompt-as-a-variable,
@@ -129,4 +213,12 @@ Not candidates -- structurally out of scope, same reasoning as
 subagent orchestration through kernel code. Each would require the
 Python-first control environment this project has deliberately not
 built (see `PARITY.md`'s "RLM programming model" and "Recursive
-subagents" entries for why).
+subagents" entries for why). Also not a candidate: restructuring the
+worker model so a parent process hosts child runtimes in-process
+("one root session tree") instead of today's one-process-per-session
+design -- that's a foundational rewrite of the daemon/worker
+architecture (crash isolation, `parent_id`-based routing, the whole
+socket-per-session model), not a bounded slice, and today's design
+already gets the properties that matter (independent lifecycle,
+independent crash recovery, daemon-mediated messaging) through a
+different, already-working mechanism.
