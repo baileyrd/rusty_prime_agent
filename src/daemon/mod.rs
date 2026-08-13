@@ -216,6 +216,13 @@ impl Supervisor {
                 // re-seeded.
                 thinking: state.thinking.clone(),
                 runtime: state.runtime.clone(),
+                // `rlm_depth`/`rlm_max_depth` follow the same
+                // "always supplied, re-read from persisted state"
+                // treatment as `thinking`/`runtime` -- a session's own
+                // depth in its recursion tree doesn't change across a
+                // respawn.
+                rlm_depth: Some(state.rlm_depth),
+                rlm_max_depth: Some(state.rlm_max_depth),
             },
         )
         .await?;
@@ -251,6 +258,13 @@ impl Supervisor {
                         thinking,
                         tools,
                         runtime,
+                        // Resolved by `handle_session_new` itself (a
+                        // parent lookup, or the env-var-fallback root
+                        // case) -- not part of the wire `Request::
+                        // SessionNew`, since a client never sets these
+                        // directly.
+                        rlm_depth: None,
+                        rlm_max_depth: None,
                     },
                 )
                 .await
@@ -390,6 +404,14 @@ impl Supervisor {
         meta.model = meta
             .model
             .or_else(|| std::env::var("RUSTY_PRIME_AGENT_MODEL").ok());
+        // Parity with `rlm-runtime.md`'s `RLM_DEPTH`/`RLM_MAX_DEPTH`:
+        // resolved here, server-side, the same place `parent_id` is
+        // already validated -- a child inherits the parent's own
+        // `rlm_max_depth` (not re-resolved from this env var), and its
+        // `rlm_depth` is exactly one more than the parent's. A root
+        // session (no `parent_id`) starts at depth 0 with a freshly
+        // resolved max, the same `RUSTY_PRIME_AGENT_MODEL`-style
+        // env-var-fallback treatment `model` just got above.
         if let Some(parent_id) = &meta.parent_id {
             let parent_dir = paths::session_dir(&self.state_root, parent_id);
             if !paths::state_file_path(&parent_dir).exists() {
@@ -403,6 +425,17 @@ impl Supervisor {
                     )
                     .await;
             }
+            let parent_state = catalog::read_session_state(Context::Daemon, &parent_dir)?;
+            meta.rlm_depth = Some(parent_state.rlm_depth + 1);
+            meta.rlm_max_depth = Some(parent_state.rlm_max_depth);
+        } else {
+            meta.rlm_depth = Some(0);
+            meta.rlm_max_depth = Some(
+                std::env::var("RUSTY_PRIME_AGENT_RLM_MAX_DEPTH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(crate::session::DEFAULT_RLM_MAX_DEPTH),
+            );
         }
         let session_id = crate::session::new_session_id();
         let session_dir = paths::session_dir(&self.state_root, &session_id);
@@ -564,6 +597,14 @@ impl Supervisor {
                 thinking: source_state.thinking.clone(),
                 tools: source_state.tools.clone(),
                 runtime: source_state.runtime.clone(),
+                // Same "no `parent_id`" treatment as the two fields
+                // above it -- a fork is a fresh, standalone session, not
+                // tied into the source's own recursion tree, so it
+                // starts at depth 0 with its own freshly-resolved max
+                // (`AgentSession::create`'s `unwrap_or` defaults) rather
+                // than inheriting `source_state`'s.
+                rlm_depth: None,
+                rlm_max_depth: None,
             },
         )
         .await

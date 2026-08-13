@@ -102,6 +102,16 @@ pub struct WorkerArgs {
     /// resume/recover respawn is exactly what `daemon::Supervisor::
     /// ensure_worker_running` does, mirroring `thinking`.
     pub runtime: Option<String>,
+    /// See `protocol::SessionState::rlm_depth`'s own doc comment. Same
+    /// "always supplied by the daemon at spawn time" treatment as
+    /// `runtime` -- [`bootstrap_kernel`] needs it *before* `AgentSession::
+    /// create`/`recover` even run (to inject `RLM_DEPTH` into the kernel
+    /// at startup), so it can't be deferred to a persisted-state read
+    /// the way `tools` is.
+    pub rlm_depth: Option<u32>,
+    /// See `protocol::SessionState::rlm_max_depth`'s own doc comment.
+    /// Same treatment as `rlm_depth`.
+    pub rlm_max_depth: Option<u32>,
 }
 
 /// Builds this worker's `ModelProvider`. `model.is_none()` (the ordinary
@@ -191,9 +201,25 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// the "one comm target, typed request kinds" shape `rlm-runtime.md`
 /// itself describes ("Bundled Python skills such as `goal` call
 /// `rlm.host_request("goal.get", ...)`").
-async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
+///
+/// `RLM_DEPTH`/`RLM_MAX_DEPTH` are also injected as plain kernel globals
+/// (ints, not functions) -- parity with `rlm-runtime.md`'s "Children
+/// receive incremented `RLM_DEPTH`, the inherited maximum depth." The
+/// actual depth-limit *check* happens server-side in `AgentSession::
+/// handle_rlm_run` (which has `self.state.rlm_depth`/`rlm_max_depth`
+/// already loaded, no round trip needed); these globals exist so kernel
+/// code can also read/display them directly, matching what a real
+/// `prime-agent` session exposes.
+async fn bootstrap_kernel(
+    state_root: &Path,
+    tool_runtime: &mut dyn ToolRuntime,
+    rlm_depth: u32,
+    rlm_max_depth: u32,
+) -> Result<()> {
     let mut code = format!(
         "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n\n\
+         RLM_DEPTH = {rlm_depth}\n\
+         RLM_MAX_DEPTH = {rlm_max_depth}\n\n\
          import asyncio\n\
          from ipykernel.comm import Comm\n\
          _host_request_kernel = get_ipython().kernel\n\
@@ -240,7 +266,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut tool_runtime = build_tool_runtime(&session_dir, args.runtime.as_deref());
     tool_runtime.start().await?;
     if args.runtime.as_deref() == Some("ipython") {
-        bootstrap_kernel(&args.state_root, tool_runtime.as_mut()).await?;
+        bootstrap_kernel(
+            &args.state_root,
+            tool_runtime.as_mut(),
+            args.rlm_depth.unwrap_or(0),
+            args.rlm_max_depth
+                .unwrap_or(crate::session::DEFAULT_RLM_MAX_DEPTH),
+        )
+        .await?;
     }
     let provider = build_provider(&args.state_root, args.model.clone(), args.thinking.clone())?;
 
@@ -257,6 +290,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     thinking: args.thinking.clone(),
                     tools: args.tools.clone(),
                     runtime: args.runtime.clone(),
+                    rlm_depth: args.rlm_depth,
+                    rlm_max_depth: args.rlm_max_depth,
                 },
                 provider,
                 tool_runtime,
@@ -456,6 +491,8 @@ pub async fn spawn(
         thinking,
         tools,
         runtime,
+        rlm_depth,
+        rlm_max_depth,
     } = meta;
 
     let cwd = std::env::current_dir().map_err(|e| HarnessError::io(Context::Worker, None, e))?;
@@ -489,6 +526,12 @@ pub async fn spawn(
     }
     if let Some(runtime) = &runtime {
         cmd.arg("--runtime").arg(runtime);
+    }
+    if let Some(rlm_depth) = rlm_depth {
+        cmd.arg("--rlm-depth").arg(rlm_depth.to_string());
+    }
+    if let Some(rlm_max_depth) = rlm_max_depth {
+        cmd.arg("--rlm-max-depth").arg(rlm_max_depth.to_string());
     }
     // stderr goes to a log file, same reasoning as `client::daemon_start`'s
     // identical redirect: a worker that panics or exits before binding

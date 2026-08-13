@@ -844,10 +844,10 @@ daemon/worker split rather than requiring the Python control environment:
   session id -- there's no separate child-slot-id concept here the way
   `rlm-runtime.md` describes), never waiting for the child's own reply --
   parity with `rlm(...)` "returns immediately after task admission...
-  never waits for or returns the child's answer." No recursion-depth
-  check yet and no parent-scoped registry of admitted children yet --
-  both explicitly separate, later increments (see below), not silently
-  skipped.
+  never waits for or returns the child's answer." Rejects admission once
+  the recursion-depth limit is reached (see the next paragraph). No
+  parent-scoped registry of admitted children yet -- a separate, later
+  increment (see below), not silently skipped.
 
   Real end-to-end coverage of the *kernel* side (a new `#[ignore]`d test,
   `real_kernel_rlm_call_opens_an_rlm_run_host_request`) proves `rlm(...)`
@@ -881,6 +881,72 @@ daemon/worker split rather than requiring the Python control environment:
   retry loop already used. Confirmed fixed by five consecutive real-kernel
   test runs with zero hangs, after two reproductions of the hang without
   it.
+
+  **Later increment: recursion depth limits (`RLM_DEPTH`/
+  `RLM_MAX_DEPTH`).** Parity with `rlm-runtime.md`'s
+  `AgentSession.runRlmChild()` step 1, "Check `RLM_DEPTH <
+  RLM_MAX_DEPTH`," and its stated default ("root sessions may create
+  children; children may not create grandchildren unless configured
+  higher"). `protocol::SessionState` gains persisted `rlm_depth`/
+  `rlm_max_depth: u32` fields (`#[serde(default)]`, so old `state.json`
+  files without them still parse, reading as `0`); `session::
+  DEFAULT_RLM_MAX_DEPTH = 1` matches `rlm-runtime.md`'s own default
+  exactly. The check itself lives client-side in `handle_rlm_run`, before
+  a child is ever admitted -- `if self.state.rlm_depth >=
+  self.state.rlm_max_depth`, returning `{"error": "recursion depth limit
+  reached (RLM_DEPTH=..., RLM_MAX_DEPTH=...)"}` -- mirroring
+  `rlm-runtime.md`'s own description of the parent checking this before
+  admission, not the daemon rejecting it after the fact.
+
+  The two values themselves are computed centrally by the daemon, in
+  `daemon::handle_session_new`, not sent by any client (`NewSessionMeta`'s
+  two new fields are always `None` at every call site outside the daemon
+  itself, resolved there after the fact): a session with a `parent_id`
+  looks the parent's own persisted state up (`catalog::
+  read_session_state`, the same lookup that already validates the parent
+  exists) and gets `parent.rlm_depth + 1` / the parent's own
+  `rlm_max_depth` **inherited unchanged** -- not re-resolved -- matching
+  "the inherited maximum depth" language in `rlm-runtime.md`. A root
+  session (no `parent_id`) gets `rlm_depth = 0` and `rlm_max_depth` from a
+  new `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` env var (parsed as `u32`, falling
+  back to `DEFAULT_RLM_MAX_DEPTH` if unset or invalid), the same env-var-
+  fallback shape already used for `RUSTY_PRIME_AGENT_MODEL`. A resumed or
+  recovered worker gets both values read back out of persisted state
+  unchanged, same treatment as `thinking`/`runtime`; a forked session gets
+  fresh values (depth `0`, default max) since a fork is a standalone
+  session, not tied into its source's own recursion tree -- matching the
+  `parent_id: None` treatment a fork already has. Threading the values
+  into the kernel bootstrap (`RLM_DEPTH`/`RLM_MAX_DEPTH` as plain Python
+  int globals, needed before any `AgentSession` exists to read them back
+  out of `state.json`) required a new `WorkerArgs::rlm_depth`/
+  `rlm_max_depth` pair, plumbed through as `--rlm-depth`/`--rlm-max-depth`
+  flags on the `__worker-main` subprocess invocation, the same "always
+  supplied by the daemon at spawn time" pattern `model`/`thinking` already
+  use. `SessionSummary` (`session list`'s own display struct) is
+  deliberately *not* extended with these two fields -- a display nicety
+  out of scope for the mechanism itself.
+
+  Coverage: a CI-safe unit test
+  (`handle_rlm_run_rejects_admission_once_the_depth_limit_is_reached`)
+  proves the client-side rejection directly against a hand-constructed
+  `AgentSession` with `rlm_depth == rlm_max_depth`, no daemon or kernel
+  needed since the check itself never touches either. Two CI-safe
+  integration tests in `tests/subagents.rs`
+  (`session_spawn_inherits_the_parents_max_depth_and_increments_depth_by_one`,
+  `session_new_defaults_to_max_depth_one_with_no_env_var_set`) prove the
+  daemon's actual computation end to end -- `session spawn` reuses the
+  exact same `SessionNew` round trip `rlm(...)`'s `handle_rlm_run` does,
+  so this is genuine coverage of the shared mechanism, not a parallel
+  untested path -- reading the persisted `rlm_depth`/`rlm_max_depth`
+  straight out of each session's own `state.json` (a new `tests::common::
+  session_rlm_depth` helper, same pattern as the existing `worker_pid`
+  helper) across three generations (root, child, grandchild) and with/
+  without `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH` set. No new real-kernel test
+  was added for this increment: the depth check happens entirely before
+  any kernel-facing code runs, so the existing
+  `real_kernel_rlm_call_opens_an_rlm_run_host_request` test (which never
+  hits the limit) and the CI-safe tests above already cover every code
+  path a kernel-involving test could reach.
 
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:

@@ -100,7 +100,26 @@ pub fn assert_success(label: &str, output: &std::process::Output) {
 }
 
 pub fn daemon_start(state_dir: &Path) {
-    let out = run(state_dir, &["daemon", "start"]);
+    daemon_start_with_env(state_dir, &[]);
+}
+
+/// Same as [`daemon_start`], but with extra environment variables set on
+/// the `daemon start` invocation itself -- inherited from there down into
+/// the detached `__supervisor-main` process it spawns (`client::
+/// ensure_daemon_started` never calls `env_clear`), the same "set it on
+/// the CLI process, let the child inherit it" pattern already used for
+/// `RUSTY_PRIME_AGENT_MODEL`/API-key env vars elsewhere in this test
+/// suite. Needed for proving `RUSTY_PRIME_AGENT_RLM_MAX_DEPTH`, which
+/// only the daemon (not this CLI process) ever reads.
+pub fn daemon_start_with_env(state_dir: &Path, envs: &[(&str, &str)]) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("daemon")
+        .arg("start")
+        .env("RUSTY_PRIME_AGENT_HOME", state_dir);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("failed to run harness");
     if !out.status.success() {
         // `daemon.log` is the supervisor's own stderr (`client::
         // daemon_start`'s redirect, not this CLI process's) -- read it
@@ -270,6 +289,24 @@ pub fn worker_pid(state_dir: &Path, session_id: &str) -> u32 {
     value["worker_pid"]
         .as_u64()
         .expect("state.json has worker_pid") as u32
+}
+
+/// Reads `rlm_depth`/`rlm_max_depth` straight from `state.json` -- these
+/// are deliberately not surfaced through `session list`/`SessionSummary`
+/// (see `protocol::SessionState::rlm_depth`'s own doc comment), so a test
+/// proving the daemon's parent-lookup-and-inherit computation needs to
+/// read the persisted state directly, same as [`worker_pid`].
+pub fn session_rlm_depth(state_dir: &Path, session_id: &str) -> (u32, u32) {
+    let path = state_dir
+        .join("sessions")
+        .join(session_id)
+        .join("state.json");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let value: serde_json::Value = serde_json::from_str(&text).expect("state.json is valid JSON");
+    let depth = value["rlm_depth"].as_u64().expect("has rlm_depth") as u32;
+    let max_depth = value["rlm_max_depth"].as_u64().expect("has rlm_max_depth") as u32;
+    (depth, max_depth)
 }
 
 pub fn session_stop(state_dir: &Path, session_id: &str) -> String {

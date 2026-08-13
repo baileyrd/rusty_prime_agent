@@ -253,6 +253,12 @@ pub enum Command {
         thinking: Option<String>,
         tools: Option<String>,
         runtime: Option<String>,
+        /// Always supplied by the daemon at spawn time (see
+        /// `worker::WorkerArgs::rlm_depth`'s own doc comment for why this
+        /// can't wait until `AgentSession::create`/`recover` reads it back
+        /// out of persisted state instead).
+        rlm_depth: Option<u32>,
+        rlm_max_depth: Option<u32>,
     },
 }
 
@@ -887,6 +893,8 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
     let mut thinking = None;
     let mut tools = None;
     let mut runtime = None;
+    let mut rlm_depth = None;
+    let mut rlm_max_depth = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session-id" => {
@@ -956,6 +964,26 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
                         .clone(),
                 )
             }
+            "--rlm-depth" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| usage("--rlm-depth requires a value"))?;
+                rlm_depth = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| usage(format!("invalid --rlm-depth value {value:?}")))?,
+                )
+            }
+            "--rlm-max-depth" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| usage("--rlm-max-depth requires a value"))?;
+                rlm_max_depth = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| usage(format!("invalid --rlm-max-depth value {value:?}")))?,
+                )
+            }
             other => return Err(usage(format!("unknown __worker-main flag {other}"))),
         }
     }
@@ -970,5 +998,7 @@ fn parse_worker_main<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Co
         thinking,
         tools,
         runtime,
+        rlm_depth,
+        rlm_max_depth,
     })
 }
