@@ -588,8 +588,16 @@ above:
 - **`/share` (upload as a private gist).** -- **False**, already tracked
   in `PARITY.md` ("nothing on the other end to send it to").
 - **Message queue (Enter=steering, Alt+Enter=follow-up, queue
-  reordering).** -- **False**, consistent with the already-tracked
-  "steering vs. follow-up queuing structurally absent" finding.
+  reordering).** -- **Partial, one clause now closed.** **Closed**:
+  typing a follow-up while a prompt is still generating no longer blocks
+  or gets dropped -- it's queued and dispatched, in order, once the
+  in-flight reply lands (see `PARITY.md`'s "Interactive TUI: steering
+  vs. follow-up message queue" entry). **Still False**: no `Enter`-vs-
+  `Alt+Enter` keybinding distinction (there's exactly one behavior for a
+  submitted line while busy: queue it), no steering at all (interrupting
+  an in-flight prompt -- no cancellation primitive exists anywhere in
+  this project yet), and no queue reordering/editing UI once a line is
+  queued.
 - **Session flags: `-c`, `-r [path|id]`, `--no-session`, `--fork
   <path|id>`.** -- **Partial.** None exist as top-level flags; `--fork`
   exists only as the `session fork <id>` subcommand, keyed by UUID not

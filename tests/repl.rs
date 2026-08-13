@@ -47,6 +47,51 @@ fn repl_sends_each_line_as_a_prompt_and_exits_on_eof() {
 }
 
 #[test]
+fn repl_queues_lines_typed_while_a_reply_is_still_in_flight() {
+    // Parity with a bounded slice of `prime-agent`'s "steering vs.
+    // follow-up queuing" -- see `PARITY.md`'s own "Interactive TUI:
+    // steering vs. follow-up message queue" entry. All four lines are
+    // already sitting in the pipe before the REPL even starts reading,
+    // so the background reader can (and in practice reliably does) pull
+    // ahead of the first prompt's own daemon round trip -- a real
+    // socket hop plus transcript persistence -- while `session_repl`
+    // used to be fully synchronous (read one line, `.await` its whole
+    // reply, only then read the next) and could never even see a second
+    // line until the first was completely done.
+    let state_dir = common::TempDir::new("repl-followup-queue");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "one\ntwo\nthree\nfour\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for word in ["one", "two", "three", "four"] {
+        assert!(stdout.contains(&format!("echo: {word}")), "got: {stdout}");
+    }
+    // The reader really does pull ahead of the in-flight prompt in
+    // practice (confirmed manually and across repeated runs in this
+    // project's own sandbox) -- at least one of the three follow-up
+    // lines should have been queued rather than processed synchronously.
+    assert!(
+        stdout.contains("(queued -- will run once the current reply finishes)"),
+        "expected at least one line to be queued while a reply was in flight, got: {stdout}"
+    );
+    // Replies land in the same order they were typed -- the queue is
+    // FIFO, not reordered by whichever daemon round trip happens to
+    // finish first.
+    let one = stdout.find("echo: one").expect("echo: one");
+    let two = stdout.find("echo: two").expect("echo: two");
+    let three = stdout.find("echo: three").expect("echo: three");
+    let four = stdout.find("echo: four").expect("echo: four");
+    assert!(one < two && two < three && three < four, "got: {stdout}");
+
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=8"), "got: {listing}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
 fn repl_stops_at_an_explicit_exit_line_without_reaching_eof() {
     let state_dir = common::TempDir::new("repl-exit");
     common::daemon_start(state_dir.path());

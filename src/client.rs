@@ -797,8 +797,184 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
     } else {
         None
     };
-    let stdin = std::io::stdin();
-    while let Some(line) = next_repl_line(&stdin, raw_guard.is_some())? {
+    let raw_active = raw_guard.is_some();
+
+    // Parity with a bounded slice of `prime-agent`'s TUI-side "steering
+    // vs. follow-up queuing" -- see `PARITY.md`'s own "Interactive TUI:
+    // steering vs. follow-up message queue" entry for the full story of
+    // what's here and what deliberately isn't. Reading stdin used to be
+    // fully synchronous with sending a prompt: read one line, `.await`
+    // the daemon's full reply, print it, read the next line -- so there
+    // was never a window during which a second line could even be read.
+    // Now the line reader lives on its own persistent background task
+    // (`rusty_tokio::spawn_blocking`, looping internally rather than one
+    // fresh spawn per line -- `session_rpc`'s own stdin-reading loop can
+    // afford a fresh `spawn_blocking` per line because it never races
+    // that read against anything else; this loop does, so a persistent
+    // reader is required -- racing a *fresh* blocking read against an
+    // in-flight prompt on every iteration would risk two concurrent
+    // blocking reads on the same fd if the prompt happened to finish
+    // first and the read was abandoned mid-flight), feeding lines into
+    // `line_rx` as they arrive. The main loop below races that channel
+    // against whatever prompt is currently in flight (`current`, at most
+    // one at a time) using `rusty_tokio::select!`: a line that arrives
+    // while nothing is in flight is dispatched immediately, the same as
+    // before; a line that arrives while a prompt is still generating is
+    // queued (`queue`) and dispatched, in order, once the in-flight
+    // prompt's reply lands -- "follow-up queuing." Only ordinary prompt
+    // sends run concurrently with reading; slash commands (all of which
+    // are typically-fast local operations, or REPL wiring around another
+    // `client::session_*` function's own already-serial network round
+    // trip) still execute synchronously once dispatched, unchanged --
+    // widening every one of them to also run concurrently with an
+    // in-flight prompt is a larger surface than this increment covers,
+    // see `PARITY.md`'s own "full slash-command surface" entry.
+    //
+    // Deliberately *not* attempted here: "steering" -- interrupting an
+    // already-in-flight prompt instead of queuing a follow-up behind it.
+    // Investigated, not assumed: there is no cancellation primitive
+    // anywhere in this project's protocol/daemon/worker layers today (no
+    // `Request::SessionInterrupt`, nothing a client could send to abort
+    // a `session.lock().await`-held `prompt()` call already running
+    // server-side) -- see `PARITY.md`'s own "cancel primitive" entry for
+    // where that's tracked. Dropping the client-side `JoinHandle` for an
+    // in-flight send wouldn't cancel the daemon's own work; the worker
+    // would still process it and could append a stray, unrequested reply
+    // to the transcript later, incoherent with whatever the "steering"
+    // message produced instead. Building a real interrupt primitive is a
+    // separate, larger piece of work this increment doesn't take on.
+    //
+    // `stdout_lock` (an `Arc<std::sync::Mutex<()>>`, not `rusty_tokio::
+    // sync::Mutex` -- the reader lives on a `spawn_blocking` thread, a
+    // genuinely synchronous context that can't `.await` an async lock)
+    // guards every write `read_raw_line` makes against the main task's
+    // own output for a prompt that finishes (or gets queued) while the
+    // reader is concurrently mid-echo of the next line's keystrokes --
+    // the same shared-lock shape `session_rpc`'s own `stdout_lock`/
+    // `forward_events` already established for an analogous concurrent-
+    // writer problem. Bounded, not exhaustive: it covers this
+    // increment's own two new output points (the "queued" notice and a
+    // finished reply's print) plus every `read_raw_line` write, but does
+    // *not* reach into `session_compact`/`session_fork`/`session_tree`/
+    // etc.'s own internal `println!`/`print_json` calls (those are
+    // shared with the plain top-level, non-REPL CLI commands, which have
+    // no such lock and no reason to need one) -- a command's own output
+    // can still, in principle, interleave with live keystroke echo of
+    // whatever's typed immediately afterward, now that the reader runs
+    // continuously in the background regardless of what the main task is
+    // doing. Stated honestly rather than silently left uncovered: closing
+    // that residual gap would mean threading a lock through every shared
+    // client function's own print calls, a materially larger change than
+    // this increment's own scope.
+    let stdout_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let (line_tx, mut line_rx) =
+        rusty_tokio::sync::mpsc::unbounded_channel::<Result<Option<String>>>();
+    {
+        let stdout_lock = stdout_lock.clone();
+        rusty_tokio::spawn_blocking(move || {
+            let stdin = std::io::stdin();
+            loop {
+                let result = next_repl_line(&stdin, raw_active, &stdout_lock);
+                let keep_going = matches!(result, Ok(Some(_)));
+                if line_tx.send(result).is_err() || !keep_going {
+                    break;
+                }
+            }
+        });
+    }
+
+    // What woke the loop up: either the in-flight prompt completed, or
+    // another line arrived from the reader. Branches inside `rusty_tokio
+    // ::select!` below compute one of these and nothing else -- no
+    // mutation of any outer `let mut` state from inside a branch body.
+    // `rusty_tokio::select!` expands each branch into one shared, `move`
+    // `poll_fn` closure (see that macro's own module doc comment); a
+    // `move` closure captures every referenced outer variable *by
+    // value*, not merely by the reference its usage would otherwise
+    // need, so any outer `Vec`/`bool`/`Option` mutated directly inside a
+    // branch would just be silently lost once that one-shot closure is
+    // dropped at the end of the `.await` -- and referencing the same
+    // outer variable again on the *next* loop iteration would fail to
+    // compile outright ("borrow of moved value"), since it was already
+    // moved into the previous iteration's closure. Computing a plain
+    // value here and doing every mutation afterward, in ordinary code
+    // outside the macro, sidesteps both problems.
+    enum Wake {
+        PromptFinished(Result<crate::protocol::TranscriptEntry>),
+        Reader(Result<Option<String>>),
+    }
+
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut current: Option<rusty_tokio::JoinHandle<Result<crate::protocol::TranscriptEntry>>> =
+        None;
+    let mut reader_done = false;
+
+    loop {
+        if let Some(handle) = current.as_mut() {
+            // A fresh reborrow each iteration, referenced by name (not
+            // `line_rx` itself) inside the macro below for the same
+            // move-capture reason `Wake` exists -- see that enum's own
+            // doc comment. `line_rx` is used again on later iterations
+            // (both here and in the idle branch further down), so the
+            // actual receiver must never itself be moved into a
+            // select!-generated closure.
+            let line_rx_ref = &mut line_rx;
+            let wake = rusty_tokio::select! {
+                joined = handle => {
+                    Wake::PromptFinished(
+                        joined
+                            .map_err(|e| {
+                                HarnessError::protocol(
+                                    Context::Cli,
+                                    format!("prompt task did not complete: {e}"),
+                                )
+                            })
+                            .and_then(|inner| inner),
+                    )
+                },
+                received = line_rx_ref.recv() => {
+                    Wake::Reader(received.unwrap_or(Ok(None)))
+                },
+            };
+            match wake {
+                Wake::PromptFinished(result) => {
+                    current = None;
+                    let entry = result?;
+                    let _guard = stdout_lock.lock().unwrap();
+                    match mode {
+                        OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+                        OutputMode::Text => print_entry(&entry),
+                    }
+                }
+                Wake::Reader(Ok(Some(l))) => {
+                    if !l.trim().is_empty() {
+                        let _guard = stdout_lock.lock().unwrap();
+                        println!("(queued -- will run once the current reply finishes)");
+                        drop(_guard);
+                        queue.push_back(l);
+                    }
+                }
+                Wake::Reader(Ok(None)) => reader_done = true,
+                Wake::Reader(Err(e)) => return Err(e),
+            }
+            continue;
+        }
+
+        let line = if let Some(l) = queue.pop_front() {
+            l
+        } else if reader_done {
+            break;
+        } else {
+            match line_rx.recv().await {
+                Some(Ok(Some(l))) => l,
+                Some(Ok(None)) | None => {
+                    reader_done = true;
+                    continue;
+                }
+                Some(Err(e)) => return Err(e),
+            }
+        };
+
         let text = line.trim();
         if text.is_empty() {
             continue;
@@ -1019,15 +1195,22 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         let (text_to_send, at_images) = expand_at_references(&text_to_send);
         let mut images = std::mem::take(&mut pending_images);
         images.extend(at_images);
-        let entry = if images.is_empty() {
-            send_prompt(state_root, &session_id, text_to_send).await?
+        let images = if images.is_empty() {
+            None
         } else {
-            send_prompt_with_images(state_root, &session_id, text_to_send, Some(images)).await?
+            Some(images)
         };
-        match mode {
-            OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
-            OutputMode::Text => print_entry(&entry),
-        }
+        // Spawned rather than `.await`ed directly -- this is the one
+        // dispatch branch that runs concurrently with reading further
+        // lines, per this function's own `stdout_lock` doc comment
+        // above. `current` being `Some` is what puts the top of this
+        // loop into its "busy" (queue-while-generating) mode next
+        // iteration.
+        let owned_root = state_root.to_path_buf();
+        let owned_session_id = session_id.clone();
+        current = Some(rusty_tokio::spawn(async move {
+            send_prompt_with_images(&owned_root, &owned_session_id, text_to_send, images).await
+        }));
     }
     Ok(())
 }
@@ -1039,9 +1222,13 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
 /// tests pipes stdin, so this is the path they all still exercise,
 /// unchanged). `Ok(None)` at EOF either way -- the same "loop just ends"
 /// signal the previous `for line in stdin.lock().lines()` gave.
-fn next_repl_line(stdin: &std::io::Stdin, raw_active: bool) -> Result<Option<String>> {
+fn next_repl_line(
+    stdin: &std::io::Stdin,
+    raw_active: bool,
+    stdout_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+) -> Result<Option<String>> {
     if raw_active {
-        return read_raw_line(stdin);
+        return read_raw_line(stdin, stdout_lock);
     }
     use std::io::BufRead;
     let mut buf = String::new();
@@ -1084,7 +1271,10 @@ fn next_repl_line(stdin: &std::io::Stdin, raw_active: bool) -> Result<Option<Str
 /// still render correctly since each byte is echoed immediately as
 /// typed, the same way a real terminal emulator assembles a UTF-8
 /// sequence from bytes arriving one at a time.
-fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
+fn read_raw_line(
+    stdin: &std::io::Stdin,
+    stdout_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+) -> Result<Option<String>> {
     use std::io::{Read, Write};
     let mut locked = stdin.lock();
     let mut out = std::io::stdout();
@@ -1099,8 +1289,19 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
             // on an empty line: end the REPL.
             return Ok(None);
         }
+        // Every write below is taken under `stdout_lock` -- since
+        // increment #79 (the follow-up message queue), this function
+        // runs continuously on its own background task while a prior
+        // prompt may still be generating and printing its own reply
+        // concurrently on the main task; without a shared lock the two
+        // could interleave mid-write and garble the terminal. See
+        // `session_repl`'s own doc comment on `stdout_lock` for the
+        // full story -- the same shared-lock shape `session_rpc`'s
+        // `forward_events` already established for an analogous
+        // concurrent-writer problem.
         match byte[0] {
             b'\r' => {
+                let _guard = stdout_lock.lock().unwrap();
                 let _ = out.write_all(b"\r\n");
                 let _ = out.flush();
                 return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
@@ -1111,36 +1312,39 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
                 // comment for why `\r`/`\n` can be told apart at all
                 // here.
                 buf.push(b'\n');
+                let _guard = stdout_lock.lock().unwrap();
                 let _ = out.write_all(b"\r\n");
                 let _ = out.flush();
             }
             0x03 => {
                 buf.clear();
+                let _guard = stdout_lock.lock().unwrap();
                 let _ = out.write_all(b"^C\r\n");
                 let _ = out.flush();
             }
             0x04 if buf.is_empty() => {
+                let _guard = stdout_lock.lock().unwrap();
                 let _ = out.write_all(b"\r\n");
                 let _ = out.flush();
                 return Ok(None);
             }
-            0x7f | 0x08 => {
-                match buf.pop() {
-                    Some(b'\n') => {
-                        // Rejoins the buffer, but doesn't try to move
-                        // the terminal's own cursor back up a line it
-                        // already scrolled past -- see this function's
-                        // own doc comment for why that stays out of
-                        // scope here.
-                    }
-                    Some(_) => {
-                        let _ = out.write_all(b"\x08 \x08");
-                        let _ = out.flush();
-                    }
-                    None => {}
+            0x7f | 0x08 => match buf.pop() {
+                Some(b'\n') => {
+                    // Rejoins the buffer, but doesn't try to move
+                    // the terminal's own cursor back up a line it
+                    // already scrolled past -- see this function's
+                    // own doc comment for why that stays out of
+                    // scope here.
                 }
-            }
+                Some(_) => {
+                    let _guard = stdout_lock.lock().unwrap();
+                    let _ = out.write_all(b"\x08 \x08");
+                    let _ = out.flush();
+                }
+                None => {}
+            },
             0x09 => {
+                let _guard = stdout_lock.lock().unwrap();
                 if let Some(completed) = complete_repl_line(&buf) {
                     let erase = buf.len() - completed.common_prefix_len;
                     for _ in 0..erase {
@@ -1161,6 +1365,7 @@ fn read_raw_line(stdin: &std::io::Stdin) -> Result<Option<String>> {
             }
             b => {
                 buf.push(b);
+                let _guard = stdout_lock.lock().unwrap();
                 let _ = out.write_all(&[b]);
                 let _ = out.flush();
             }
