@@ -2774,6 +2774,107 @@ daemon/worker split rather than requiring the Python control environment:
   own module doc comment already states for testing compaction's actual
   effect end-to-end. The in-process `session.rs` unit tests above are the
   real, meaningful coverage instead.
+- [x] **Bounded candidates batch 3: session/CLI convenience.** Four
+  small, independent gaps, all named directly in `CLAIMS_AUDIT.md`'s own
+  checklist.
+
+  **Resume-by-partial-ID convenience.** `CLAIMS_AUDIT.md` scoped this
+  narrowly ("a small prefix-match helper ahead of `session attach`/
+  `session fork`"), but a `grep` for every place the daemon validates a
+  `session_id` against disk found exactly seven real chokepoints:
+  `resolve_worker` (used by ten handlers) plus six standalone handlers
+  doing their own inline `state_file_path(...).exists()` check
+  (`handle_schedule_add`/`handle_schedule_list`/`handle_schedule_cancel`/
+  `handle_session_stop`/`handle_goal_show`/`handle_harness_show`). New
+  `Daemon::resolve_session_id(&self, partial: &str) -> String`: returns
+  `partial` unchanged if it already names a real session directly (the
+  fast, common path -- checked first even though a full id being a
+  literal prefix of some other session's own id is vanishingly unlikely
+  given `new_session_id`'s nanosecond-timestamp-plus-pid shape), else
+  resolves via `catalog::scan` to the one real session id starting with
+  it if exactly one matches. Zero matches or more than one both fall
+  through to returning `partial` itself unresolved -- every caller
+  already has its own "unknown session" error path for that string, so
+  an ambiguous prefix and a genuinely unknown one are reported
+  identically, a real but bounded imprecision, not a distinction this
+  slice attempts. Wired into all seven chokepoints, covering effectively
+  every session-scoped daemon request rather than just the two named in
+  the checklist, with zero protocol/CLI changes needed. New `tests/
+  partial_session_id.rs`: an unambiguous prefix resolves the same as the
+  full id (proven through `session goal show`/`session schedule list`/
+  `session stop`), a full exact id still wins even when a second session
+  exists that it could also be read as a prefix of, an ambiguous prefix
+  (`"sess-"`, matching every session) reports the existing "unknown
+  session" error rather than guessing, and a prefix matching nothing
+  does the same.
+
+  **`daemon shutdown --force`.** `Request::DaemonShutdown` gains a
+  `force: bool` field. `force: false` (the default, unchanged) still
+  sends `Request::WorkerShutdown` to every `Active` session's worker and
+  waits for each ack before tearing down the daemon's own sockets.
+  `force: true` skips that round trip entirely -- useful when a worker
+  has wedged and its ack would otherwise hang the whole shutdown. Skipped
+  workers are not killed, just not waited on: they keep running headless,
+  exactly the same "supervisor gone, worker still alive" state this
+  project's own crash recovery (`is_worker_alive`/`resolve_worker`)
+  already has to and does handle for an actual crash, so nothing about a
+  forced shutdown needed new recovery machinery. New `tests/
+  session_lifecycle.rs` test proves both halves at once: after `daemon
+  shutdown --force` on a session with a live worker, `state.json` still
+  reads `"active"` (a graceful shutdown would have flipped it to
+  `"stopped"` via `mark_stopped` before ever acking), and a fresh daemon
+  on the same state root can still reach the orphaned worker rather than
+  finding it crashed.
+
+  **A `--no-session`/ephemeral-mode flag.** `-p`/`--print` gains
+  `--no-session` (`cli::Command::Print::no_session`, a third strict
+  leading flag alongside `--model`, composable in either order). Unlike
+  ordinary `-p` (`client::print_once`, which creates a real, durably
+  persisted session via the daemon), `--no-session` routes through new
+  `client::print_ephemeral`: no daemon, no worker process, nothing left
+  in `session list` afterward. It reuses the exact in-process path the
+  embeddable SDK already established for a non-daemon caller
+  (`AgentSession::create`, see `tests/embedded_session.rs`), pointed at a
+  throwaway scratch directory under the OS temp dir that's removed again
+  (along with any `rp-server` sidecar `--model` needed) once the prompt
+  completes. Honest caveat: `AgentSession::create`'s durable `state.json`/
+  `transcript.jsonl` writes have no in-memory-only mode to opt out of, so
+  "no session persists" is enforced by cleaning up after the fact rather
+  than by skipping the writes in the first place -- a real implementation
+  difference from prime-agent's own in-memory-only ephemeral sessions,
+  but not a user-visible one: nothing durable remains on disk by the time
+  the command returns either way. `--model` still works in ephemeral mode
+  (reuses `worker::build_provider`, now `pub(crate)`, plus an explicit
+  `rp_server::ensure_running` call this path has to make itself since
+  there's no daemon-side spawn-ordering to lean on); `--thinking`/
+  `--tools`/`--runtime` are not exposed here, the same as ordinary `-p`
+  already doesn't expose them. Three new `tests/session_lifecycle.rs`
+  tests: a successful ephemeral prompt starts no daemon (`daemon.pid`
+  never created) and leaves no `sessions/` entries behind; `--no-session`
+  and `--model` compose in either order (proven via the same
+  no-rp-server-available failure `session_new_with_model_fails_loudly_
+  when_rp_server_is_unavailable` already exercises, still without ever
+  starting a daemon).
+
+  **Piped-stdin merging for `-p`.** New `merge_piped_stdin` (`lib.rs`):
+  when `-p`'s own stdin is not a terminal (`std::io::IsTerminal`), its
+  full contents are read and appended to the prompt text, blank-line
+  separated, before either the `print_once` or `print_ephemeral` path
+  runs -- no protocol change needed, matching `CLAIMS_AUDIT.md`'s own
+  scoping. Fails open: an I/O error reading an already-non-terminal
+  stdin is treated as "nothing piped" rather than failing the command,
+  since the prompt text already given on the command line is still a
+  valid prompt on its own. A real hazard caught before it could land in
+  CI: `tests/common/mod.rs`'s `run()` helper spawns the compiled binary
+  with stdin inherited from the test process by default, which is
+  usually not a terminal either -- every existing `-p` test would have
+  started blocking on stdin, waiting for an EOF nothing was ever going to
+  send. Fixed by having `run()` explicitly set `Stdio::null()` (read as
+  immediate empty EOF -- safe, not a hang) and adding two tests that
+  build their own `Command` with a real `Stdio::piped()`: one proves a
+  real piped file's contents get appended correctly, the other proves an
+  explicitly-empty pipe (`common::run`'s new default) leaves the prompt
+  text untouched rather than appending a stray blank line.
 
 ## Needs a new subsystem
 

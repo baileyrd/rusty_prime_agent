@@ -637,15 +637,18 @@ above:
   and have this same session act on it right away. A caller in a second
   terminal/process can already interrupt a running turn today.
 - **Session flags: `-c`, `-r [path|id]`, `--no-session`, `--fork
-  <path|id>`.** -- **Partial.** None exist as top-level flags; `--fork`
-  exists only as the `session fork <id>` subcommand, keyed by UUID not
-  path.
+  <path|id>`.** -- **Partial.** `--no-session` now exists, but only on
+  `-p`/`--print` (see `PARITY.md`'s "Bounded candidates batch 3" entry),
+  not as a general top-level flag every subcommand honors. `-c`/`-r` are
+  still absent, and `--fork` still exists only as the `session fork <id>`
+  subcommand, keyed by UUID not path.
 - **CLI command list: `agents`, `list [--all]`, `attach`, `stop`,
   `rename`, `send`, `schedule`, `status`, `doctor`, `shutdown [--force]`,
   `package install/remove/list/update`, `update [--force]`, `config`.**
   -- **Partial.** `list`/`attach`/`stop`/`rename`/`schedule`/`status`/
-  `shutdown` map to real subcommands. `send` maps to `session message`
-  but requires an existing parent/child relationship rather than
+  `shutdown [--force]` all map to real subcommands (`--force` shipped in
+  "Bounded candidates batch 3", see `PARITY.md`). `send` maps to `session
+  message` but requires an existing parent/child relationship rather than
   addressing any agent freely. `update` now exists too (`harness update
   [--force]`, a best-effort translation with no release channel behind
   it -- see `PARITY.md`'s own "Self-update" entry), and so does `doctor`
@@ -1218,21 +1221,27 @@ From the recursive doc-tree pass:
       `session list` already returns the right data (every status
       tier); a bounded slice adds a simple filter/select-to-attach text
       picker on top, no new data source needed.
-- [ ] **Resume-by-partial-ID convenience.** Sessions are addressed only
-      by full UUID today; a small prefix-match helper ahead of `session
-      attach`/`session fork` would need no protocol change.
-- [ ] **`daemon shutdown --force`.** Currently unconditional; a `--force`
-      flag distinguishing "graceful `WorkerShutdown` to every session"
-      from "skip the round trip and just clean up sockets" is a small
-      addition to the existing handler.
-- [ ] **A `--no-session`/ephemeral-mode flag.** No such flag exists on
-      `session new`/`-p` today; would skip `state.json`/`transcript.jsonl`
-      persistence, reusing the in-memory `AgentSession::create` path the
-      embeddable SDK already established for a non-daemon caller.
-- [ ] **Piped-stdin merging for `-p`.** `print_once` never reads stdin
-      today; a bounded slice checks `stdin().is_terminal()` and, if
-      piped, merges it into `text` before the existing `SessionNew`/
-      `SessionPrompt` calls -- no protocol change needed.
+- [x] **Resume-by-partial-ID convenience** -- shipped as `Daemon::
+      resolve_session_id`, wired into all seven real session-id-
+      validation chokepoints (`resolve_worker` plus six standalone
+      handlers), not just `session attach`/`session fork` as originally
+      scoped -- see `PARITY.md`'s "Bounded candidates batch 3" entry.
+- [x] **`daemon shutdown --force`** -- shipped: `Request::DaemonShutdown`
+      gained a `force: bool` field; `true` skips the per-session
+      `WorkerShutdown` round trip, leaving any still-running worker
+      orphaned but reachable, the same "supervisor gone, worker still
+      alive" state crash recovery already handles.
+- [x] **A `--no-session`/ephemeral-mode flag** -- shipped on `-p`/
+      `--print` (not `session new`, which has no ephemeral equivalent to
+      offer): `--no-session` routes through new `client::print_ephemeral`,
+      reusing `AgentSession::create` against a throwaway scratch
+      directory removed once the prompt completes -- no daemon, no
+      worker, nothing left in `session list`. See `PARITY.md`'s "Bounded
+      candidates batch 3" entry for the honest caveat on what "no
+      persistence" means mechanically here.
+- [x] **Piped-stdin merging for `-p`** -- shipped as `lib::merge_piped_
+      stdin`, checked via `std::io::IsTerminal` before either the
+      `print_once` or `print_ephemeral` path runs, no protocol change.
 
 Not candidates -- structurally out of scope, same reasoning as
 `PARITY.md`'s "Needs a new subsystem" section: prompt-as-a-variable

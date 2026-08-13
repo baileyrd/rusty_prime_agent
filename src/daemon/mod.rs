@@ -249,7 +249,9 @@ impl Supervisor {
         match request {
             Request::Ping => conn.write_response(Context::Daemon, &Response::Pong).await,
             Request::DaemonStatus => self.handle_daemon_status(&mut conn).await,
-            Request::DaemonShutdown => self.handle_daemon_shutdown(&mut conn).await,
+            Request::DaemonShutdown { force } => {
+                self.handle_daemon_shutdown(&mut conn, force).await
+            }
             Request::SessionNew {
                 name,
                 model,
@@ -420,18 +422,20 @@ impl Supervisor {
         .await
     }
 
-    async fn handle_daemon_shutdown(&self, conn: &mut LineStream) -> Result<()> {
-        let sessions = catalog::scan(&self.state_root)?;
-        for summary in sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Active)
-        {
-            let socket_path = paths::worker_socket_path(&self.state_root, &summary.session_id);
-            if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
-                let _ = private
-                    .write_request(Context::Worker, &Request::WorkerShutdown)
-                    .await;
-                let _ = private.read_response(Context::Worker).await;
+    async fn handle_daemon_shutdown(&self, conn: &mut LineStream, force: bool) -> Result<()> {
+        if !force {
+            let sessions = catalog::scan(&self.state_root)?;
+            for summary in sessions
+                .iter()
+                .filter(|s| s.status == SessionStatus::Active)
+            {
+                let socket_path = paths::worker_socket_path(&self.state_root, &summary.session_id);
+                if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
+                    let _ = private
+                        .write_request(Context::Worker, &Request::WorkerShutdown)
+                        .await;
+                    let _ = private.read_response(Context::Worker).await;
+                }
             }
         }
         conn.write_response(Context::Daemon, &Response::DaemonShutdownAck)
@@ -718,6 +722,7 @@ impl Supervisor {
         text: String,
         kind: crate::protocol::ScheduleKind,
     ) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -736,6 +741,7 @@ impl Supervisor {
     }
 
     async fn handle_schedule_list(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -759,6 +765,7 @@ impl Supervisor {
         session_id: String,
         schedule_id: String,
     ) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -921,17 +928,54 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Resume-by-partial-ID convenience -- see `PARITY.md`'s "Bounded
+    /// candidates batch 3" entry. `partial` is returned unchanged
+    /// whenever it already names a real session directly (the fast,
+    /// common path, and also what keeps a full id from ever being
+    /// second-guessed even if it happens to be a literal prefix of some
+    /// other session's own id -- vanishingly unlikely given `new_session_
+    /// id`'s own nanosecond-timestamp-plus-pid shape, but checked first
+    /// regardless rather than assumed impossible) or whenever it
+    /// resolves, via `catalog::scan`, to *exactly* one real session id
+    /// starting with it. Zero matches or more than one both fall through
+    /// to returning `partial` itself unresolved -- every caller already
+    /// has its own "unknown session" error path for that string, so
+    /// there's no need for this function to duplicate it (an ambiguous
+    /// prefix and a genuinely unknown one end up reported identically,
+    /// a real but bounded imprecision, not a distinction this bounded
+    /// slice attempts).
+    fn resolve_session_id(&self, partial: &str) -> String {
+        let session_dir = paths::session_dir(&self.state_root, partial);
+        if paths::state_file_path(&session_dir).exists() {
+            return partial.to_string();
+        }
+        let Ok(sessions) = catalog::scan(&self.state_root) else {
+            return partial.to_string();
+        };
+        let mut matches = sessions
+            .into_iter()
+            .map(|s| s.session_id)
+            .filter(|id| id.starts_with(partial));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => only,
+            _ => partial.to_string(),
+        }
+    }
+
     /// Shared by `SessionAttach`/`SessionPrompt`: validate the session
     /// exists, recover/resume its worker if needed, and report either
     /// path as a structured `session_already_active`-shaped
     /// [`Response::Error`] rather than a bug when it fails -- matching
     /// the reference protocol's own "structured errors for recoverable
-    /// cases" contract.
+    /// cases" contract. `session_id` is resolved through `resolve_
+    /// session_id` first, so every one of this function's ten callers
+    /// gets partial-id resolution for free.
     async fn resolve_worker(
         &self,
         conn: &mut LineStream,
         session_id: &str,
     ) -> Result<Option<PathBuf>> {
+        let session_id = &self.resolve_session_id(session_id);
         let session_dir = paths::session_dir(&self.state_root, session_id);
         if !paths::state_file_path(&session_dir).exists() {
             conn.write_response(
@@ -999,6 +1043,7 @@ impl Supervisor {
     /// could observe "no live worker" just before the other request
     /// finishes spawning one, then never stop it.
     async fn handle_session_stop(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1285,6 +1330,7 @@ impl Supervisor {
     }
 
     async fn handle_goal_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1332,6 +1378,7 @@ impl Supervisor {
     }
 
     async fn handle_harness_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
+        let session_id = self.resolve_session_id(&session_id);
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn

@@ -301,6 +301,123 @@ fn print_mode_starts_a_daemon_and_prints_just_the_reply() {
 }
 
 #[test]
+fn print_no_session_never_starts_a_daemon_or_leaves_a_session_behind() {
+    // Parity with `prime-agent --no-session` (`CLAIMS_AUDIT.md`'s
+    // "Session flags" entry). Unlike ordinary `-p`, this must not need
+    // (or start) a daemon at all, and must leave nothing behind under
+    // `RUSTY_PRIME_AGENT_HOME` once it returns.
+    let state_dir = common::TempDir::new("print-no-session");
+
+    let out = common::run(
+        state_dir.path(),
+        &["-p", "--no-session", "hello", "ephemeral", "world"],
+    );
+    common::assert_success("-p --no-session", &out);
+    assert_eq!(
+        common::stdout_string(&out),
+        "echo: hello ephemeral world",
+        "ephemeral print mode should output only the reply text"
+    );
+
+    // No daemon was started: `daemon.pid`/`daemon.sock` were never
+    // created under this state root.
+    assert!(
+        !state_dir.path().join("daemon.pid").exists(),
+        "-p --no-session must not start a daemon"
+    );
+    // No session directory was created either -- ephemeral really means
+    // ephemeral, not just "not listed."
+    let sessions_dir = state_dir.path().join("sessions");
+    let session_count = std::fs::read_dir(&sessions_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        session_count, 0,
+        "-p --no-session must not leave any session directory behind"
+    );
+}
+
+#[test]
+fn print_no_session_and_model_flags_compose_in_either_order() {
+    // `--no-session` and `--model` are both strict leading flags on `-p`
+    // -- proves the parser accepts either ordering ahead of the prompt
+    // text. No real `--model` backend is available in CI (see
+    // `session_new_with_model_fails_loudly_when_rp_server_is_unavailable`),
+    // so this only proves the flags parse and the ephemeral path is
+    // reached (a real rp-server round trip is covered manually/
+    // end-to-end elsewhere, same as every other `--model` test here).
+    let state_dir = common::TempDir::new("print-no-session-and-model-order");
+
+    let out = common::run(
+        state_dir.path(),
+        &["-p", "--no-session", "--model", "ollama/qwen2.5:0.5b", "hi"],
+    );
+    assert!(
+        !out.status.success(),
+        "a --model that has no reachable rp-server should still fail loudly in ephemeral mode"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rp-server"),
+        "failure should mention rp-server, not a vague error, got: {stderr}"
+    );
+    assert!(
+        !state_dir.path().join("daemon.pid").exists(),
+        "a failed ephemeral --model attempt still must not have started a daemon"
+    );
+}
+
+#[test]
+fn print_merges_piped_stdin_into_the_prompt_text() {
+    // Parity with a bounded slice of `prime-agent -p`'s piped-stdin
+    // handling (`CLAIMS_AUDIT.md`'s "Bounded candidates batch 3" entry):
+    // when `-p`'s stdin isn't a terminal, whatever it contains is read
+    // and appended to the prompt text. `common::run` deliberately nulls
+    // stdin (see its own doc comment), so this test builds its own
+    // `Command` with a real piped stdin instead.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let state_dir = common::TempDir::new("print-piped-stdin");
+
+    let mut child = Command::new(common::bin())
+        .args(["-p", "--no-session", "summarize this:"])
+        .env("RUSTY_PRIME_AGENT_HOME", state_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn harness");
+    child
+        .stdin
+        .take()
+        .expect("child stdin should be piped")
+        .write_all(b"piped file contents\nsecond line\n")
+        .expect("write to child stdin");
+    let out = child.wait_with_output().expect("wait for harness");
+
+    common::assert_success("-p with piped stdin", &out);
+    assert_eq!(
+        common::stdout_string(&out),
+        "echo: summarize this:\n\npiped file contents\nsecond line",
+        "piped stdin should be appended to the prompt text, blank-line separated"
+    );
+}
+
+#[test]
+fn print_does_not_read_stdin_when_nothing_is_piped() {
+    // The other half of the same feature: `common::run` nulls stdin,
+    // which reads as EOF immediately (empty), not a terminal -- proving
+    // an empty/absent pipe leaves the prompt text untouched rather than
+    // appending a stray blank line.
+    let state_dir = common::TempDir::new("print-no-piped-stdin");
+
+    let out = common::run(state_dir.path(), &["-p", "--no-session", "just", "text"]);
+    common::assert_success("-p with no piped stdin", &out);
+    assert_eq!(common::stdout_string(&out), "echo: just text");
+}
+
+#[test]
 fn session_new_with_model_fails_loudly_when_rp_server_is_unavailable() {
     // CI has no `rp-server` binary on PATH (see `tests/ollama_provider.rs`
     // for the real, manually-run end-to-end coverage that does). This
@@ -324,6 +441,47 @@ fn session_new_with_model_fails_loudly_when_rp_server_is_unavailable() {
         stderr.contains("rp-server"),
         "failure should mention rp-server, not a vague error, got: {stderr}"
     );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn daemon_shutdown_force_skips_the_graceful_worker_round_trip() {
+    // Parity with `PARITY.md`'s "Bounded candidates batch 3" entry:
+    // `daemon shutdown --force` skips the per-session `WorkerShutdown`
+    // round trip (`session::mark_stopped`'s `status = Stopped` write)
+    // that an ordinary `daemon shutdown` performs. Proven two ways: the
+    // session's own `state.json` still reads "active" afterward (a
+    // graceful shutdown would have flipped it to "stopped" before this
+    // process even sent its ack), and the orphaned worker is still
+    // alive and reachable -- a fresh daemon on the same state root can
+    // still talk to it rather than finding it crashed.
+    let state_dir = common::TempDir::new("daemon-shutdown-force");
+    common::daemon_start(state_dir.path());
+
+    let session_id = common::session_new(state_dir.path(), None);
+    assert_eq!(
+        common::session_status(state_dir.path(), &session_id),
+        "active"
+    );
+
+    let out = common::run(state_dir.path(), &["daemon", "shutdown", "--force"]);
+    common::assert_success("daemon shutdown --force", &out);
+    assert_eq!(common::stdout_string(&out), "daemon shut down");
+
+    assert_eq!(
+        common::session_status(state_dir.path(), &session_id),
+        "active",
+        "a forced shutdown must not have run the graceful WorkerShutdown \
+         that would have flipped this to 'stopped'"
+    );
+
+    // The orphaned worker is still alive: a fresh daemon on the same
+    // state root can still reach it (not "crashed and needs recovery").
+    common::daemon_start(state_dir.path());
+    let out = common::run(state_dir.path(), &["session", "goal", "show", &session_id]);
+    common::assert_success("session goal show (after forced shutdown)", &out);
+    assert_eq!(common::stdout_string(&out), "no goal");
 
     common::daemon_shutdown(state_dir.path());
 }

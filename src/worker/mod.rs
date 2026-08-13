@@ -128,7 +128,13 @@ pub struct WorkerArgs {
 /// is `Some`) -- `rp_server::read_port` finding nothing recorded here
 /// would mean that invariant broke, worth failing loudly on rather than
 /// silently falling back to `EchoProvider`.
-fn build_provider(
+///
+/// `pub(crate)`, not private: `client::print_ephemeral` (`-p
+/// --no-session`) reuses this directly too, the same "no daemon/worker
+/// process in the loop, but still the exact same provider-selection
+/// rule" reasoning `AgentSession::create`'s own doc comment already
+/// gives for the embeddable SDK generally.
+pub(crate) fn build_provider(
     state_root: &Path,
     model: Option<String>,
     thinking: Option<String>,

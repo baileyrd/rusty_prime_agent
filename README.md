@@ -47,7 +47,19 @@ harness -p "hello there"
 ```
 
 `-p`/`--print` transparently starts a daemon if none is running, creates
-an unnamed session, prompts it once, and prints just the reply.
+an unnamed session, prompts it once, and prints just the reply. Add
+`--no-session` to skip the daemon entirely instead: the prompt runs
+in-process against a throwaway session that's cleaned up as soon as it
+finishes, so nothing shows up in `session list` and nothing durable is
+left behind (`--model` still works in this mode). If `-p`'s stdin isn't
+a terminal -- `harness -p "summarize:" < notes.txt`, or `cat notes.txt |
+harness -p "summarize:"` -- its full contents are read and appended to
+the prompt text.
+
+```sh
+harness -p --no-session "hello there"
+harness -p "summarize:" < notes.txt
+```
 
 By default every session uses a built-in echo provider (no model, no
 network). Point a session at a real model with `--model
@@ -150,8 +162,13 @@ harness session new --model ollama/qwen2.5:0.5b --runtime ipython
 ```sh
 harness daemon start                 # idempotent; spawns a detached supervisor
 harness daemon status                # pid, generation, active session count
-harness daemon shutdown              # gracefully stops every worker, then exits
+harness daemon shutdown [--force]    # gracefully stops every worker, then exits
 ```
+
+`--force` skips waiting on each session's own graceful shutdown -- useful
+if a worker has wedged and would otherwise hang `daemon shutdown`. A
+skipped worker isn't killed, just not waited on: it keeps running and
+stays reachable, the same as after any other supervisor crash.
 
 ### Sessions
 
@@ -170,6 +187,12 @@ harness session branch-summary <id> <sequence>   # ask the model to summarize a 
 harness session heartbeat <id> [--every DURATION]  # manually re-enter the session's active goal
 harness session interrupt <id>                # request an in-flight turn stop before its next round
 ```
+
+Every `<id>` above also accepts a short, unambiguous prefix of a real
+session id instead of the full string -- `session stop sess-1a2b3` works
+as long as exactly one session starts with `sess-1a2b3`. A prefix
+matching zero or more than one session is reported the same as an
+unknown id outright, not guessed at.
 
 `session prompt <id> --image <path>` attaches a local image (recognized
 by extension: png/jpg/jpeg/gif/webp/bmp) to the prompt, encoded as a
