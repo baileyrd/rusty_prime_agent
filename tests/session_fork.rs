@@ -2,7 +2,8 @@
 //! `prime-agent`'s `/fork`, see `protocol::Request::SessionFork`'s own
 //! doc comment for exactly what's implemented (session-level forking,
 //! reusing this project's existing session-creation machinery) and what
-//! isn't (`/tree` visualization, active-leaf switching, `/clone`).
+//! isn't (`/clone`'s live-state duplication -- `/tree` visualization and
+//! active-leaf switching are covered by `tests/session_tree.rs` instead).
 
 mod common;
 

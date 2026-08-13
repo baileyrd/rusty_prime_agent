@@ -17,7 +17,7 @@ use crate::paths;
 use crate::procutil;
 use crate::protocol::{
     GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessNoteKind, HarnessState,
-    Request, Response, Role, SessionEvent, SessionStatus, TranscriptEntry,
+    Request, Response, Role, SessionEvent, SessionState, SessionStatus, TranscriptEntry,
 };
 use crate::transport;
 
@@ -899,6 +899,36 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if text == "/tree" {
+            // Parity with a bounded slice of `prime-agent`'s TUI-side
+            // `/tree` visualization -- `session tree` itself already
+            // exists as a top-level `harness session tree <id>` command
+            // (see `client::session_tree`'s own doc comment); this is
+            // just wiring the same client-side call into the REPL loop,
+            // the identical shape `/compact`/`/fork` above already have.
+            session_tree(state_root, session_id.clone(), mode).await?;
+            continue;
+        }
+        if let Some(sequence_str) = text
+            .strip_prefix("/tree ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with `prime-agent`'s `/tree` navigation half:
+            // `/tree <sequence>` switches this session's active leaf
+            // instead of just displaying the tree, the same "one command
+            // name, display with no argument, act with one" shape a
+            // bounded REPL slice can afford without a real interactive
+            // picker (see `PARITY.md`'s intra-session-branching entry for
+            // why that picker itself stays out of scope).
+            match sequence_str.parse::<u64>() {
+                Ok(sequence) => {
+                    session_set_active_leaf(state_root, session_id.clone(), sequence, mode).await?;
+                }
+                Err(_) => println!("`/tree <sequence>` requires an integer, got {sequence_str:?}"),
+            }
+            continue;
+        }
         if let Some(path) = text
             .strip_prefix("/export ")
             .map(str::trim)
@@ -1303,6 +1333,138 @@ pub async fn session_fork(
     }
 }
 
+/// `session tree <id>` -- parity with `prime-agent`'s `/tree`
+/// visualization half: prints every branch of `session_id`'s own
+/// transcript (not just the active one -- `session attach`'s own "full,
+/// unfiltered audit trail" reasoning applies here too), indented by
+/// depth, with the entry `state.active_leaf_sequence` currently points
+/// at marked `(active)`. Read-only; see [`session_set_active_leaf`] for
+/// the navigation half that actually moves the active leaf.
+///
+/// Reconstructs the tree client-side from the same two fields the wire
+/// protocol already carries (`TranscriptEntry::parent_sequence`,
+/// `SessionState::active_leaf_sequence`) rather than adding a new
+/// request/response shape just to pre-render it server-side -- this
+/// project's own "the client renders, the wire carries data" split every
+/// other `--mode text` renderer already follows. `effective_parent`
+/// mirrors `session::AgentSession::active_chain`'s own legacy-fallback
+/// rule exactly (`parent_sequence: None` with `sequence > 1` implicitly
+/// continues from `sequence - 1`), so a pre-branching session's tree
+/// still renders as the flat chain it always was.
+pub async fn session_tree(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
+    let (state, transcript) = fetch_session_snapshot(state_root, &session_id).await?;
+    if mode == OutputMode::Json {
+        print_json(&serde_json::json!({
+            "type": "session_tree",
+            "active_leaf_sequence": state.active_leaf_sequence,
+            "transcript": transcript,
+        }));
+        return Ok(());
+    }
+    if transcript.is_empty() {
+        println!("(no turns yet)");
+        return Ok(());
+    }
+
+    fn effective_parent(transcript: &[TranscriptEntry], entry: &TranscriptEntry) -> Option<u64> {
+        match entry.parent_sequence {
+            Some(parent) => Some(parent),
+            None if entry.sequence > 1 => {
+                let previous = entry.sequence - 1;
+                transcript
+                    .iter()
+                    .any(|e| e.sequence == previous)
+                    .then_some(previous)
+            }
+            None => None,
+        }
+    }
+
+    let mut children: std::collections::BTreeMap<Option<u64>, Vec<&TranscriptEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in &transcript {
+        children
+            .entry(effective_parent(&transcript, entry))
+            .or_default()
+            .push(entry);
+    }
+
+    fn print_subtree(
+        children: &std::collections::BTreeMap<Option<u64>, Vec<&TranscriptEntry>>,
+        parent: Option<u64>,
+        depth: usize,
+        active_leaf_sequence: Option<u64>,
+    ) {
+        let Some(siblings) = children.get(&parent) else {
+            return;
+        };
+        for entry in siblings {
+            let role = match entry.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+            };
+            let preview: String = entry.text.chars().take(60).collect();
+            let marker = if active_leaf_sequence == Some(entry.sequence) {
+                " (active)"
+            } else {
+                ""
+            };
+            println!(
+                "{}[{}] {role}: {preview}{marker}",
+                "  ".repeat(depth),
+                entry.sequence
+            );
+            print_subtree(
+                children,
+                Some(entry.sequence),
+                depth + 1,
+                active_leaf_sequence,
+            );
+        }
+    }
+    print_subtree(&children, None, 0, state.active_leaf_sequence);
+    Ok(())
+}
+
+/// `session set-active-leaf <id> <sequence>` -- parity with
+/// `prime-agent`'s `/tree` navigation half: redirects
+/// `session_id`'s own active leaf to `sequence`, the entry the *next*
+/// prompt continues from. See `protocol::Request::SessionSetActiveLeaf`'s
+/// own doc comment for the underlying mechanism -- this is the first
+/// client surface to reach it; a `sequence` that doesn't name a real
+/// transcript entry comes back as `Response::Error { conflict: true,
+/// .. }`, surfaced the same way any other conflict already is.
+pub async fn session_set_active_leaf(
+    state_root: &Path,
+    session_id: String,
+    sequence: u64,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionSetActiveLeaf {
+            session_id,
+            sequence,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::SessionSetActiveLeafAck {
+            active_leaf_sequence,
+        } => {
+            match mode {
+                OutputMode::Json => print_json(&response),
+                OutputMode::Text => println!("active leaf set to sequence {active_leaf_sequence}"),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
 /// Shared by [`schedule_add`] and [`session_spawn`]'s own near-immediate
 /// one-shot enqueue -- the latter needs the raw id, not printed text.
 async fn add_schedule(
@@ -1650,11 +1812,15 @@ fn build_refine_prompt(transcript: &[TranscriptEntry], notes: &[HarnessNote]) ->
 /// `SessionAttach` stream, then drops the connection without reading
 /// further -- an ordinary early client disconnect from the daemon's own
 /// point of view (`session_attach`'s own doc comment covers the same
-/// stream; this is a one-shot read of its first event only).
-async fn fetch_transcript_snapshot(
+/// stream; this is a one-shot read of its first event only). Shared by
+/// every caller that wants the full `state.json`/`transcript.jsonl` pair
+/// (`session_tree` needs `SessionState::active_leaf_sequence` alongside
+/// the transcript; everyone else only needs the transcript, via
+/// [`fetch_transcript_snapshot`]).
+async fn fetch_session_snapshot(
     state_root: &Path,
     session_id: &str,
-) -> Result<Vec<TranscriptEntry>> {
+) -> Result<(Box<SessionState>, Vec<TranscriptEntry>)> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
         Context::Daemon,
@@ -1668,7 +1834,7 @@ async fn fetch_transcript_snapshot(
         other => return Err(unexpected_response(other)),
     }
     match conn.read_event(Context::Daemon).await? {
-        Some(SessionEvent::Snapshot { transcript, .. }) => Ok(transcript),
+        Some(SessionEvent::Snapshot { state, transcript }) => Ok((state, transcript)),
         Some(other) => Err(HarnessError::protocol(
             Context::Daemon,
             format!("expected a snapshot event first, got {other:?}"),
@@ -1678,6 +1844,14 @@ async fn fetch_transcript_snapshot(
             "connection closed before a snapshot event",
         )),
     }
+}
+
+async fn fetch_transcript_snapshot(
+    state_root: &Path,
+    session_id: &str,
+) -> Result<Vec<TranscriptEntry>> {
+    let (_, transcript) = fetch_session_snapshot(state_root, session_id).await?;
+    Ok(transcript)
 }
 
 /// Bounded parity with `prime-agent /autonomous`: repeatedly sends a

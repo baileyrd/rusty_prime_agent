@@ -447,14 +447,41 @@ async fn handle_private_connection(
             .await
         }
         Request::SessionSetActiveLeaf { sequence, .. } => {
-            let active_leaf_sequence = session.lock().await.set_active_leaf(sequence).await?;
-            conn.write_response(
-                Context::Worker,
-                &Response::SessionSetActiveLeafAck {
-                    active_leaf_sequence,
-                },
-            )
-            .await
+            // Unlike `SessionRename`/`SessionCompact` (never fail --
+            // renaming always succeeds, compaction's own no-op cases are
+            // still `Ok`), an unknown `sequence` is a real, expected
+            // business error (`session::AgentSession::set_active_leaf`'s
+            // own doc comment) -- matched explicitly and turned into a
+            // `Response::Error` sent back over *this* connection instead
+            // of propagated via `?`, which would just drop the
+            // connection (`run`'s own accept loop logs a bare `Err` to
+            // the worker's stderr and moves on, no response at all) and
+            // leave the daemon's own relay -- and the client past it --
+            // seeing an opaque "closed before responding" instead of the
+            // real conflict message. The same explicit-match-not-`?`
+            // shape `daemon::Supervisor::handle_session_fork` already
+            // uses for its own genuinely-failable step.
+            match session.lock().await.set_active_leaf(sequence).await {
+                Ok(active_leaf_sequence) => {
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::SessionSetActiveLeafAck {
+                            active_leaf_sequence,
+                        },
+                    )
+                    .await
+                }
+                Err(err) => {
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::Error {
+                            message: err.to_string(),
+                            conflict: true,
+                        },
+                    )
+                    .await
+                }
+            }
         }
         Request::GoalUpdate { action, .. } => {
             let goal = session.lock().await.update_goal(action).await?;

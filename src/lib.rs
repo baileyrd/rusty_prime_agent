@@ -223,6 +223,13 @@ pub async fn run(args: &[String]) -> Result<()> {
         cli::Command::SessionRpc { session_id } => {
             client::session_rpc(&state_root, session_id).await
         }
+        cli::Command::SessionTree { session_id } => {
+            client::session_tree(&state_root, session_id, output_mode).await
+        }
+        cli::Command::SessionSetActiveLeaf {
+            session_id,
+            sequence,
+        } => client::session_set_active_leaf(&state_root, session_id, sequence, output_mode).await,
         cli::Command::ModelList { detailed } => {
             client::model_list(&state_root, detailed, output_mode).await
         }

@@ -103,6 +103,19 @@ pub enum Command {
     SessionRpc {
         session_id: String,
     },
+    /// `harness session tree <id>` -- parity with `prime-agent`'s
+    /// `/tree` visualization half. See `client::session_tree`'s own doc
+    /// comment.
+    SessionTree {
+        session_id: String,
+    },
+    /// `harness session set-active-leaf <id> <sequence>` -- parity with
+    /// `prime-agent`'s `/tree` navigation half. See
+    /// `protocol::Request::SessionSetActiveLeaf`'s own doc comment.
+    SessionSetActiveLeaf {
+        session_id: String,
+        sequence: u64,
+    },
     /// `harness session schedule add <id> (--at TIME|--every DURATION)
     /// <text...>` -- parity with `prime-agent schedule add`.
     ScheduleAdd {
@@ -425,6 +438,29 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     session_id,
                     at_sequence,
                     name,
+                })
+            }
+            Some("tree") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session tree` requires a session id"))?;
+                Ok(Command::SessionTree { session_id })
+            }
+            Some("set-active-leaf") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session set-active-leaf` requires a session id"))?;
+                let sequence = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session set-active-leaf` requires a sequence"))?
+                    .parse::<u64>()
+                    .map_err(|_| usage("`session set-active-leaf` requires an integer sequence"))?;
+                Ok(Command::SessionSetActiveLeaf {
+                    session_id,
+                    sequence,
                 })
             }
             Some("schedule") => parse_schedule(&mut it),
