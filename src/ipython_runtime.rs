@@ -55,7 +55,7 @@ use rusty_tokio::process::{Command, Stdio};
 use crate::error::{Context, HarnessError, Result};
 use crate::procutil;
 use crate::sha256::{hmac_sha256_hex, sha256};
-use crate::tool_runtime::{BoxFuture, ExecutionOutcome, ToolRuntime};
+use crate::tool_runtime::{BoxFuture, ExecutionOutcome, HostRequest, ToolRuntime};
 use crate::zmtp::ZmtpSocket;
 
 /// How long [`start`](IpythonKernelRuntime::start) waits for the kernel
@@ -106,6 +106,23 @@ struct ConnectionFile {
     kernel_name: String,
 }
 
+/// State carried between an `execute`/`resume_execute` call that paused
+/// on a host request and the `resume_execute` call that continues it --
+/// `IpythonKernelRuntime` itself is the natural place to hold this
+/// (rather than threading it back and forth through the caller) since
+/// the caller only ever has the `HostRequest` it needs to reply to, not
+/// the kernel-protocol bookkeeping (which shell message this all belongs
+/// to, what `result` has already been seen) required to keep draining
+/// correctly afterward.
+struct PendingExecution {
+    request_msg_id: String,
+    /// `execute_result`/`error` content seen *before* the pause, if any
+    /// -- carried through so a result that arrived earlier in the same
+    /// cell isn't lost if a later `await host_request(...)` in that same
+    /// cell never produces one of its own.
+    result_so_far: Option<String>,
+}
+
 /// A real IPython kernel subprocess, driven over hand-rolled ZMTP -- see
 /// this module's own doc comment.
 pub struct IpythonKernelRuntime {
@@ -117,6 +134,7 @@ pub struct IpythonKernelRuntime {
     iopub: Option<ZmtpSocket>,
     control: Option<ZmtpSocket>,
     next_msg_seq: u64,
+    pending: Option<PendingExecution>,
 }
 
 impl IpythonKernelRuntime {
@@ -134,6 +152,7 @@ impl IpythonKernelRuntime {
             iopub: None,
             control: None,
             next_msg_seq: 0,
+            pending: None,
         }
     }
 
@@ -229,6 +248,144 @@ impl IpythonKernelRuntime {
         })?;
         let frames = iopub.recv_multipart().await?;
         parse_jupyter_message(&frames)
+    }
+
+    /// Reads `iopub` until either `execute_request` `request_msg_id`
+    /// completes (`status: idle`, returns `Ok(None)`) or the kernel opens
+    /// a `host.request`-targeted comm and is now blocked awaiting a reply
+    /// (returns `Ok(Some(HostRequest))`) -- the shared drain loop behind
+    /// both [`execute`](ToolRuntime::execute) and
+    /// [`resume_execute`](ToolRuntime::resume_execute), which differ only
+    /// in how they arrive at a `request_msg_id` to drain and an initial
+    /// `(stdout, result)` to accumulate into. `comm_open` is confirmed (by
+    /// direct raw-socket probing before this was written, see
+    /// `ipython_runtime`'s own module doc comment) to broadcast on
+    /// `iopub` the same way `stream`/`execute_result` do, carrying the
+    /// same `parent_header.msg_id` as the cell that opened it -- so this
+    /// reuses the existing `parent_header` filter rather than needing a
+    /// separate one, on the same v1 assumption every other branch here
+    /// already makes: `host_request(...)` is always awaited synchronously
+    /// within the cell that opened it, not fired off from a background
+    /// task the way `rlm-runtime.md` warns a real Jupyter client must
+    /// also tolerate.
+    async fn drain_until_idle_or_host_request(
+        &mut self,
+        request_msg_id: &str,
+        stdout: &mut String,
+        result: &mut Option<String>,
+    ) -> Result<Option<HostRequest>> {
+        loop {
+            let (msg_type, parent_header, content) = self.recv_iopub().await?;
+            if parent_header.get("msg_id").and_then(|v| v.as_str()) != Some(request_msg_id) {
+                continue;
+            }
+            match msg_type.as_str() {
+                "stream" => {
+                    let name = content
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stdout");
+                    let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if name == "stderr" {
+                        stdout.push_str("[stderr] ");
+                    }
+                    stdout.push_str(text);
+                }
+                "execute_result" => {
+                    *result = content
+                        .get("data")
+                        .and_then(|d| d.get("text/plain"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                "error" => {
+                    let ename = content
+                        .get("ename")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Error");
+                    let evalue = content.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
+                    *result = Some(format!("{ename}: {evalue}"));
+                }
+                "comm_open"
+                    if content.get("target_name").and_then(|v| v.as_str())
+                        == Some("host.request") =>
+                {
+                    let comm_id = content
+                        .get("comm_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let payload = content
+                        .get("data")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    let kind = payload
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    return Ok(Some(HostRequest {
+                        comm_id,
+                        kind,
+                        payload,
+                    }));
+                }
+                "status"
+                    if content.get("execution_state").and_then(|v| v.as_str()) == Some("idle") =>
+                {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Runs [`drain_until_idle_or_host_request`](Self::drain_until_idle_or_host_request)
+    /// under `EXECUTE_TIMEOUT`, then either drains the matching
+    /// `execute_reply` off `shell` and returns a finished
+    /// `ExecutionOutcome` (same "keep `recv_shell` from seeing stale
+    /// replies" reasoning the original single-call `execute` always had),
+    /// or stashes `self.pending` so a later `resume_execute` can continue
+    /// exactly where this call paused.
+    async fn drive_execution(
+        &mut self,
+        request_msg_id: String,
+        mut stdout: String,
+        mut result: Option<String>,
+    ) -> Result<ExecutionOutcome> {
+        let pending = rusty_tokio::time::timeout(
+            EXECUTE_TIMEOUT,
+            self.drain_until_idle_or_host_request(&request_msg_id, &mut stdout, &mut result),
+        )
+        .await
+        .map_err(|_| {
+            HarnessError::conflict(Context::Runtime, "kernel execute_request timed out")
+        })??;
+
+        match pending {
+            None => {
+                // Best-effort: idle on iopub always follows execute_reply
+                // on shell in practice (confirmed by direct probing), so
+                // this should already be sitting in the socket buffer.
+                let _ = rusty_tokio::time::timeout(Duration::from_secs(5), self.recv_shell()).await;
+                Ok(ExecutionOutcome {
+                    stdout,
+                    result,
+                    pending_host_request: None,
+                })
+            }
+            Some(host_request) => {
+                self.pending = Some(PendingExecution {
+                    request_msg_id,
+                    result_so_far: result.clone(),
+                });
+                Ok(ExecutionOutcome {
+                    stdout,
+                    result,
+                    pending_host_request: Some(host_request),
+                })
+            }
+        }
     }
 }
 
@@ -364,80 +521,31 @@ impl ToolRuntime for IpythonKernelRuntime {
                     }),
                 )
                 .await?;
+            self.drive_execution(request_msg_id, String::new(), None)
+                .await
+        })
+    }
 
-            let outcome = rusty_tokio::time::timeout(EXECUTE_TIMEOUT, async {
-                let mut stdout = String::new();
-                let mut result: Option<String> = None;
-                loop {
-                    let (msg_type, parent_header, content) = self.recv_iopub().await?;
-                    // The kernel emits iopub traffic this client never
-                    // asked for -- most notably its own unsolicited
-                    // `busy`/`idle` pair right after boot (confirmed by
-                    // direct testing against a real kernel: an early
-                    // version of this loop broke out on that startup
-                    // `idle` before the real `execute_request`'s own
-                    // `busy`/`stream`/`idle` sequence had even started,
-                    // always reporting empty output). `parent_header.
-                    // msg_id` is how a real Jupyter client tells "this
-                    // message is part of the reply to *my* request" apart
-                    // from everything else on the same broadcast socket.
-                    if parent_header.get("msg_id").and_then(|v| v.as_str())
-                        != Some(request_msg_id.as_str())
-                    {
-                        continue;
-                    }
-                    match msg_type.as_str() {
-                        "stream" => {
-                            let name = content
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("stdout");
-                            let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            if name == "stderr" {
-                                stdout.push_str("[stderr] ");
-                            }
-                            stdout.push_str(text);
-                        }
-                        "execute_result" => {
-                            result = content
-                                .get("data")
-                                .and_then(|d| d.get("text/plain"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-                        "error" => {
-                            let ename = content
-                                .get("ename")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Error");
-                            let evalue =
-                                content.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
-                            result = Some(format!("{ename}: {evalue}"));
-                        }
-                        "status"
-                            if content.get("execution_state").and_then(|v| v.as_str())
-                                == Some("idle") =>
-                        {
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                // Drain the matching `execute_reply` off `shell` so it
-                // doesn't sit unread and pollute the next call's own
-                // `recv_shell` -- see `recv_shell`'s own doc comment.
-                // Best-effort: idle on iopub always follows execute_reply
-                // on shell in practice (confirmed by direct probing), so
-                // this should already be sitting in the socket buffer.
-                let _ = rusty_tokio::time::timeout(Duration::from_secs(5), self.recv_shell()).await;
-                Ok::<ExecutionOutcome, HarnessError>(ExecutionOutcome { stdout, result })
-            })
-            .await
-            .map_err(|_| {
-                HarnessError::conflict(Context::Runtime, "kernel execute_request timed out")
-            })??;
-
-            Ok(outcome)
+    fn resume_execute(
+        &mut self,
+        comm_id: &str,
+        reply: serde_json::Value,
+    ) -> BoxFuture<'_, Result<ExecutionOutcome>> {
+        let comm_id = comm_id.to_string();
+        Box::pin(async move {
+            self.send_control(
+                "comm_msg",
+                serde_json::json!({"comm_id": comm_id, "data": reply}),
+            )
+            .await?;
+            let pending = self.pending.take().ok_or_else(|| {
+                HarnessError::conflict(
+                    Context::Runtime,
+                    "resume_execute called with no pending host request",
+                )
+            })?;
+            self.drive_execution(pending.request_msg_id, String::new(), pending.result_so_far)
+                .await
         })
     }
 
@@ -917,6 +1025,108 @@ mod tests {
         runtime.shutdown().await.expect("shutdown should succeed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real end-to-end coverage of the whole `host.request` comm
+    /// protocol: defines `host_request` exactly the way `worker::
+    /// bootstrap_kernel` does (including the `control_handlers`
+    /// monkeypatch confirmed necessary by direct raw-socket probing
+    /// before this was written -- stock `ipykernel` never routes
+    /// `comm_msg` through `control` on its own), then proves the full
+    /// round trip through the actual `execute`/`resume_execute` methods
+    /// rather than a standalone probe script: `execute` pauses on
+    /// `pending_host_request` when the kernel opens the comm and blocks
+    /// awaiting a reply, and `resume_execute` both delivers that reply
+    /// and lets the cell finish, producing the value the awaited call
+    /// returned. `#[ignore]`d for the same real-`ipykernel`-install
+    /// reason as its siblings.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_host_request_round_trips_through_execute_and_resume() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-hostreq-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the code `worker::bootstrap_kernel` sends for
+        // `host_request` (minus the `rlm_heartbeat` definition, which
+        // this test isn't exercising).
+        let setup_code = "\
+import asyncio
+from ipykernel.comm import Comm
+_host_request_kernel = get_ipython().kernel
+_host_request_kernel.control_handlers['comm_msg'] = _host_request_kernel.comm_manager.comm_msg
+_host_request_kernel.control_handlers['comm_close'] = _host_request_kernel.comm_manager.comm_close
+_host_request_loop = asyncio.get_event_loop()
+def host_request(kind, payload=None):
+    comm = Comm(target_name='host.request', data={'kind': kind, **(payload or {})})
+    fut = _host_request_loop.create_future()
+    def _on_msg(msg):
+        def _resolve():
+            if not fut.done():
+                fut.set_result(msg['content']['data'])
+        _host_request_loop.call_soon_threadsafe(_resolve)
+    comm.on_msg(_on_msg)
+    return fut
+";
+        let setup_outcome = runtime
+            .execute(setup_code)
+            .await
+            .expect("host_request setup code should round-trip");
+        assert!(
+            setup_outcome.pending_host_request.is_none(),
+            "setup code alone must not open any comm"
+        );
+
+        let outcome = runtime
+            .execute("result = await host_request('ping', {'x': 1})\nresult")
+            .await
+            .expect("the await-cell should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting a host-request reply");
+        assert_eq!(pending.kind, "ping");
+        assert_eq!(pending.payload.get("x").and_then(|v| v.as_i64()), Some(1));
+        assert!(
+            !pending.comm_id.is_empty(),
+            "expected a non-empty comm_id to reply to"
+        );
+
+        // A single-key payload, deliberately: `serde_json::json!`'s
+        // default `Value::Object` is a `BTreeMap` (alphabetically
+        // ordered, not insertion-ordered), so a real reply's Python
+        // `repr()` on the far side would come back key-sorted rather
+        // than in the order this literal was written -- a single key
+        // sidesteps that rather than asserting against a specific
+        // ordering this project's own JSON layer doesn't promise.
+        let resumed = runtime
+            .resume_execute(&pending.comm_id, serde_json::json!({"echo": "pong"}))
+            .await
+            .expect("resume_execute should deliver the reply and let the cell finish");
+        assert!(
+            resumed.pending_host_request.is_none(),
+            "the cell should have finished after exactly one host request"
+        );
+        assert_eq!(
+            resumed.result.as_deref(),
+            Some("{'echo': 'pong'}"),
+            "the awaited call should have returned the exact reply this test sent"
+        );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
     }
 
     /// Real end-to-end coverage for `skills.rs`'s whole point: a real

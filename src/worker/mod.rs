@@ -147,17 +147,18 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
     }
 }
 
-/// One-time kernel setup once `tool_runtime` is up. Always defines
+/// One-time kernel setup once `tool_runtime` is up. Defines
 /// `rlm_heartbeat()` in the kernel's own globals -- parity with
 /// `prime-agent`'s kernel-side manual re-entry trigger (`session::
 /// execute_python_tool_call` watches for the marker it prints, see that
-/// module's own doc comment) -- and, only when `skills::discover` finds
-/// any, also puts `paths::global_skills_dir` on the kernel's `sys.path`
-/// so `import <skill-name>` resolves. Always exactly one
-/// `execute_request` when `--runtime ipython` (previously zero when no
-/// skills were installed); propagates a genuine execution failure via
-/// `?`, same "fail loudly on a broken startup precondition" convention
-/// as `build_provider`'s own callers.
+/// module's own doc comment) -- and a `host_request(kind, payload=None)`
+/// coroutine (parity with `rlm-runtime.md`'s `rlm.host_request(...)`),
+/// and, only when `skills::discover` finds any, also puts `paths::
+/// global_skills_dir` on the kernel's `sys.path` so `import <skill-name>`
+/// resolves. Always exactly one `execute_request` when `--runtime
+/// ipython` (previously zero when no skills were installed); propagates
+/// a genuine execution failure via `?`, same "fail loudly on a broken
+/// startup precondition" convention as `build_provider`'s own callers.
 ///
 /// `rlm_heartbeat(every=None)` -- the optional `every` argument (a
 /// duration string like `"10m"`, parity with `prime-agent`'s own
@@ -165,10 +166,42 @@ fn build_tool_runtime(session_dir: &Path, runtime: Option<&str>) -> Box<dyn Tool
 /// the same printed line (`marker + (every or "")`), since a plain
 /// stdout `print()` is the only channel from kernel code back to this
 /// process -- `session::execute_python_tool_call`'s marker parsing
-/// splits it back out.
+/// splits it back out. `rlm_heartbeat` itself is *not* migrated onto
+/// `host_request` here: it works today, and the marker hack costs
+/// nothing extra to keep running alongside the new channel until a real
+/// second host-request kind (`rlm(...)`, the next increment) makes the
+/// migration worth doing at the same time.
+///
+/// `host_request(kind, payload=None)` opens a Jupyter comm targeting
+/// `"host.request"` and returns an `asyncio.Future` that resolves with
+/// whatever `ipython_runtime::IpythonKernelRuntime::resume_execute`'s
+/// caller replies with -- confirmed against a real `ipykernel` before
+/// writing any Rust (see `ipython_runtime`'s own module doc comment) that
+/// this requires monkeypatching `kernel.control_handlers['comm_msg']`
+/// (stock `ipykernel` only ever routes `comm_msg` through `shell`, never
+/// `control`, despite `rlm-runtime.md` describing `control` as where
+/// host-request replies travel) and resolving the future via
+/// `loop.call_soon_threadsafe` (`rlm-runtime.md`'s own stated reason:
+/// "the control handler may run on another thread").
 async fn bootstrap_kernel(state_root: &Path, tool_runtime: &mut dyn ToolRuntime) -> Result<()> {
     let mut code = format!(
-        "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n",
+        "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n\n\
+         import asyncio\n\
+         from ipykernel.comm import Comm\n\
+         _host_request_kernel = get_ipython().kernel\n\
+         _host_request_kernel.control_handlers['comm_msg'] = _host_request_kernel.comm_manager.comm_msg\n\
+         _host_request_kernel.control_handlers['comm_close'] = _host_request_kernel.comm_manager.comm_close\n\
+         _host_request_loop = asyncio.get_event_loop()\n\
+         def host_request(kind, payload=None):\n\
+         \x20   comm = Comm(target_name='host.request', data={{'kind': kind, **(payload or {{}})}})\n\
+         \x20   fut = _host_request_loop.create_future()\n\
+         \x20   def _on_msg(msg):\n\
+         \x20       def _resolve():\n\
+         \x20           if not fut.done():\n\
+         \x20               fut.set_result(msg['content']['data'])\n\
+         \x20       _host_request_loop.call_soon_threadsafe(_resolve)\n\
+         \x20   comm.on_msg(_on_msg)\n\
+         \x20   return fut\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 
