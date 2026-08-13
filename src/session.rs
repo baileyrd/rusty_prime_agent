@@ -38,9 +38,10 @@ use rusty_tokio::sync::broadcast;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
-    ChildUsageAttribution, CompactionState, ForkedFrom, GoalAction, GoalState, GoalStatus,
-    HarnessAction, HarnessNote, HarnessSnapshot, HarnessState, Request, Role, ScheduleKind,
-    SessionEvent, SessionState, SessionStatus, ToolCallRequest, TranscriptEntry, Usage,
+    BranchSummary, ChildUsageAttribution, CompactionState, ForkedFrom, GoalAction, GoalState,
+    GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState, Request, Role,
+    ScheduleKind, SessionEvent, SessionState, SessionStatus, ToolCallRequest, TranscriptEntry,
+    Usage,
 };
 use crate::provider::{
     ChatTurn, ModelProvider, ProviderReply, ProviderResponse, ToolDef, TurnRole,
@@ -1587,6 +1588,7 @@ impl AgentSession {
             // Overwritten unconditionally by `append_entry` itself --
             // see that function's own doc comment.
             parent_sequence: None,
+            branch_summary: None,
         })
         .await
     }
@@ -1611,6 +1613,7 @@ impl AgentSession {
             child_usage_attributed: Some(attribution),
             // Overwritten unconditionally by `append_entry` itself.
             parent_sequence: None,
+            branch_summary: None,
         })
         .await
     }
@@ -1674,14 +1677,132 @@ impl AgentSession {
         let mut cursor = by_sequence.get(&leaf).copied();
         while let Some(entry) = cursor {
             chain.push(entry);
-            cursor = match entry.parent_sequence {
-                Some(parent) => by_sequence.get(&parent).copied(),
-                None if entry.sequence > 1 => by_sequence.get(&(entry.sequence - 1)).copied(),
-                None => None,
-            };
+            cursor = effective_parent_sequence(entry)
+                .and_then(|parent| by_sequence.get(&parent).copied());
         }
         chain.reverse();
         chain
+    }
+
+    /// Parity with `session-format.md`'s `BranchSummaryEntry` -- a
+    /// manual, on-demand summary of a branch other than the one
+    /// currently active, asked of the session's own model the same way
+    /// `compact_now` asks it to fold old turns into a running summary.
+    /// Unlike `compact_now` (which shrinks the *active* chain in place),
+    /// this doesn't touch `active_leaf_sequence` or fold anything away --
+    /// it reads `branch_leaf_sequence`'s own branch (back to wherever it
+    /// diverges from the chain active *right now*), asks the model for a
+    /// summary, and appends the result as an ordinary `Role::System`
+    /// entry on the *current* active chain: a durable record of "here's
+    /// what happened over on that other branch," visible from wherever
+    /// you actually are, not a mutation of the branch it describes.
+    ///
+    /// `(false, None)` (not an error) covers two no-op cases, same
+    /// "accurate no-op beats a manufactured error" reasoning
+    /// `compact_now`/`ScheduleCancelAck::found` already use: no model
+    /// configured (`EchoProvider` has nothing to summarize with), or
+    /// `branch_leaf_sequence` is already part of the active chain
+    /// (nothing "other" to summarize). An unknown `branch_leaf_sequence`
+    /// -- one that names no transcript entry at all -- is a real
+    /// conflict, the same validation `set_active_leaf` already does.
+    pub async fn branch_summarize(
+        &mut self,
+        branch_leaf_sequence: u64,
+    ) -> Result<(bool, Option<String>)> {
+        if !self
+            .transcript
+            .iter()
+            .any(|e| e.sequence == branch_leaf_sequence)
+        {
+            return Err(HarnessError::conflict(
+                Context::Session,
+                format!(
+                    "no transcript entry at sequence {branch_leaf_sequence} in session {}",
+                    self.state.session_id
+                ),
+            ));
+        }
+        if self.state.model.is_none() {
+            return Ok((false, None));
+        }
+        let active_sequences: std::collections::HashSet<u64> = self
+            .active_chain()
+            .into_iter()
+            .map(|e| e.sequence)
+            .collect();
+        if active_sequences.contains(&branch_leaf_sequence) {
+            return Ok((false, None));
+        }
+
+        let by_sequence: std::collections::HashMap<u64, &TranscriptEntry> =
+            self.transcript.iter().map(|e| (e.sequence, e)).collect();
+        let mut branch_entries: Vec<&TranscriptEntry> = Vec::new();
+        let mut cursor = by_sequence.get(&branch_leaf_sequence).copied();
+        while let Some(entry) = cursor {
+            if active_sequences.contains(&entry.sequence) {
+                break;
+            }
+            branch_entries.push(entry);
+            cursor = effective_parent_sequence(entry)
+                .and_then(|parent| by_sequence.get(&parent).copied());
+        }
+        branch_entries.reverse();
+        if branch_entries.is_empty() {
+            return Ok((false, None));
+        }
+        let entry_count = branch_entries.len();
+
+        let mut prompt_text = String::from(
+            "Summarize the following branch of a conversation -- one that is \
+             not the branch currently active. Reply with only a concise \
+             summary capturing the important facts, decisions, and current \
+             state of that branch -- no preamble.\n\nBranch turns:\n",
+        );
+        for entry in &branch_entries {
+            prompt_text.push_str(&format!("{:?}: {}\n", entry.role, entry.text));
+        }
+        let ask = [ChatTurn {
+            role: TurnRole::User,
+            content: Some(prompt_text),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let summary = match self.provider.respond(&ask, &[]).await?.reply {
+            ProviderReply::Text(text) => text,
+            ProviderReply::ToolCalls(_) => {
+                "(branch summary unavailable: model requested tools instead of summarizing)"
+                    .to_string()
+            }
+        };
+        self.append_branch_summary(BranchSummary {
+            branch_leaf_sequence,
+            entry_count: entry_count as u32,
+            summary: summary.clone(),
+        })
+        .await?;
+        Ok((true, Some(summary)))
+    }
+
+    async fn append_branch_summary(
+        &mut self,
+        branch_summary: BranchSummary,
+    ) -> Result<TranscriptEntry> {
+        self.append_entry(TranscriptEntry {
+            sequence: self.state.last_sequence + 1,
+            timestamp_ms: now_ms(),
+            role: Role::System,
+            text: String::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            usage: None,
+            child_usage_attributed: None,
+            // Overwritten unconditionally by `append_entry` itself.
+            parent_sequence: None,
+            branch_summary: Some(Box::new(branch_summary)),
+        })
+        .await
     }
 
     /// Redirects the active leaf to `sequence`, the entry the *next*
@@ -1829,6 +1950,23 @@ impl AgentSession {
         self.tool_runtime.shutdown().await?;
         let _ = self.events.send(SessionEvent::SessionEnded);
         Ok(())
+    }
+}
+
+/// Shared by [`AgentSession::active_chain`] and
+/// [`AgentSession::branch_summarize`]'s own branch walk: an entry's own
+/// `parent_sequence` if set, else -- for a legacy entry written before
+/// that field existed (`parent_sequence: None`, `sequence > 1`) -- an
+/// implicit link to `sequence - 1`, the flat order every pre-existing
+/// transcript already has. Each caller looks the returned sequence up in
+/// its own `by_sequence` map, which already handles it not being present
+/// (e.g. a legacy transcript truncated by `session fork`'s own `--at`
+/// snapshot) by simply ending the walk there.
+fn effective_parent_sequence(entry: &TranscriptEntry) -> Option<u64> {
+    match entry.parent_sequence {
+        Some(parent) => Some(parent),
+        None if entry.sequence > 1 => Some(entry.sequence - 1),
+        None => None,
     }
 }
 
@@ -2028,6 +2166,7 @@ mod tests {
             usage: None,
             child_usage_attributed: None,
             parent_sequence: None,
+            branch_summary: None,
         }
     }
 
@@ -2875,6 +3014,179 @@ mod tests {
             chain.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             vec![1, 2]
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn branch_summarize_rejects_an_unknown_sequence() {
+        let root = temp_state_root("branch-summary-unknown");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-branch-summary-unknown".to_string(),
+            NewSessionMeta {
+                model: Some("ollama/qwen2.5:0.5b".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+        session
+            .append(Role::User, "hello".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let err = session.branch_summarize(999).await.unwrap_err();
+        assert!(err.to_string().contains("999"), "got: {err}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn branch_summarize_is_a_no_op_with_no_model_configured() {
+        let root = temp_state_root("branch-summary-no-model");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-branch-summary-no-model".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+        let root_entry = session
+            .append(Role::User, "root".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        session
+            .append(
+                Role::Assistant,
+                "branch a".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        session.set_active_leaf(root_entry.sequence).await.unwrap();
+        session
+            .append(
+                Role::Assistant,
+                "branch b".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (summarized, summary) = session.branch_summarize(2).await.unwrap();
+        assert!(!summarized);
+        assert!(summary.is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn branch_summarize_is_a_no_op_for_a_sequence_already_on_the_active_chain() {
+        let root = temp_state_root("branch-summary-active-chain");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-branch-summary-active".to_string(),
+            NewSessionMeta {
+                model: Some("ollama/qwen2.5:0.5b".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+        let first = session
+            .append(Role::User, "hello".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let (summarized, summary) = session.branch_summarize(first.sequence).await.unwrap();
+        assert!(!summarized);
+        assert!(summary.is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn branch_summarize_produces_a_summary_entry_for_an_inactive_branch() {
+        let root = temp_state_root("branch-summary-real");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-branch-summary-real".to_string(),
+            NewSessionMeta {
+                model: Some("ollama/qwen2.5:0.5b".to_string()),
+                ..NewSessionMeta::default()
+            },
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let root_entry = session
+            .append(Role::User, "root".to_string(), None, None, None, None)
+            .await
+            .unwrap();
+        let abandoned_leaf = session
+            .append(
+                Role::Assistant,
+                "the abandoned branch".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        session.set_active_leaf(root_entry.sequence).await.unwrap();
+        let new_leaf = session
+            .append(
+                Role::Assistant,
+                "the new active branch".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (summarized, summary) = session
+            .branch_summarize(abandoned_leaf.sequence)
+            .await
+            .unwrap();
+        assert!(summarized);
+        let summary = summary.expect("a real summary should come back");
+        assert!(summary.contains("echo:"), "got: {summary}");
+
+        // The summary entry is appended on the *current* active chain --
+        // continuing from `new_leaf`, not mutating the branch it
+        // describes.
+        let appended = session
+            .transcript
+            .iter()
+            .find(|e| e.sequence == new_leaf.sequence + 1)
+            .expect("a new entry should have been appended");
+        assert_eq!(appended.parent_sequence, Some(new_leaf.sequence));
+        let recorded = appended
+            .branch_summary
+            .as_ref()
+            .expect("the appended entry should carry a BranchSummary");
+        assert_eq!(recorded.branch_leaf_sequence, abandoned_leaf.sequence);
+        assert_eq!(recorded.entry_count, 1);
+        assert_eq!(recorded.summary, summary);
+        assert_eq!(session.state.active_leaf_sequence, Some(appended.sequence));
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -657,7 +657,66 @@ the same explicit-match-not-`?` shape `daemon::Supervisor::
 handle_session_fork` already uses for its own genuinely-failable step,
 now the established pattern for private-transport requests too.
 
-## REPL commands: `/file`, `/fork`, `/export`, `/tree`
+## Branch summaries (`BranchSummaryEntry`) and `/clone`, revisited
+
+Parity with `session-format.md`'s `BranchSummaryEntry` -- previously
+tracked as absent because it "depends on the tree structure," which now
+exists (the two sections above). Same shape decision as
+`ChildUsageAttribution`: a new `protocol::BranchSummary {
+branch_leaf_sequence, entry_count, summary }`, boxed behind
+`TranscriptEntry::branch_summary: Option<Box<BranchSummary>>` (its own
+`String` was enough to trip clippy's `large_enum_variant` on
+`SessionEvent`, the same reason `SessionEvent::Snapshot` already boxes
+its `SessionState`) -- a flat optional field, not a separate typed
+message-union class.
+
+`AgentSession::branch_summarize(&mut self, branch_leaf_sequence) ->
+Result<(bool, Option<String>)>` is read-only with respect to the branch
+it describes, unlike `compact_now` (which shrinks the *active* chain in
+place): it walks `branch_leaf_sequence`'s own branch back to wherever it
+diverges from the chain active *right now*, asks the session's own model
+to summarize those turns the same way `compact_now` asks it to fold old
+ones into a running summary, and appends the result as an ordinary
+`Role::System` entry on the *current* active chain -- a durable record
+of "here's what happened over on that other branch," not a mutation of
+the branch it summarizes. A new `effective_parent_sequence` free
+function factors the legacy-fallback rule out of `active_chain`'s own
+walk so both this and branch-summarization share one implementation of
+it. `(false, None)` (not an error) for the same two honest no-op shapes
+`compact_now` already established: no model configured, or
+`branch_leaf_sequence` already part of the active chain. An unknown
+sequence is a real conflict, matched explicitly in
+`handle_private_connection` (the same fix `SessionSetActiveLeaf` needed,
+now the established pattern for every private-transport request that can
+genuinely fail).
+
+New `Request::SessionBranchSummarize { session_id, branch_leaf_sequence
+}` / `Response::SessionBranchSummarizeAck { summarized, summary }`, same
+relay every other session-mutating request uses. `harness session
+branch-summary <id> <sequence>` plus `/branch-summary <sequence>` in
+`session_repl` -- the same "protocol + top-level command + REPL wrapper"
+shape `/compact`/`/fork`/`/tree` already established. `session_tree`'s
+own display renders a `BranchSummary` entry's otherwise-empty `text` as
+`(branch summary of sequence N, K turns)` instead of a blank line.
+
+**`/clone` was re-investigated fresh alongside this, not left on its old
+reasoning.** The old blocker ("depends on the tree structure") is gone,
+but the *real* one never was that -- `prime-agent`'s `/clone` duplicates
+*live* interpreter/kernel state (in-flight Python variables, imported
+modules, open connections), not just durable transcript/config data.
+Nothing in this project's architecture can do that at any layer: a
+worker crash or `session stop` already loses an `IpythonKernelRuntime`'s
+live kernel state today (only `transcript.jsonl`/`state.json` survive),
+and `session fork`'s own design was built around that exact limit (see
+the "Session forking" section above). A `session clone` built from what
+this project actually has would just be `session fork` with truncation
+and narrative-reset turned off -- not a distinct feature. Real live-state
+duplication needs OS-level process forking of a running kernel (or full
+interpreter-state serialization), a genuinely different and much larger
+mechanism than anything branch summaries touched, so it stays
+unimplemented.
+
+## REPL commands: `/file`, `/fork`, `/export`, `/tree`, `/branch-summary`
 
 Bounded parity with a slice of `prime-agent`'s TUI-side rich-editor/
 message-queue features -- see `PARITY.md` for the full story, including

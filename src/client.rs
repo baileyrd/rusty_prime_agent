@@ -929,6 +929,33 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if let Some(sequence_str) = text
+            .strip_prefix("/branch-summary ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Parity with `session-format.md`'s `BranchSummaryEntry` --
+            // `session branch-summary` itself already exists as a
+            // top-level `harness session branch-summary <id> <sequence>`
+            // command; this is just wiring the same client-side call
+            // into the REPL loop, the identical shape `/tree`/`/fork`
+            // above already have.
+            match sequence_str.parse::<u64>() {
+                Ok(branch_leaf_sequence) => {
+                    session_branch_summarize(
+                        state_root,
+                        session_id.clone(),
+                        branch_leaf_sequence,
+                        mode,
+                    )
+                    .await?;
+                }
+                Err(_) => println!(
+                    "`/branch-summary <sequence>` requires an integer, got {sequence_str:?}"
+                ),
+            }
+            continue;
+        }
         if let Some(path) = text
             .strip_prefix("/export ")
             .map(str::trim)
@@ -1405,7 +1432,23 @@ pub async fn session_tree(state_root: &Path, session_id: String, mode: OutputMod
                 Role::System => "system",
                 Role::Tool => "tool",
             };
-            let preview: String = entry.text.chars().take(60).collect();
+            // `BranchSummary` entries carry an empty `text` (the data
+            // lives in the structured field, same as `child_usage_
+            // attributed`'s own shape) -- fall back to a short
+            // description instead of an empty preview.
+            let preview: String = match &entry.branch_summary {
+                Some(branch_summary) => format!(
+                    "(branch summary of sequence {}, {} turn{})",
+                    branch_summary.branch_leaf_sequence,
+                    branch_summary.entry_count,
+                    if branch_summary.entry_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                None => entry.text.chars().take(60).collect(),
+            };
             let marker = if active_leaf_sequence == Some(entry.sequence) {
                 " (active)"
             } else {
@@ -1458,6 +1501,54 @@ pub async fn session_set_active_leaf(
             match mode {
                 OutputMode::Json => print_json(&response),
                 OutputMode::Text => println!("active leaf set to sequence {active_leaf_sequence}"),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+/// `session branch-summary <id> <branch-leaf-sequence>` -- parity with
+/// `session-format.md`'s `BranchSummaryEntry`. See
+/// `protocol::Request::SessionBranchSummarize`'s own doc comment for the
+/// no-op cases (`summarized: false`): no model configured, or
+/// `branch_leaf_sequence` already part of the active chain.
+pub async fn session_branch_summarize(
+    state_root: &Path,
+    session_id: String,
+    branch_leaf_sequence: u64,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionBranchSummarize {
+            session_id,
+            branch_leaf_sequence,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::SessionBranchSummarizeAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (
+                    Response::SessionBranchSummarizeAck {
+                        summarized: true,
+                        summary,
+                    },
+                    OutputMode::Text,
+                ) => println!("branch summarized: {}", summary.as_deref().unwrap_or("")),
+                (
+                    Response::SessionBranchSummarizeAck {
+                        summarized: false, ..
+                    },
+                    OutputMode::Text,
+                ) => println!(
+                    "nothing to summarize (no model configured, or that sequence is already \
+                     part of the active branch)"
+                ),
+                _ => unreachable!(),
             }
             Ok(())
         }

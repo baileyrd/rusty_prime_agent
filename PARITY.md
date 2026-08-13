@@ -501,6 +501,90 @@ daemon/worker split rather than requiring the Python control environment:
   Plus a manual pass in this sandbox confirming the same end to end
   against the real compiled binary, including through `session_repl`'s
   `/tree`/`/tree <sequence>` lines.
+- [x] **Branch summaries (`BranchSummaryEntry`)** and **`/clone`,
+  re-investigated fresh.** This item was previously tracked as
+  structurally absent -- `CLAIMS_AUDIT.md` used to say `BranchSummaryEntry`
+  "depends on the tree structure... already confirmed absent." That
+  premise no longer holds (the tree structure landed two entries up), so
+  it earned an honest second look rather than staying cut on a stale
+  reason -- the same standing instruction that reopened intra-session
+  branching itself in the first place. `/clone` got the same fresh look:
+  re-confirmed still out of scope, for a *different* reason than
+  branching had (see below), not left unexamined.
+
+  **Branch summaries: real, built.** Same shape decision as
+  `ChildUsageAttribution` before it: a flat, optional
+  `protocol::BranchSummary { branch_leaf_sequence, entry_count, summary }`
+  field on `TranscriptEntry` (boxed -- its `String` was enough to trip
+  clippy's `large_enum_variant` on `SessionEvent`, the same reasoning
+  `SessionEvent::Snapshot` already boxes its own `SessionState` for),
+  not a separate typed message-union class. Unlike `compact_now` (which
+  *shrinks* the active chain in place), `AgentSession::branch_summarize`
+  is read-only with respect to the branch it describes: it walks
+  `branch_leaf_sequence`'s own branch back to wherever it diverges from
+  the chain active *right now* (a new `effective_parent_sequence` free
+  function, factored out of `active_chain`'s own walk so both share one
+  implementation of the legacy-fallback rule), asks the session's own
+  model to summarize those turns the same way `compact_now` asks it to
+  fold old ones, and appends the result as an ordinary `Role::System`
+  entry on the *current* active chain -- a durable, visible record of
+  "here's what happened over on that other branch," not a mutation of
+  the branch itself. `(false, None)` (not an error) for the same two
+  honest no-op cases `compact_now` already established the shape for: no
+  model configured, or `branch_leaf_sequence` is already part of the
+  active chain (nothing "other" to summarize). An unknown
+  `branch_leaf_sequence` is a real conflict, the same validation
+  `set_active_leaf` already does -- and matched explicitly rather than
+  propagated via `?` in `worker::handle_private_connection`, the same
+  fix `SessionSetActiveLeaf` needed for the identical reason.
+
+  New `Request::SessionBranchSummarize { session_id,
+  branch_leaf_sequence }` / `Response::SessionBranchSummarizeAck {
+  summarized, summary }`, forwarded from the public daemon socket to the
+  owning worker's private socket unchanged, same relay every other
+  session-mutating request uses. `harness session branch-summary <id>
+  <sequence>` as a top-level command, plus `/branch-summary <sequence>`
+  wired into `session_repl`, the same "protocol + top-level command +
+  REPL wrapper" shape `/compact`/`/fork`/`/tree` already established.
+  `session tree`'s own display was extended to show a short description
+  for a `BranchSummary` entry (`(branch summary of sequence N, K turns)`)
+  in place of its otherwise-empty `text` field.
+
+  Verified with new unit tests in `session.rs` (unknown sequence is a
+  conflict; a no-op with no model configured; a no-op for a sequence
+  already on the active chain; a real summary -- using `EchoProvider`
+  with `state.model` set to a fake string, the same "provider and model
+  string are independent parameters" trick `seed_forked_session`'s own
+  test already relies on -- correctly appended on the *current* active
+  chain with the right `BranchSummary` fields), CI-safe integration
+  tests in `tests/session_tree.rs` covering the same no-op/conflict
+  cases end to end against a real daemon, and a new `#[ignore]`d
+  real-model test in `tests/ollama_provider.rs`
+  (`ollama_provider_summarizes_an_abandoned_branch`) -- run against this
+  sandbox's real Ollama + `rp-server` and confirmed passing before this
+  was written up. Plus a manual pass confirming `session tree`'s own
+  enriched display end to end.
+
+  **`/clone`: re-investigated, confirmed still out of scope, for a
+  different reason than before.** The old reasoning ("depends on the
+  tree structure") is gone now that the tree structure exists -- but the
+  real blocker was never the *data model*, it's what `prime-agent`'s
+  `/clone` actually duplicates: *live* interpreter/kernel state (in-flight
+  Python variables, imported modules, open connections), not just
+  durable transcript/config data. This project's own architecture has no
+  mechanism for that at any layer -- `session stop`/a worker crash
+  already lose an `IpythonKernelRuntime`'s live kernel state today (only
+  `transcript.jsonl`/`state.json` survive), and `session fork` was built
+  around exactly that same limit (`ARCHITECTURE.md`'s own "Session
+  forking" section). A `session clone` that copied everything `session
+  fork` already copies (full transcript, no truncation, goal/harness
+  carried forward too) would just be `session fork` with the truncation
+  and narrative-reset options turned off -- not a meaningfully different
+  feature, and not what `/clone` is actually for upstream. Real live-state
+  duplication would need OS-level process forking of a running kernel
+  (or full interpreter-state serialization) -- a genuinely different,
+  much larger mechanism than anything this increment's branch-summary
+  work touched, so it stays unimplemented.
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
