@@ -1160,11 +1160,40 @@ attempted here, and not silently implied by anything in
   client plus somewhere real to send it, and there's nothing on the
   other end for this project to authenticate against.
 - **ACP mode** (Agent Client Protocol). `prime-agent`'s `--mode acp`
-  speaks JSON-RPC 2.0 to editor integrations (Zed, VS Code). This is an
-  editor-ecosystem integration surface this project has never targeted --
-  there's no editor plugin on the other end to talk to, the same
-  reasoning the `/login` bullet above uses for having no account to log
-  into.
+  speaks the Agent Client Protocol (`agentclientprotocol.com`) to
+  editor integrations. Re-investigated closely rather than taken on
+  faith, because -- unlike `/login` just above it, or "Extensions"/
+  "Themes" (see the medium-effort section's own entry on those) -- the
+  `/login` reasoning this bullet used to give ("no editor plugin on the
+  other end") turns out to be factually wrong: ACP is a real, openly
+  specified JSON-RPC 2.0 protocol, and Zed is a real, currently-shipping
+  ACP *client* already in people's hands. Implementing an ACP *server*
+  here needs no backend this project would have to build or own, unlike
+  `/login`'s missing Prime Intellect account system -- the "nothing on
+  the other end" framing simply doesn't transfer.
+
+  The honest reason to still hold off: this project doesn't yet have
+  field-verified knowledge of ACP's exact wire shapes (`session/update`'s
+  content union, `session/request_permission`'s parameters, `initialize`'s
+  capability payload, confirmed message framing) the way MCP integration
+  and the ZMTP client both required a direct probe of the real thing
+  before any code was written for either. Writing an implementation
+  against recalled-but-unverified JSON-RPC method signatures risks
+  producing something that *claims* ACP compliance without actually
+  having it -- worse than staying unimplemented. Structurally, this
+  looks tractable once that spike is done: `client::session_rpc`
+  (`--mode rpc`) is already this project's own precedent for "a headless
+  JSON-in/JSON-out protocol reusing existing `Request`/`Response`/
+  `SessionEvent` types rather than inventing a second schema," and
+  `ProviderReply`'s non-streaming shape (a complete reply per turn, no
+  partial deltas -- see the RPC mode entry above) looks like it can
+  still emit a single, spec-legal `session/update` chunk per turn rather
+  than needing this project's whole model-provider path restructured
+  for true incremental streaming. Kept in this section for now (nothing
+  here has actually verified a spike against the real protocol yet), but
+  unlike `/login`'s genuinely missing backend, this one is a tractable
+  near-term increment once that verification step happens, not a
+  structurally missing subsystem -- still unimplemented today.
 - **Intra-session tree branching** (`/tree`'s underlying `id`/`parentId`/
   active-leaf JSONL structure inside one session's own transcript, see
   `session-format.md`). Investigated closely (see the "Session-level
