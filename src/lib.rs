@@ -61,6 +61,7 @@ mod prompt_template;
 mod providers;
 mod rp_server;
 mod schedule;
+mod self_update;
 mod settings;
 mod sha256;
 mod skills;
@@ -250,6 +251,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         cli::Command::ModelList { detailed } => {
             client::model_list(&state_root, detailed, output_mode).await
         }
+        cli::Command::Update { force } => client::self_update(force, output_mode).await,
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }

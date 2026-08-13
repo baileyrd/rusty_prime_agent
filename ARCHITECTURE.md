@@ -590,6 +590,38 @@ terminal's own local echo but `read_raw_line` re-echoes every byte itself
 (see that module's own doc comment), so the key is visible on screen as
 it's typed, same as everything else piped through this REPL.
 
+## Self-update (`harness update`)
+
+Bounded, honest parity with `prime-agent update [--force]` -- see
+`PARITY.md` for the full story, including why the real thing (checking a
+release registry for a newer version) doesn't translate: this project's
+own `Cargo.toml` says `publish = false`, with no crates.io release and
+no GitHub Releases workflow, so there is no release channel to check.
+
+`self_update::run(force)` (no daemon involved, same "pure local
+operation" shape as `model_list`/`skill_list`) instead treats the one
+real invariant this whole project has -- it's only ever built via `cargo
+build --release` run directly in a git checkout of its own source -- as
+the update mechanism itself. `SOURCE_ROOT` is that checkout's path,
+embedded into the binary at compile time via Cargo's own
+`CARGO_MANIFEST_DIR`; `run_in(root, force)` is the actual implementation
+(`run` is a one-line wrapper around it), split out so the "no `.git`
+directory found" error path has a CI-safe unit test against a plain temp
+directory, independent of a second, `#[ignore]`d test that runs the real
+thing (`git pull` against a real `origin`, then `cargo build --release`
+if anything changed) against this project's own checkout.
+
+`git pull`, then (unless it reported nothing new and `--force` wasn't
+passed) `cargo build --release`, both via `rusty_tokio::process::Command`
+with `.output()` (not `.status()`, unlike `run_quality_gate` -- this
+needs the captured stdout/stderr to report back, not just a pass/fail).
+`--force` only ever means "rebuild anyway" -- never "discard uncommitted
+changes"; `git pull` already refuses on its own to overwrite uncommitted
+changes a merge would touch, and nothing here second-guesses that
+protection or adds a destructive path around it. A missing checkout
+(binary copied elsewhere, source directory since deleted) is a loud,
+named-path error, not a silent no-op.
+
 ## `providers.json` (custom provider registration)
 
 Parity with letting a session point at any self-hosted OpenAI-compatible
