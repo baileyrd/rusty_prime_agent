@@ -778,6 +778,41 @@ daemon/worker split rather than requiring the Python control environment:
   owns it, which also means `ipykernel`'s own parent-poller kills it for
   free if the worker crashes without a clean `shutdown`.
 
+  **Later increment: the `host.request` comm protocol.** A real,
+  generic typed-request channel now exists: `tool_runtime::HostRequest`
+  (`comm_id`/`kind`/`payload`) and a new `ToolRuntime::resume_execute`
+  method, backing a kernel-side `host_request(kind, payload=None)`
+  coroutine `bootstrap_kernel` now defines alongside `rlm_heartbeat`.
+  `IpythonKernelRuntime::execute` pauses mid-cell (returning
+  `ExecutionOutcome.pending_host_request`) the moment the kernel opens a
+  comm targeting `"host.request"`, instead of blocking until timeout;
+  `resume_execute` sends the reply over `control` as a `comm_msg` and
+  continues draining until the cell either finishes or blocks on
+  another request. Confirmed against a real kernel *before* writing the
+  Rust side that this needs one thing `rlm-runtime.md` doesn't spell
+  out: stock `ipykernel` only ever routes `comm_msg` through its
+  `shell_handlers`, never `control_handlers` -- despite `control` being
+  exactly where `rlm-runtime.md` says host-request replies travel, a
+  real Jupyter kernel doesn't wire that up on its own. The bootstrap
+  code monkeypatches `kernel.control_handlers['comm_msg'] = kernel.
+  comm_manager.comm_msg` (and `comm_close` the same way) to make this
+  true, and resolves the kernel-side `asyncio.Future` via `loop.
+  call_soon_threadsafe` rather than a direct `set_result` -- confirmed
+  necessary because the control handler runs on a different thread than
+  the one the awaited cell is suspended on, exactly the reason `rlm-
+  runtime.md` itself gives for needing `call_soon_threadsafe`. Proven
+  end-to-end (`execute` pausing, `resume_execute` delivering a reply and
+  finishing the cell) as a new `#[ignore]`d real-kernel test in
+  `ipython_runtime.rs`'s own test module, same discipline as its
+  siblings. Explicitly not done yet: no request `kind` is dispatched to
+  anything -- `session.rs`'s tool-calling loop doesn't call `resume_
+  execute` at all, so this is proven machinery with no live caller
+  inside a real session. `rlm_heartbeat` was deliberately *not*
+  migrated onto this channel either: it already works via the stdout
+  marker, migrating it isn't free, and doing so alongside the first real
+  consumer (a kernel-callable `rlm(...)`, the next increment) is more
+  useful than migrating it in isolation.
+
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:
   `session new --runtime ipython` offers an `execute_python` tool

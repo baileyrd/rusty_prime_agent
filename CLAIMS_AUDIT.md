@@ -164,14 +164,23 @@ worker/session code.
   no in-process handle to any child's runtime at all.
 - **"IPython is the model-facing control environment. Typed host
   requests return authoritative operations to the TypeScript session."**
-  -- **Partial.** The kernel is real and model-facing for `--runtime
-  ipython` sessions (see the RLM section above). But there is no general
-  typed request/response channel from kernel code back to the Rust host.
-  The only kernel-to-host signal that exists is the single hardcoded
-  stdout marker (`HEARTBEAT_MARKER`, `src/session.rs:56`) used
-  exclusively to trigger `trigger_heartbeat` -- a one-off convention, not
-  a general "typed host request" protocol a kernel call could use for
-  other authoritative operations.
+  -- **Now Partial-leaning-True (was Partial-leaning-False).** The
+  kernel is real and model-facing for `--runtime ipython` sessions (see
+  the RLM section above). Originally found without any general typed
+  request/response channel -- the only kernel-to-host signal was the
+  hardcoded `HEARTBEAT_MARKER` stdout convention. **Closed at the
+  mechanism level**: a real `host.request` Jupyter comm protocol now
+  exists (`tool_runtime::HostRequest`, `ToolRuntime::resume_execute`,
+  kernel-side `host_request(kind, payload)` defined in `worker::
+  bootstrap_kernel`) -- `IpythonKernelRuntime::execute` pauses with
+  `pending_host_request` set when the kernel opens a `host.request` comm
+  and blocks awaiting a reply, and `resume_execute` delivers one over
+  `control` and lets the cell finish. Still Partial, not True: nothing
+  yet calls this from `session.rs`'s own `execute_python_tool_call` loop
+  (no dispatcher wired to a real request `kind`) -- the mechanism is
+  proven end-to-end against a real kernel, but has no live caller inside
+  a real session yet. That's the next increment (a kernel-callable
+  `rlm(...)` using it).
 - **"Workers and kernels are separate processes for lifecycle and
   failure containment, not security sandboxes. They normally run with
   the same operating-system permissions as the client."** -- **True.**
@@ -182,15 +191,18 @@ worker/session code.
 - **Prompt execution sequence diagram** (`U -> C -> S -> W -> A -> P`,
   streamed back through the same chain, transcript appended, "opt
   IPython tool call" branching into a "typed host request" vs. "ordinary
-  execution" alternative). -- **True for the outer flow, false for the
-  inner branch.** The client/daemon/worker/`AgentSession`/provider chain,
-  transcript append, and event streaming back to the client all match
-  what `handle_session_prompt`/`AgentSession::prompt` actually do,
-  including the "generation-aware events" detail (`SessionState.
-  generation`, `src/protocol.rs:531`, bumped on every respawn precisely
-  so attach-stream cursors can detect it). The "typed host request" arm
-  of the IPython branch does not exist as a general mechanism, per the
-  point above -- only the heartbeat marker special case does.
+  execution" alternative). -- **True for the outer flow, mechanism now
+  real but unwired for the inner branch.** The client/daemon/worker/
+  `AgentSession`/provider chain, transcript append, and event streaming
+  back to the client all match what `handle_session_prompt`/
+  `AgentSession::prompt` actually do, including the "generation-aware
+  events" detail (`SessionState.generation`, `src/protocol.rs:531`,
+  bumped on every respawn precisely so attach-stream cursors can detect
+  it). The "typed host request" arm of the IPython branch now exists at
+  the `ToolRuntime` layer (see the system-diagram entry above) but
+  `session.rs`'s own tool-calling loop doesn't yet call it -- so this
+  branch is real machinery without a live caller, not the "only the
+  heartbeat marker special case" finding of the earlier pass.
 - **"From the session queue onward, the same execution and persistence
   path is used when a prompt comes from a heartbeat, cron schedule, goal
   continuation, autonomous mode, or another agent instead of an attached
@@ -558,14 +570,20 @@ above:
 
 - **The callable `rlm` object preloaded in kernel globals
   (`await rlm(...)`, `.list_subagents()`, `.delete_subagent()`,
-  `.host_request(...)`).** -- **False**, entirely. `bootstrap_kernel`
-  only ever defines `rlm_heartbeat`; no `rlm` name of any kind exists in
-  kernel globals. This sharpens the earlier finding by naming the exact
-  missing primitive (`host_request`) rather than just "no `rlm(...)`."
+  `.host_request(...)`).** -- **False**, still. `bootstrap_kernel`
+  defines `rlm_heartbeat` and a bare `host_request(kind, payload)`
+  coroutine (see the system-diagram entry above), but no `rlm` object of
+  any kind, namespaced or otherwise, exists in kernel globals -- `await
+  rlm(...)`/`rlm.list_subagents()`/`rlm.host_request(...)` all remain
+  unavailable. The underlying comm-protocol primitive the last sentence
+  named as missing (`host_request`) is exactly what's now real, just not
+  yet exposed through an `rlm` namespace or consumed by any real request
+  kind.
 - **`goal`/`agent_message`/`compact` skills all calling
   `rlm.host_request(...)`.** -- **False**, confirmed each has zero
   kernel presence -- goal/compaction/messaging are all CLI/daemon-level
-  only.
+  only. `host_request` itself is real now (see above), but nothing calls
+  it for any of these three kinds yet.
 - **Child usage attribution, parent-scoped registry surviving
   compaction/restart, recursion depth limits.** -- **False/N/A**,
   already settled, reconfirmed with no new evidence.
@@ -867,14 +885,17 @@ work, not yet decided or scheduled:
       need to synthesize skill *logic*) -- would close the "built-in
       skill creator" gap without requiring the model to author working
       Python on its own.
-- [ ] **Generalize the heartbeat marker into a real typed host-request
-      channel.** Currently one hardcoded stdout marker for one specific
-      trigger. If a second kernel-to-host authoritative operation is
-      ever needed, a small tagged-JSON-on-stdout convention (marker +
-      one JSON payload, parsed the same way `extract_heartbeat_marker`
-      already parses `marker + every`) would generalize this without
-      much new machinery -- not worth building ahead of a second actual
-      caller, so left as a candidate rather than started.
+- [x] **A real `host.request` typed channel (done, see the "RLM control
+      channel" work).** `tool_runtime::HostRequest`/`ToolRuntime::
+      resume_execute` plus a kernel-side `host_request(kind, payload)`
+      coroutine now exist and are proven end-to-end against a real
+      kernel. `rlm_heartbeat` itself was deliberately *not* migrated onto
+      it yet -- the stdout marker still works and costs nothing to leave
+      running alongside the new channel -- but the channel a migration
+      would use is real now, not a "not worth building ahead of a second
+      caller" candidate anymore. Migrating `rlm_heartbeat` and adding the
+      first real request `kind` (`rlm.run`) is tracked as ongoing work,
+      not a followup.
 - [ ] **`daemon doctor [--fix]`.** No diagnostic/repair command exists.
       A bounded first slice: check daemon-socket reachability, scan for
       orphaned `worker.sock` files with no live process behind them

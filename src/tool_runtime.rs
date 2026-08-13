@@ -28,40 +28,77 @@ use crate::error::Result;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// What one `execute` call produced. Deliberately small: Phase 1 never
-/// inspects this beyond appending it to the transcript, and Phase 2's
-/// real kernel connection is where "typed host requests return
-/// authoritative operations to the TypeScript session" (the reference
-/// architecture's own phrase) would grow this into something richer.
+/// What one `execute`/`resume_execute` call produced. Grown, as this
+/// module's own doc comment anticipated, to carry "typed host requests"
+/// once `ipython_runtime::IpythonKernelRuntime` actually implemented
+/// them: `pending_host_request` is `Some` exactly when the kernel is
+/// blocked mid-cell awaiting a reply (`await host_request(...)`) rather
+/// than finished -- the caller must compute a reply and call
+/// [`ToolRuntime::resume_execute`], not treat this `ExecutionOutcome` as
+/// final. `stdout`/`result` still only ever reflect what was produced
+/// *up to* that pause; a caller looping through possibly-several pauses
+/// within one cell is responsible for concatenating `stdout` across
+/// calls itself (see `session::execute_python_tool_call`).
 #[derive(Debug, Clone, Default)]
-// `execute`'s return type: legitimately unconstructed in Phase 1 (see
-// `execute`'s own `#[allow]` below) -- not oversight.
-#[allow(dead_code)]
 pub struct ExecutionOutcome {
     pub stdout: String,
     pub result: Option<String>,
+    pub pending_host_request: Option<HostRequest>,
+}
+
+/// One typed host request the kernel is blocked awaiting a reply to --
+/// parity with `rlm-runtime.md`'s "comm target: host.request" (see
+/// `ipython_runtime`'s own doc comment for the full mechanism: a Jupyter
+/// comm opened by kernel-side code, replied to over the `control`
+/// channel to avoid deadlocking the `shell` channel it was opened on).
+/// `kind`/`payload` are exactly what the kernel-side `host_request(kind,
+/// payload)` call passed, opaque to `ToolRuntime` itself -- interpreting
+/// `kind` and producing a reply is the caller's job (`AgentSession`),
+/// not this trait's.
+#[derive(Debug, Clone)]
+pub struct HostRequest {
+    /// The Jupyter comm id the reply must be addressed to (see
+    /// `ToolRuntime::resume_execute`).
+    pub comm_id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
 }
 
 /// The host-side handle to a model-facing code execution environment.
-/// Phase 2 will back this with a real IPython kernel subprocess; Phase 1
-/// backs it only with [`NoopToolRuntime`].
+/// Backed for real by `ipython_runtime::IpythonKernelRuntime` when a
+/// session opts in (`session new --runtime ipython`); every other
+/// session gets [`NoopToolRuntime`].
 pub trait ToolRuntime: Send + Sync {
-    /// Bring the runtime up (Phase 2: spawn and handshake with the
-    /// kernel subprocess via `rustils::Command`/`rusty_tokio`). Called
-    /// once per `AgentSession` lifetime, before the first `execute`.
+    /// Bring the runtime up (spawn and handshake with the kernel
+    /// subprocess). Called once per `AgentSession` lifetime, before the
+    /// first `execute`.
     fn start(&mut self) -> BoxFuture<'_, Result<()>>;
 
-    /// Run one turn's worth of code and return what it produced. Never
-    /// called in Phase 1 -- tool execution is an explicit non-goal, and
-    /// `AgentSession::prompt` never reaches for it. Kept (and kept
-    /// compiling, via `NoopToolRuntime`) because the trait's whole
-    /// purpose is to be the exact shape Phase 2's turn loop calls into;
-    /// a method Phase 1 doesn't exercise is the intended state, not an
-    /// unfinished one.
-    #[allow(dead_code)]
+    /// Run one turn's worth of code and return what it produced -- or,
+    /// if the kernel blocks mid-cell on `await host_request(...)`, what
+    /// it produced *so far* plus `pending_host_request`. A caller that
+    /// sees `pending_host_request` set must compute a reply and call
+    /// [`resume_execute`](Self::resume_execute), not treat the call as
+    /// finished.
     fn execute(&mut self, code: &str) -> BoxFuture<'_, Result<ExecutionOutcome>>;
 
-    /// Tear the runtime down (Phase 2: terminate the kernel subprocess).
+    /// Replies to a `pending_host_request` from a prior `execute`/
+    /// `resume_execute` call (addressed by `comm_id`) and continues
+    /// draining the kernel's response until it either completes or
+    /// blocks on another host request -- a cell may `await
+    /// host_request(...)` more than once, so a caller must loop calling
+    /// this until the returned `ExecutionOutcome.pending_host_request`
+    /// is `None`. [`NoopToolRuntime`] never produces a pending host
+    /// request in the first place, so this is never reachable on it in
+    /// practice; its own implementation errors loudly rather than
+    /// pretending to be capable of it.
+    fn resume_execute(
+        &mut self,
+        comm_id: &str,
+        reply: serde_json::Value,
+    ) -> BoxFuture<'_, Result<ExecutionOutcome>>;
+
+    /// Tear the runtime down (terminate the kernel subprocess).
     fn shutdown(&mut self) -> BoxFuture<'_, Result<()>>;
 }
 
@@ -84,7 +121,21 @@ impl ToolRuntime for NoopToolRuntime {
             Ok(ExecutionOutcome {
                 stdout: String::new(),
                 result: Some(format!("<no-op tool runtime: would execute `{code}`>")),
+                pending_host_request: None,
             })
+        })
+    }
+
+    fn resume_execute(
+        &mut self,
+        _comm_id: &str,
+        _reply: serde_json::Value,
+    ) -> BoxFuture<'_, Result<ExecutionOutcome>> {
+        Box::pin(async {
+            Err(crate::error::HarnessError::conflict(
+                crate::error::Context::Runtime,
+                "NoopToolRuntime never produces a pending host request, so resume_execute should never be called on it",
+            ))
         })
     }
 
