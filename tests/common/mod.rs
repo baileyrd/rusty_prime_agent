@@ -1,11 +1,15 @@
 //! Shared black-box test support: drives the real compiled `harness`
 //! binary as a subprocess against an isolated `RUSTY_PRIME_AGENT_HOME`,
 //! the same way a real user/TUI would. This is deliberately a black-box
-//! test, not a call into internal modules -- the package has no `[lib]`
-//! target (see `ARCHITECTURE.md`), and even if it did, testing through
-//! the actual CLI + real daemon/worker OS processes + real Unix sockets
-//! is what the brief's "session recovery" and "worker crash handling"
-//! coverage actually needs to be evidence of.
+//! test, not a call into internal modules: even though the package now
+//! has a `[lib]` target (`rusty_prime_agent`, see `ARCHITECTURE.md`'s
+//! "Embeddable SDK" section, and `tests/embedded_session.rs`/`tests/
+//! dispatch_one_shot.rs` for the tests that actually exercise it),
+//! testing *this* project's own daemon/worker/socket architecture
+//! through the actual CLI + real OS processes + real Unix sockets is
+//! what the brief's "session recovery" and "worker crash handling"
+//! coverage actually needs to be evidence of -- a lib-level call would
+//! bypass the exact machinery these tests exist to prove.
 //!
 //! `mod common;` is included separately by each test binary
 //! (`session_lifecycle.rs`/`supervisor_restart_recovery.rs`/

@@ -598,7 +598,19 @@ pub async fn session_rpc(state_root: &Path, session_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch_one_shot(state_root: &Path, request: Request) -> Result<Response> {
+/// Sends one [`Request`] to an already-running daemon and returns its
+/// typed [`Response`] -- re-exported at the crate root
+/// (`rusty_prime_agent::dispatch_one_shot`) as this project's "drive a
+/// running daemon" embedding primitive (see `lib.rs`'s own doc comment).
+/// Everything else in this module stays crate-internal on purpose: every
+/// other `client::session_*`/`client::daemon_*` function renders its
+/// result straight to this process's own stdout (`println!`/
+/// `print_json`) rather than returning it, which makes sense for a CLI
+/// binary and no sense at all for an external caller embedding this
+/// crate as a library. Uses the daemon's already-running socket
+/// (`connect`) -- an embedder wanting no daemon at all should use
+/// [`crate::session::AgentSession`] directly instead.
+pub async fn dispatch_one_shot(state_root: &Path, request: Request) -> Result<Response> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &request).await?;
     read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await

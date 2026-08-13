@@ -226,6 +226,69 @@ daemon/worker split rather than requiring the Python control environment:
   `my-vllm/*` in `rp-server`'s real `/v1/models` catalog, and `session
   new --model my-vllm/qwen2.5:0.5b` round-tripped a real completion
   through it.
+- [x] **An embeddable SDK** (`[lib]` target), bounded parity with
+  `prime-agent`'s own `createAgentSession()`/`defineTool()`/
+  programmatic model-and-auth configuration -- deliberately two honest
+  embedding layers matching this project's actual daemon/worker/socket
+  architecture, not an assumed in-process agent loop the way
+  `prime-agent`'s own SDK works:
+
+  1. **In-process, no daemon at all.** `session::AgentSession::create`
+     is exactly what `session.rs`'s own unit tests already constructed
+     directly (`Box::new(EchoProvider)`/`Box::new(NoopToolRuntime)`), now
+     `pub` (along with `provider`/`tool_runtime`/`protocol`/`error`/
+     `paths`) for any external crate to do the same: a real, driveable
+     session with no daemon/worker/socket machinery in the loop.
+     Not a pure in-memory session, though -- `create` still does real
+     filesystem I/O under a caller-supplied `state_root`, the same
+     durability a daemon-backed session gets. `provider::ModelProvider`/
+     `tool_runtime::ToolRuntime` were already plain `pub trait`s, already
+     object-safe and `Send + Sync`, already how `AgentSession` stores
+     them internally -- implementing either yourself is this project's
+     answer to `defineTool()`, no separate registration API needed.
+  2. **Drive a *running* daemon.** `dispatch_one_shot` (re-exported at
+     the crate root) sends one `protocol::Request` over an already-
+     running daemon's socket and returns a typed `protocol::Response` --
+     the same connect-send-receive primitive `client.rs`'s own CLI-
+     output functions already built on internally, promoted to `pub`
+     instead of them: every `client::session_*`/`client::daemon_*`
+     function renders straight to this process's own stdout
+     (`println!`/`print_json`), which makes sense for a CLI binary and
+     no sense for an external embedder, so those stay crate-internal.
+
+  New `src/lib.rs`, taking over the full `mod` list `main.rs`'s own
+  `run` dispatch used to own, splitting it into the public embedding
+  surface above plus everything else staying a plain (still
+  crate-internal-usable) `mod`. `Cargo.toml` gained a `[lib] name =
+  "rusty_prime_agent"` section alongside the existing `[[bin]] name =
+  "harness"`; `main.rs` shrank to the handful of process-level concerns
+  that are genuinely bin-only and would be wrong to impose on an
+  embedding host process -- `harden_inherited_stdio` (see that
+  function's own doc comment) and the explicit `std::process::exit`
+  (`rp_server::ensure_running`'s reaper task needs it, see that entry
+  above) -- calling `rusty_prime_agent::run(&args)` for everything else.
+  No internal module needed new visibility beyond that: item-level `pub`
+  was already liberal throughout (nothing outside the crate could ever
+  tell the difference before now), so this was almost entirely a
+  question of which `mod` declarations became `pub mod`, not a rewrite
+  of internal APIs.
+
+  Explicitly out of scope for this increment: any semver/stability
+  guarantee on the new public surface (`publish = false`/`0.1.0` stay),
+  docs.rs-quality rustdoc coverage beyond what's here, and exposing
+  `daemon`/`worker`/`ipython_runtime`/`zmtp` publicly -- nothing in
+  either embedding layer needs them directly.
+
+  Verified with two new CI-safe integration tests -- the first tests in
+  this project not shaped as `std::process::Command::new(common::bin())`
+  (every `tests/*.rs` file compiles as its own crate linking the lib the
+  same way a real external embedder would, so this is genuine proof, not
+  a same-crate shortcut): `tests/embedded_session.rs` constructs and
+  prompts an `AgentSession` directly (plus a `create`-then-`recover`
+  round trip proving real disk persistence with no daemon ever
+  involved), and `tests/dispatch_one_shot.rs` drives a real running
+  daemon (`common::daemon_start`, still a real subprocess) through the
+  re-exported `dispatch_one_shot` call instead of parsing CLI stdout.
 - [x] **`--mode json`** -- a leading global flag (`harness --mode json
   session list`, parity with `prime-agent --mode json`) that switches
   every public subcommand's rendering from this project's own
@@ -613,11 +676,13 @@ daemon/worker split rather than requiring the Python control environment:
   trip, state persisting across calls within one kernel, a Python
   exception surfacing correctly, clean shutdown) lives as an `#[ignore]`d
   test directly in `ipython_runtime.rs`'s own test module rather than
-  `tests/`, since this project's binary has no `[lib]` target for an
-  integration test to link a Rust-level unit test against -- run
-  explicitly against a real local `ipykernel` install (`pip install
-  ipykernel`), the same infra-gated pattern `tests/ollama_provider.rs`
-  uses. CI-safe coverage (`tests/ipython_runtime.rs`) proves the flag
+  `tests/`. `Cargo.toml` now has a `[lib]` target (see the "Embeddable
+  SDK" entry below), but `ipython_runtime` is deliberately *not* part of
+  its public surface -- `IpythonKernelRuntime` stays crate-internal on
+  purpose, so a same-crate unit test is still the only way to construct
+  one directly, same as before that target existed. Run explicitly
+  against a real local `ipykernel` install (`pip install ipykernel`),
+  the same infra-gated pattern `tests/ollama_provider.rs` uses. CI-safe coverage (`tests/ipython_runtime.rs`) proves the flag
   reaches all the way from `session new` through the daemon to the
   worker's `ToolRuntime` selection without needing a real kernel, by
   pointing `RUSTY_PRIME_AGENT_IPYTHON_BIN` at a binary name that can't
@@ -1007,11 +1072,6 @@ attempted here, and not silently implied by anything in
   there's no editor plugin on the other end to talk to, the same
   reasoning the `/login` bullet above uses for having no account to log
   into.
-- **An embeddable SDK** (`createAgentSession()`, custom tools via
-  `defineTool()`, programmatic model/auth configuration). Would need this
-  project to become a library crate rather than a binary-only one --
-  `Cargo.toml` has no `[lib]` target today. A real, nameable architectural
-  change, not attempted.
 - **A tree-structured session data model** (`/tree`/`/fork`/`/clone`'s
   underlying `id`/`parentId`/active-leaf JSONL structure, see
   `session-format.md`). Deeper than the already-cut TUI commands

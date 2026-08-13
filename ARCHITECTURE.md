@@ -22,7 +22,8 @@ project's current shape.
 
 | Module | Owns |
 | --- | --- |
-| `main` | Entrypoint, argv dispatch, `harden_inherited_stdio` |
+| `lib` | Crate root (`rusty_prime_agent`): `pub async fn run(args)` (the full subcommand-dispatch match, moved out of `main.rs`), the `pub mod`/`pub use` embedding surface -- see "Embeddable SDK" below |
+| `main` | Thin bin entrypoint: `harden_inherited_stdio`, argv collection, calling `rusty_prime_agent::run`, and the exit-code mapping -- the process-level concerns that are genuinely bin-only |
 | `cli` | Argument parsing for the public subcommands |
 | `client` | The CLI-side half of every request: connects to `daemon.sock`, sends a `Request`, prints the `Response`/event stream. Also owns `session_autonomous`'s bounded continuation loop (`session autonomous`), `session_refine`'s Continual Harness review loop (`session refine`), `session_spawn`/`session_children`/`session_message`'s recursive-subagent composition, and `session_repl`'s minimal interactive loop (`session repl`, see `PARITY.md` for all four) -- pure client-side orchestration over existing `SessionNew`/`SessionList`/`SessionPrompt`/`SessionAttach`/`ScheduleAdd`/`GoalShow`/`GoalUpdate`/`HarnessShow`/`HarnessUpdate` requests, no daemon/worker changes needed beyond threading `parent_id` through `SessionNew`/`SessionState` |
 | `daemon` | The supervisor process: binds the public socket, routes requests, recovers sessions on its own startup |
@@ -50,6 +51,63 @@ project's current shape.
 | `auth` | `<state_dir>/auth.json` read/parse plus `!command` key resolution (`load`/`resolve_key`) -- see below |
 | `providers` | `<state_dir>/providers.json` read/parse for custom/arbitrary OpenAI-compatible provider registration (`load`) -- see below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
+
+## Embeddable SDK
+
+Parity with `prime-agent`'s own `createAgentSession()`/`defineTool()`
+programmatic API -- see `PARITY.md` for the full design story, including
+why this is two deliberately honest embedding layers rather than an
+assumed in-process agent loop. `Cargo.toml` has both a `[lib] name =
+"rusty_prime_agent"` and the existing `[[bin]] name = "harness"`; the
+bin depends on the lib as an ordinary same-package target, not a
+duplicated copy of any source.
+
+`lib.rs`'s public surface is deliberately narrow: `pub mod session`
+(`AgentSession` and friends -- see "In-process, no daemon at all" below),
+`pub mod provider`/`pub mod tool_runtime` (the two traits an embedder
+implements to plug in a custom model/tool backend), `pub mod protocol`
+(the wire types), `pub mod error`/`pub mod paths`, and `pub use
+client::dispatch_one_shot` (see "Drive a running daemon" below).
+Everything else (`daemon`/`worker`/`client`'s own CLI-output functions/
+`ipython_runtime`/`zmtp`/...) stays a plain `mod`, still fully usable
+*within* the crate by `run()` exactly as before -- module privacy in
+Rust only gates *external* crates, so none of that internal wiring
+needed to change at all, only which few `mod` declarations became `pub
+mod`.
+
+**In-process, no daemon at all.** `session::AgentSession::create(state_root,
+session_id, NewSessionMeta, Box<dyn ModelProvider>, Box<dyn
+ToolRuntime>)` is exactly what `session.rs`'s own unit tests already
+constructed directly -- a real, driveable session with no daemon/
+worker/socket machinery in the loop. Not a pure in-memory session,
+though: `create` still does real filesystem I/O (`state.json`/
+`transcript.jsonl` persistence) under the caller-supplied `state_root`,
+the same durability a daemon-backed session gets. `ModelProvider`/
+`ToolRuntime` were already plain `pub trait`s, already object-safe and
+`Send + Sync` (boxed-future methods specifically so an external async
+impl doesn't need `async-trait`), already how `AgentSession` stores them
+internally -- implementing either yourself is this project's answer to
+`defineTool()`, no separate tool-registration API needed.
+
+**Drive a running daemon.** `dispatch_one_shot(state_root, Request) ->
+Result<Response>` sends one typed request over an already-running
+daemon's socket and returns a typed response -- the same connect-send-
+receive primitive every `client::session_*`/`client::daemon_*` function
+already built on internally, but returning data instead of `println!`/
+`print_json`-ing straight to this process's own stdout the way those
+CLI-rendering functions do. That's exactly why only this one function
+is promoted to `pub`, not the whole `client` module.
+
+Explicitly out of scope for this increment: any semver/stability
+guarantee on the public surface (`publish = false`/`0.1.0` stay),
+docs.rs-quality rustdoc coverage beyond what's here, and exposing
+`daemon`/`worker`/`ipython_runtime`/`zmtp` -- nothing in either
+embedding layer needs them directly. Verified by `tests/
+embedded_session.rs` (layer one) and `tests/dispatch_one_shot.rs` (layer
+two) -- the first tests in this project not shaped as `std::process::
+Command::new(common::bin())`, since every `tests/*.rs` file compiles as
+its own crate linking the lib the same way a real external embedder
+would.
 
 ## Dependency stack
 

@@ -369,6 +369,48 @@ listed as configured -- it needs no API key.
 per-model catalog instead (id, owning provider, context length) -- needs
 `rp-server` on `PATH`, unlike the plain listing above.
 
+## Embedding as a library
+
+`harness` is one binary built on top of the `rusty_prime_agent` library
+crate (`Cargo.toml` has both a `[lib]` and a `[[bin]]` target); an
+external Rust program can depend on the same crate directly, with two
+embedding layers to pick from:
+
+```rust
+// No daemon at all -- a real, driveable session in-process.
+use rusty_prime_agent::provider::EchoProvider;
+use rusty_prime_agent::session::{AgentSession, NewSessionMeta};
+use rusty_prime_agent::tool_runtime::NoopToolRuntime;
+
+let mut session = AgentSession::create(
+    state_root,
+    "my-session".to_string(),
+    NewSessionMeta::default(),
+    Box::new(EchoProvider),
+    Box::new(NoopToolRuntime),
+)
+.await?;
+let reply = session.prompt("hello".to_string()).await?;
+```
+
+```rust
+// Drive an already-running daemon instead.
+use rusty_prime_agent::protocol::{Request, Response};
+
+let response = rusty_prime_agent::dispatch_one_shot(
+    state_root,
+    Request::SessionList,
+)
+.await?;
+```
+
+Implement `provider::ModelProvider`/`tool_runtime::ToolRuntime` yourself
+to plug in a custom model backend or tool/code-execution environment --
+both are plain `pub trait`s already used exactly that way internally, no
+separate registration step needed. See `ARCHITECTURE.md`'s "Embeddable
+SDK" section for the full design, including what's deliberately kept
+crate-internal (`daemon`/`worker`/`ipython_runtime`/`zmtp`).
+
 ## Environment variables
 
 | Variable | Effect |
