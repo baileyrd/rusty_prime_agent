@@ -1136,6 +1136,74 @@ daemon/worker split rather than requiring the Python control environment:
   "total_tokens":44}`, confirming the wire-parsing half end to end
   against real infrastructure, not just a hand-built fixture.
 
+  **Later increment: kernel-callable `goal`/`agent_message`/`compact`
+  skills.** Parity with `rlm.md`/`rlm-runtime.md`: "the `goal`,
+  `agent_message`, `rlm_heartbeat`, and `compact` skills call `rlm.
+  host_request(...)`" -- `rlm_heartbeat()` was already real (an earlier
+  increment); this closes the other three. Real Python API signatures
+  from `rlm-runtime.md`: `await goal.get()`, `await goal.create(task,
+  token_budget=...)`, `await goal.complete()`; `await agent_message.send(
+  message, receiver_role="parent")` / `await agent_message.send(...,
+  receiver_role="child", receiver_name=child.session_name)`. `compact`
+  itself was named but never given a documented signature there, so
+  `await compact.now(instructions=None)` mirrors this project's own
+  existing `session compact [instructions]`/`/compact [instructions]`
+  naming instead of guessing at an upstream shape that was never
+  specified. Implemented as three small namespace objects in
+  `worker::bootstrap_kernel` (`goal`/`agent_message`/`compact`, each a
+  bare class instance with one or a few `async def` methods), matching
+  upstream's own dotted-call syntax exactly -- a deliberate departure
+  from the bare-top-level-function simplification `rlm(...)`/
+  `rlm_list_subagents()`/`rlm_delete_subagent()` already made, since here
+  the upstream shape genuinely is a small namespace object per skill, not
+  one big `rlm.*` surface.
+
+  Five new `handle_host_request` kinds: `"goal.get"`/`"goal.create"`/
+  `"goal.complete"` and `"compact.now"` all operate on *this same
+  session's own state* -- "goal state, persistence... live in
+  `AgentSession`," and compaction is likewise entirely local -- so unlike
+  every `rlm.*`/`agent_message.*` kind (which all cross to another
+  session and therefore need a daemon round trip), these four reuse
+  `update_goal`/`compact_now` directly, the exact same in-process methods
+  `Request::GoalUpdate`/`Request::SessionCompact` already call from the
+  worker's own private-connection handler -- no round trip at all.
+  `token_budget` (`goal.create`) is accepted but not enforced: this
+  project's own `GoalState` has no token/wall-clock budget concept
+  (`session_autonomous`'s own turn/time budget is a separate, unrelated
+  mechanism), so there's nothing real to wire it to yet, the same
+  "accept an argument that doesn't fully translate" looseness `rlm(...)`'s
+  own `model` parameter already has. `"agent_message.send"` resolves
+  `receiver_role="parent"` to `self.state.parent_id` directly (an error
+  if there is none) and `receiver_role="child"` (with a required
+  `receiver_name`) via the exact same `Request::SessionList`-filtered-
+  by-`parent_id` lookup `handle_list_subagents` already performs,
+  matched by name (an error if zero or more than one direct child has
+  that name); delivery reuses this project's own existing `session
+  message` mechanism verbatim -- a `"[from <session-id>] <message>"`-
+  prefixed `Request::SessionPrompt` sent to the recipient's own worker
+  via the daemon. Because `handle_host_request` now mutates `self.state`
+  directly (`goal.*`/`compact.now`), its own signature changed from
+  `&self` to `&mut self` -- a small, mechanical ripple, not a design
+  change; every `rlm.*` handler stays `&self` since none of them ever
+  need to.
+
+  Coverage: two new CI-safe unit tests
+  (`goal_and_compact_host_requests_operate_on_this_sessions_own_state`,
+  `agent_message_send_to_parent_is_an_error_when_there_is_no_parent`)
+  prove what's provable without a daemon -- the entire `goal.*`/
+  `compact.now` surface (no daemon involved at all) plus
+  `agent_message.send`'s `receiver_role="parent"`-with-no-parent error
+  path (the one `agent_message.send` case that returns before ever
+  touching the network). A new `#[ignore]`d real-kernel test
+  (`real_kernel_goal_agent_message_and_compact_open_typed_host_requests`)
+  proves the kernel-side wiring for all three skills produces the right
+  `host.request` `kind`/`payload` and returns exactly whatever the host
+  replies with. `agent_message.send`'s `receiver_role="child"` path
+  (needs a real daemon just to look children up) is not independently
+  re-tested, the same documented reason `handle_list_subagents` itself
+  isn't: it reuses the identical `Request::SessionList` shape `tests/
+  subagents.rs` already exercises end to end.
+
   Reaching the kernel from a prompt reuses the existing tool-calling loop
   (Increment 3) rather than inventing a second turn-loop mechanism:
   `session new --runtime ipython` offers an `execute_python` tool

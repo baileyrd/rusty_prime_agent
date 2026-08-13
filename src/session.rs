@@ -687,14 +687,18 @@ impl AgentSession {
     /// Dispatches one `HostRequest` the kernel is blocked awaiting a
     /// reply to (see `tool_runtime::HostRequest`'s own doc comment) and
     /// returns the JSON value to send back via `ToolRuntime::
-    /// resume_execute`. `rlm.run` is the only kind implemented so far;
-    /// an unrecognized `kind` gets an `{"error": ...}` reply rather than
-    /// a `HarnessError` -- the kernel-side caller is meant to see and
-    /// handle it, the same "surface it to the model, don't fail the
-    /// whole call" posture `execute_python_tool_call`'s own doc comment
-    /// already applies to a Python-level exception.
+    /// resume_execute`. An unrecognized `kind` gets an `{"error": ...}`
+    /// reply rather than a `HarnessError` -- the kernel-side caller is
+    /// meant to see and handle it, the same "surface it to the model,
+    /// don't fail the whole call" posture `execute_python_tool_call`'s
+    /// own doc comment already applies to a Python-level exception.
+    /// `&mut self` (not `&self`, unlike every `rlm.*` kind) since
+    /// `goal.*`/`compact.now` mutate this session's own state directly --
+    /// see those handlers' own doc comments for why they don't need a
+    /// daemon round trip the way every `rlm.*`/`agent_message.*` kind
+    /// does.
     async fn handle_host_request(
-        &self,
+        &mut self,
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
@@ -702,6 +706,11 @@ impl AgentSession {
             "rlm.run" => self.handle_rlm_run(payload).await,
             "rlm.list_subagents" => self.handle_list_subagents().await,
             "rlm.delete_subagent" => self.handle_delete_subagent(payload).await,
+            "goal.get" => self.handle_goal_get(),
+            "goal.create" => self.handle_goal_create(payload).await,
+            "goal.complete" => self.handle_goal_complete().await,
+            "compact.now" => self.handle_compact_now(payload).await,
+            "agent_message.send" => self.handle_agent_message_send(payload).await,
             other => Ok(serde_json::json!({
                 "error": format!("unknown host request kind {other:?}"),
             })),
@@ -1031,6 +1040,199 @@ impl AgentSession {
         })
         .await?;
         Ok(true)
+    }
+
+    /// Handles a kernel-side `await goal.get()` call -- parity with
+    /// `rlm.md`/`rlm-runtime.md`'s `goal` skill. "Goal state, persistence,
+    /// token and wall-clock accounting, and continuation prompting live
+    /// in `AgentSession`" -- this is *this same session's own* state, so
+    /// unlike every `rlm.*`/`agent_message.*` handler (which all cross to
+    /// another session and therefore need the daemon to route), this
+    /// reads `self.state.goal` directly with no round trip at all.
+    /// Synchronous underneath (no `.await` needed), but still returns
+    /// `Result<serde_json::Value>` to match every other host-request
+    /// handler's shape.
+    fn handle_goal_get(&self) -> Result<serde_json::Value> {
+        Ok(match &self.state.goal {
+            Some(goal) => serde_json::to_value(goal)
+                .map_err(|e| HarnessError::json(Context::Session, None, e))?,
+            None => serde_json::Value::Null,
+        })
+    }
+
+    /// Handles a kernel-side `await goal.create(task, token_budget=None)`
+    /// call. Same "no daemon round trip needed" reasoning as
+    /// `handle_goal_get` -- reuses `update_goal`'s existing `GoalAction::
+    /// Set` handling directly, the exact same path `Request::GoalUpdate`
+    /// (`session goal set`) already goes through. `token_budget` is
+    /// accepted but not enforced: this project's own `GoalState` has no
+    /// token/wall-clock budget concept at all (`session_autonomous`'s own
+    /// turn/time budget is a separate, unrelated mechanism), so there's
+    /// nothing real to wire it to yet -- the same "accept an argument
+    /// that doesn't fully translate" looseness `rlm(...)`'s own `model`
+    /// parameter already has.
+    async fn handle_goal_create(
+        &mut self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let Some(task) = payload.get("task").and_then(|v| v.as_str()) else {
+            return Ok(serde_json::json!({"error": "goal.create requires a \"task\" string"}));
+        };
+        let goal = self
+            .update_goal(GoalAction::Set {
+                text: task.to_string(),
+            })
+            .await?;
+        serde_json::to_value(goal).map_err(|e| HarnessError::json(Context::Session, None, e))
+    }
+
+    /// Handles a kernel-side `await goal.complete()` call. Same
+    /// "no daemon round trip needed" reasoning as `handle_goal_get`,
+    /// reusing `update_goal`'s existing `GoalAction::Complete` handling.
+    async fn handle_goal_complete(&mut self) -> Result<serde_json::Value> {
+        let goal = self.update_goal(GoalAction::Complete).await?;
+        serde_json::to_value(goal).map_err(|e| HarnessError::json(Context::Session, None, e))
+    }
+
+    /// Handles a kernel-side `await compact.now(instructions=None)` call
+    /// -- parity with `rlm.md`/`rlm-runtime.md`'s `compact` skill (named
+    /// but not given a documented signature there; this mirrors this
+    /// project's own existing `session compact [instructions]`/
+    /// `/compact [instructions]` naming). Same "no daemon round trip
+    /// needed" reasoning as `handle_goal_get`, reusing `compact_now`
+    /// directly -- the exact same path `Request::SessionCompact` already
+    /// goes through.
+    async fn handle_compact_now(
+        &mut self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let instructions = payload
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let (compacted, summary) = self.compact_now(instructions).await?;
+        Ok(serde_json::json!({"compacted": compacted, "summary": summary}))
+    }
+
+    /// Handles a kernel-side `await agent_message.send(message,
+    /// receiver_role="parent"|"child", receiver_name=None)` call -- parity
+    /// with `rlm.md`'s `agent_message` skill: `receiver_role="parent"`
+    /// sends to this session's own parent; `receiver_role="child"` (with
+    /// a required `receiver_name`) sends to one direct child, resolved
+    /// the exact same `Request::SessionList`-filtered-by-`parent_id` way
+    /// `handle_list_subagents` already resolves children, matching by
+    /// name (an error if zero or more than one direct child has that
+    /// name, rather than guessing). Delivery reuses this project's own
+    /// existing `session message` mechanism verbatim: a `"[from
+    /// <this-session-id>] <message>"`-prefixed `Request::SessionPrompt`
+    /// sent to the recipient's own worker (via the daemon, ensuring it's
+    /// revived if needed) -- "replies arrive as ordinary agent messages
+    /// over later turns," i.e. this call's own return value is just the
+    /// delivery ack, not a reply.
+    async fn handle_agent_message_send(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let Some(message) = payload.get("message").and_then(|v| v.as_str()) else {
+            return Ok(
+                serde_json::json!({"error": "agent_message.send requires a \"message\" string"}),
+            );
+        };
+        let receiver_role = payload
+            .get("receiver_role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("parent");
+        let to_id = match receiver_role {
+            "parent" => match &self.state.parent_id {
+                Some(id) => id.clone(),
+                None => {
+                    return Ok(
+                        serde_json::json!({"error": "this session has no parent to message"}),
+                    )
+                }
+            },
+            "child" => {
+                let Some(receiver_name) = payload.get("receiver_name").and_then(|v| v.as_str())
+                else {
+                    return Ok(serde_json::json!({
+                        "error": "agent_message.send(receiver_role=\"child\", ...) requires \
+                                  receiver_name",
+                    }));
+                };
+                let socket_path = paths::daemon_socket_path(&self.state_root);
+                let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+                conn.write_request(Context::Daemon, &Request::SessionList)
+                    .await?;
+                let response = conn.read_response(Context::Daemon).await?;
+                let sessions = match response {
+                    Some(crate::protocol::Response::SessionList { sessions }) => sessions,
+                    other => {
+                        return Err(HarnessError::protocol(
+                            Context::Daemon,
+                            format!(
+                                "expected a session_list response to agent_message.send, got \
+                                 {other:?}"
+                            ),
+                        ));
+                    }
+                };
+                let matches: Vec<_> = sessions
+                    .iter()
+                    .filter(|s| s.parent_id.as_deref() == Some(self.state.session_id.as_str()))
+                    .filter(|s| s.name.as_deref() == Some(receiver_name))
+                    .collect();
+                match matches.as_slice() {
+                    [] => {
+                        return Ok(serde_json::json!({
+                            "error": format!("no direct child named {receiver_name:?}"),
+                        }))
+                    }
+                    [only] => only.session_id.clone(),
+                    _ => {
+                        return Ok(serde_json::json!({
+                            "error": format!(
+                                "multiple direct children named {receiver_name:?}"
+                            ),
+                        }))
+                    }
+                }
+            }
+            other => {
+                return Ok(serde_json::json!({
+                    "error": format!(
+                        "unknown receiver_role {other:?}, expected \"parent\" or \"child\""
+                    ),
+                }))
+            }
+        };
+
+        let prefixed = format!("[from {}] {}", self.state.session_id, message);
+        let socket_path = paths::daemon_socket_path(&self.state_root);
+        let mut conn = transport::connect(Context::Daemon, socket_path).await?;
+        conn.write_request(
+            Context::Daemon,
+            &Request::SessionPrompt {
+                session_id: to_id.clone(),
+                text: prefixed,
+            },
+        )
+        .await?;
+        let response = conn.read_response(Context::Daemon).await?;
+        match response {
+            Some(crate::protocol::Response::SessionPromptAck { entry }) => Ok(serde_json::json!({
+                "delivered_to": to_id,
+                "sequence": entry.sequence,
+            })),
+            Some(crate::protocol::Response::Error { message, .. }) => {
+                Ok(serde_json::json!({ "error": message }))
+            }
+            other => Err(HarnessError::protocol(
+                Context::Daemon,
+                format!(
+                    "expected a session_prompt_ack response to agent_message.send, got {other:?}"
+                ),
+            )),
+        }
     }
 
     /// Handles a kernel-side `rlm_heartbeat()` call -- parity with
@@ -1822,7 +2024,7 @@ mod tests {
     async fn handle_rlm_run_rejects_admission_once_the_depth_limit_is_reached() {
         let root = temp_state_root("rlm-depth-limit");
 
-        let session = AgentSession::create(
+        let mut session = AgentSession::create(
             &root,
             "sess-depth-test".to_string(),
             NewSessionMeta {
@@ -2017,6 +2219,117 @@ mod tests {
             .transcript
             .iter()
             .all(|e| e.child_usage_attributed.is_none()));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Parity with `rlm.md`'s `goal`/`compact` skills, proven the same
+    /// "no daemon/kernel needed" way as the tests above: both operate
+    /// entirely on this session's own state, no other session or the
+    /// daemon ever involved.
+    #[rusty_tokio::test]
+    async fn goal_and_compact_host_requests_operate_on_this_sessions_own_state() {
+        let root = temp_state_root("goal-compact-host-requests");
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-goal-compact-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let none_yet = session
+            .handle_host_request("goal.get", serde_json::json!({}))
+            .await
+            .expect("goal.get should not error");
+        assert_eq!(none_yet, serde_json::Value::Null);
+
+        let created = session
+            .handle_host_request(
+                "goal.create",
+                serde_json::json!({"task": "ship the release", "token_budget": 200000}),
+            )
+            .await
+            .expect("goal.create should not error");
+        assert_eq!(
+            created.get("text").and_then(|v| v.as_str()),
+            Some("ship the release")
+        );
+        assert_eq!(
+            created.get("status").and_then(|v| v.as_str()),
+            Some("active")
+        );
+
+        let fetched = session
+            .handle_host_request("goal.get", serde_json::json!({}))
+            .await
+            .expect("goal.get should not error");
+        assert_eq!(
+            fetched.get("text").and_then(|v| v.as_str()),
+            Some("ship the release")
+        );
+
+        let completed = session
+            .handle_host_request("goal.complete", serde_json::json!({}))
+            .await
+            .expect("goal.complete should not error");
+        assert_eq!(
+            completed.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+
+        // `EchoProvider` sessions treat compaction as a plain, honest
+        // no-op ("nothing to compact") -- same as `session compact`/
+        // `/compact` already do for this same reason.
+        let compacted = session
+            .handle_host_request("compact.now", serde_json::json!({}))
+            .await
+            .expect("compact.now should not error");
+        assert_eq!(
+            compacted.get("compacted").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `agent_message.send(receiver_role="parent")` on a root session (no
+    /// parent at all) returns early with an explanatory error, entirely
+    /// in memory -- no daemon round trip ever attempted, so this is
+    /// provable without one, the same "no daemon/kernel needed" reasoning
+    /// as the tests above. The `receiver_role="child"` path always needs
+    /// a daemon round trip (even just to look children up), so it isn't
+    /// covered here -- see the real-kernel test for the kernel-side
+    /// wiring proof instead.
+    #[rusty_tokio::test]
+    async fn agent_message_send_to_parent_is_an_error_when_there_is_no_parent() {
+        let root = temp_state_root("agent-message-no-parent");
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-agent-message-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let response = session
+            .handle_host_request(
+                "agent_message.send",
+                serde_json::json!({"message": "status update", "receiver_role": "parent"}),
+            )
+            .await
+            .expect("handle_host_request should not itself error");
+        let error = response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("a root session has no parent to message");
+        assert!(error.contains("no parent"), "got: {error:?}");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

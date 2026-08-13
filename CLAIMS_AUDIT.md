@@ -447,11 +447,16 @@ separately below. The specific points worth calling out individually:
 - **Agent-to-agent messaging via a kernel-callable `agent_message`
   Python skill, with `auto`/`steer`/`follow_up` delivery modes, a
   `deliveryStatus` receipt, and `agent_message.send("all", ...)`
-  broadcast.** -- **False.** `session message` is CLI/daemon-level only
-  -- not callable from inside the kernel -- delivers as an ordinary,
-  unconditional `SessionPrompt` with no steering-vs-follow-up delivery
-  mode (this project's REPL has no concept of "steering" at all, see
-  `PARITY.md`'s TUI entry) and no broadcast target.
+  broadcast.** -- **Partial (was fully False).** **Closed**: a
+  kernel-callable `agent_message.send(message, receiver_role="parent"|
+  "child", receiver_name=...)` skill now exists (`worker::bootstrap_kernel`,
+  see the RLM Runtime Architecture section above), reusing `session
+  message`'s own delivery underneath. **Still False**: no steering-vs-
+  follow-up delivery mode (this project's REPL has no concept of
+  "steering" at all, see `PARITY.md`'s TUI entry), no `deliveryStatus`
+  receipt (the reply is just `{"delivered_to", "sequence"}`), and no
+  `"all"` broadcast target (only a specific parent or one named direct
+  child).
 - **Three heartbeat surfaces (`/heartbeat` for the user,
   `rlm_heartbeat` for the agent, `schedule` for general automation).**
   -- **Partial.** All three surfaces genuinely exist here -- `/heartbeat`
@@ -465,11 +470,16 @@ separately below. The specific points worth calling out individually:
   an addressable, independently pausable entry).
 - **Persistent goals: `/goal [--budget N]`, `status|pause|resume|
   clear`, kernel-callable `goal.get()`/`goal.complete()`.** --
-  **Partial.** `session goal set|show|pause|resume|complete|clear`
-  all exist and match. **No `--budget` token-budget flag** (confirmed
-  absent by grep) and **no kernel-callable `goal` Python skill** --
-  goal state is CLI/daemon-level only, not something `execute_python`
-  code can query or complete.
+  **Partial (one clause now closed).** `session goal set|show|pause|
+  resume|complete|clear` all exist and match. **Closed**: a
+  kernel-callable `goal` Python skill now exists (`goal.get()`/
+  `goal.create(task, token_budget=...)`/`goal.complete()`, see the RLM
+  Runtime Architecture section above) -- `execute_python` code can now
+  query and complete the session's own goal. **Still False**: no
+  `--budget` token-budget flag on `/goal`/`session goal set` (confirmed
+  absent by grep), and `goal.create`'s own `token_budget` parameter is
+  accepted but not enforced -- this project's `GoalState` still has no
+  token/wall-clock budget concept anywhere for it to hook into.
 - **Autonomous mode: turn/time/token limits, a quality-gate command,
   and avoiding a rerun of the same failed gate when the workspace hasn't
   changed.** -- **Partial.** `session autonomous --max-turns
@@ -662,11 +672,19 @@ above:
   payload)` coroutine, a deliberate, repeated simplification (see the RLM
   Runtime Architecture section above), not an oversight.
 - **`goal`/`agent_message`/`compact` skills all calling
-  `rlm.host_request(...)`.** -- **False**, confirmed each has zero
-  kernel presence -- goal/compaction/messaging are all CLI/daemon-level
-  only. `host_request` itself is real now (see above), consumed by
-  `rlm`/`rlm_list_subagents`/`rlm_delete_subagent`/`rlm_heartbeat`, but
-  nothing calls it for `goal`/`agent_message`/`compact` yet.
+  `rlm.host_request(...)`.** -- **Now True (was False).** Originally
+  found False, confirmed each had zero kernel presence -- goal/
+  compaction/messaging were all CLI/daemon-level only. **Closed**: three
+  new namespace objects in `bootstrap_kernel` (`goal`/`agent_message`/
+  `compact`, matching upstream's own dotted-call syntax exactly, not the
+  bare-function simplification `rlm(...)` itself uses) call `host_request`
+  with five new kinds -- `goal.get`/`goal.create`/`goal.complete`/
+  `compact.now` (all handled entirely in-process, no daemon round trip,
+  since this session's own goal/compaction state lives right here) and
+  `agent_message.send` (resolves `receiver_role="parent"`/`"child"` to a
+  target session id, then delivers via this project's own existing
+  `session message` mechanism). See the RLM Runtime Architecture
+  section's own entry for the full mechanism.
 - **Child usage attribution, parent-scoped registry surviving
   compaction/restart, recursion depth limits.** -- **All three now
   closed.** Recursion depth limits (`SessionState.rlm_depth`/

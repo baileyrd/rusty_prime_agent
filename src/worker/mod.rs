@@ -252,7 +252,32 @@ async fn bootstrap_kernel(
          async def rlm_list_subagents():\n\
          \x20   return await host_request('rlm.list_subagents')\n\n\
          async def rlm_delete_subagent(id):\n\
-         \x20   return await host_request('rlm.delete_subagent', {{'id': id}})\n",
+         \x20   return await host_request('rlm.delete_subagent', {{'id': id}})\n\n\
+         class _Goal:\n\
+         \x20   async def get(self):\n\
+         \x20       return await host_request('goal.get')\n\
+         \x20   async def create(self, task, token_budget=None):\n\
+         \x20       payload = {{'task': task}}\n\
+         \x20       if token_budget is not None:\n\
+         \x20           payload['token_budget'] = token_budget\n\
+         \x20       return await host_request('goal.create', payload)\n\
+         \x20   async def complete(self):\n\
+         \x20       return await host_request('goal.complete')\n\
+         goal = _Goal()\n\n\
+         class _AgentMessage:\n\
+         \x20   async def send(self, message, receiver_role='parent', receiver_name=None):\n\
+         \x20       payload = {{'message': message, 'receiver_role': receiver_role}}\n\
+         \x20       if receiver_name is not None:\n\
+         \x20           payload['receiver_name'] = receiver_name\n\
+         \x20       return await host_request('agent_message.send', payload)\n\
+         agent_message = _AgentMessage()\n\n\
+         class _Compact:\n\
+         \x20   async def now(self, instructions=None):\n\
+         \x20       payload = {{}}\n\
+         \x20       if instructions is not None:\n\
+         \x20           payload['instructions'] = instructions\n\
+         \x20       return await host_request('compact.now', payload)\n\
+         compact = _Compact()\n",
         marker = crate::session::HEARTBEAT_MARKER
     );
 

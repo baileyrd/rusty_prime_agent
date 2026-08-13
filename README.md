@@ -120,6 +120,19 @@ within a few seconds, no action needed on either side -- as a new system
 entry summing the child's total usage plus any prior attributions to
 that same turn.
 
+The kernel also gets three small skill objects for state a session
+already manages elsewhere, now reachable from code: `await goal.get()`/
+`await goal.create(task, token_budget=None)`/`await goal.complete()`
+(the same goal `session goal set/show`/`--goal` already track --
+`token_budget` is accepted but not enforced, since this project has no
+token/wall-clock budget concept yet); `await compact.now(instructions=
+None)` (the same mechanism as `session compact`/`/compact`); and `await
+agent_message.send(message, receiver_role="parent")` / `await
+agent_message.send(message, receiver_role="child", receiver_name=...)`
+to message this session's own parent or one direct child by name (the
+same delivery `session message` already uses) -- replies arrive as
+ordinary later turns, not a return value.
+
 ```sh
 harness session new --model ollama/qwen2.5:0.5b --runtime ipython
 ```

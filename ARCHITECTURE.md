@@ -256,22 +256,34 @@ hang before the fix. `ToolRuntime::execute` can now also pause mid-cell
 with `ExecutionOutcome.pending_host_request` when kernel code opens a
 Jupyter comm targeting `"host.request"` over `control` -- `resume_execute`
 delivers the caller's reply and continues draining. `AgentSession::
-handle_host_request` dispatches three request kinds so far: `"rlm.run"`
-(`handle_rlm_run`, admits a child session through the same `SessionNew`/
-`ScheduleAdd` daemon round trip `session spawn` already uses, just issued
-from inside the worker process), `"rlm.list_subagents"`/
+handle_host_request` (`&mut self`, not `&self` -- `goal.*`/`compact.now`
+mutate `self.state` directly) dispatches eight request kinds so far:
+`"rlm.run"` (`handle_rlm_run`, admits a child session through the same
+`SessionNew`/`ScheduleAdd` daemon round trip `session spawn` already
+uses, just issued from inside the worker process), `"rlm.list_subagents"`/
 `"rlm.delete_subagent"` (`handle_list_subagents`/`handle_delete_subagent`,
 a `Request::SessionList`-filtered-by-`parent_id` read and a
 `Request::SessionStop` write, respectively -- no separate registry data
 structure exists; a child's own persisted `parent_id` already is the
 durable record `list_subagents()` reads back and `delete_subagent()`
-validates against before stopping a session). Admission is gated by a
-recursion-depth check (`RLM_DEPTH >= RLM_MAX_DEPTH`) held in
-`SessionState`/checked entirely client-side before the daemon round trip
-even starts; the daemon itself is the one place that *computes* those two
-values (`daemon::handle_session_new`, inheriting `rlm_max_depth` from the
-parent unchanged and incrementing `rlm_depth` by one, or resolving both
-from scratch for a root session), never a client.
+validates against before stopping a session), `"goal.get"`/`"goal.create"`/
+`"goal.complete"`/`"compact.now"` (all operate on *this same session's
+own state*, so unlike every `rlm.*`/`agent_message.*` kind they need no
+daemon round trip at all -- they call `update_goal`/`compact_now`
+directly, the exact same in-process methods `Request::GoalUpdate`/
+`Request::SessionCompact` already call from the worker's own private-
+connection handler), and `"agent_message.send"` (resolves
+`receiver_role="parent"`/`"child"` to a target session id -- `self.state.
+parent_id` directly, or the same `Request::SessionList`-filtered-by-
+`parent_id` lookup matched by name for a child -- then reuses this
+project's own existing `session message` mechanism verbatim, a
+`"[from <id>] <message>"`-prefixed `Request::SessionPrompt`). Admission
+is gated by a recursion-depth check (`RLM_DEPTH >= RLM_MAX_DEPTH`) held
+in `SessionState`/checked entirely client-side before the daemon round
+trip even starts; the daemon itself is the one place that *computes*
+those two values (`daemon::handle_session_new`, inheriting `rlm_max_depth`
+from the parent unchanged and incrementing `rlm_depth` by one, or
+resolving both from scratch for a root session), never a client.
 
 A child admitted via `rlm(...)` records which of the parent's own
 transcript entries launched it (`SessionState::spawned_from_sequence`,

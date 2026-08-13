@@ -1405,6 +1405,183 @@ async def rlm_delete_subagent(id):
         let _ = std::fs::remove_dir_all(&session_dir);
     }
 
+    /// Same "prove the kernel produces the right request" scope as
+    /// `real_kernel_rlm_call_opens_an_rlm_run_host_request`, for the
+    /// three namespace-object skills (`goal`/`agent_message`/`compact`)
+    /// added alongside `rlm(...)`. Exercising `handle_goal_get`/
+    /// `handle_goal_create`/`handle_goal_complete`/`handle_compact_now`/
+    /// `handle_agent_message_send` themselves needs a real `AgentSession`
+    /// (the first two pairs mutate `self.state` directly with no daemon
+    /// involved at all; `agent_message.send` needs a real daemon for its
+    /// `"child"` role) -- covered instead by the CI-safe unit tests in
+    /// `session.rs` (`goal_and_compact_host_requests_operate_on_this_
+    /// sessions_own_state`, `agent_message_send_to_parent_is_an_error_
+    /// when_there_is_no_parent`) and the same documented real-kernel-
+    /// plus-real-daemon infrastructure gap every other `handle_*` request
+    /// handler lives with.
+    #[rusty_tokio::test]
+    #[ignore]
+    async fn real_kernel_goal_agent_message_and_compact_open_typed_host_requests() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "rpa-ipython-goal-compact-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&session_dir).expect("create temp session dir");
+
+        let mut runtime = IpythonKernelRuntime::new(session_dir.clone());
+        runtime
+            .start()
+            .await
+            .expect("kernel should spawn and complete the kernel_info handshake");
+
+        // Exactly the code `worker::bootstrap_kernel` sends for
+        // `host_request`/`goal`/`agent_message`/`compact`.
+        let setup_code = "\
+import asyncio
+from ipykernel.comm import Comm
+_host_request_kernel = get_ipython().kernel
+_host_request_kernel.control_handlers['comm_msg'] = _host_request_kernel.comm_manager.comm_msg
+_host_request_kernel.control_handlers['comm_close'] = _host_request_kernel.comm_manager.comm_close
+_host_request_loop = asyncio.get_event_loop()
+def host_request(kind, payload=None):
+    comm = Comm(target_name='host.request', data={'kind': kind, **(payload or {})})
+    fut = _host_request_loop.create_future()
+    def _on_msg(msg):
+        def _resolve():
+            if not fut.done():
+                fut.set_result(msg['content']['data'])
+        _host_request_loop.call_soon_threadsafe(_resolve)
+    comm.on_msg(_on_msg)
+    return fut
+
+class _Goal:
+    async def get(self):
+        return await host_request('goal.get')
+    async def create(self, task, token_budget=None):
+        payload = {'task': task}
+        if token_budget is not None:
+            payload['token_budget'] = token_budget
+        return await host_request('goal.create', payload)
+    async def complete(self):
+        return await host_request('goal.complete')
+goal = _Goal()
+
+class _AgentMessage:
+    async def send(self, message, receiver_role='parent', receiver_name=None):
+        payload = {'message': message, 'receiver_role': receiver_role}
+        if receiver_name is not None:
+            payload['receiver_name'] = receiver_name
+        return await host_request('agent_message.send', payload)
+agent_message = _AgentMessage()
+
+class _Compact:
+    async def now(self, instructions=None):
+        payload = {}
+        if instructions is not None:
+            payload['instructions'] = instructions
+        return await host_request('compact.now', payload)
+compact = _Compact()
+";
+        runtime
+            .execute(setup_code)
+            .await
+            .expect("host_request setup code should round-trip");
+
+        let outcome = runtime
+            .execute("result = await goal.create('ship the release', token_budget=200000)\nresult")
+            .await
+            .expect("goal.create(...) should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting goal.create's reply");
+        assert_eq!(pending.kind, "goal.create");
+        assert_eq!(
+            pending.payload.get("task").and_then(|v| v.as_str()),
+            Some("ship the release")
+        );
+        assert_eq!(
+            pending.payload.get("token_budget").and_then(|v| v.as_i64()),
+            Some(200000)
+        );
+        runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"text": "ship the release"}),
+            )
+            .await
+            .expect("resume_execute should deliver the reply and let goal.create(...) return it");
+
+        let outcome = runtime
+            .execute("result = await agent_message.send('status update', receiver_role='child', receiver_name='reviewer')\nresult")
+            .await
+            .expect("agent_message.send(...) should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting agent_message.send's reply");
+        assert_eq!(pending.kind, "agent_message.send");
+        assert_eq!(
+            pending.payload.get("message").and_then(|v| v.as_str()),
+            Some("status update")
+        );
+        assert_eq!(
+            pending
+                .payload
+                .get("receiver_role")
+                .and_then(|v| v.as_str()),
+            Some("child")
+        );
+        assert_eq!(
+            pending
+                .payload
+                .get("receiver_name")
+                .and_then(|v| v.as_str()),
+            Some("reviewer")
+        );
+        runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"delivered_to": "child-1", "sequence": 3}),
+            )
+            .await
+            .expect(
+                "resume_execute should deliver the reply and let agent_message.send(...) return it",
+            );
+
+        let outcome = runtime
+            .execute("result = await compact.now('focus on the API changes')\nresult")
+            .await
+            .expect("compact.now(...) should round-trip up to the pause");
+        let pending = outcome
+            .pending_host_request
+            .expect("the kernel should be paused awaiting compact.now's reply");
+        assert_eq!(pending.kind, "compact.now");
+        assert_eq!(
+            pending.payload.get("instructions").and_then(|v| v.as_str()),
+            Some("focus on the API changes")
+        );
+        let resumed = runtime
+            .resume_execute(
+                &pending.comm_id,
+                serde_json::json!({"compacted": true, "summary": "a summary"}),
+            )
+            .await
+            .expect("resume_execute should deliver the reply and let compact.now(...) return it");
+        assert!(resumed.pending_host_request.is_none());
+        assert_eq!(
+            resumed.result.as_deref(),
+            Some("{'compacted': True, 'summary': 'a summary'}"),
+            "compact.now(...) should return exactly whatever the host replied with"
+        );
+
+        runtime.shutdown().await.expect("shutdown should succeed");
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
     /// Real end-to-end coverage for `skills.rs`'s whole point: a real
     /// Python package on disk becomes `import`-able inside a real kernel
     /// once its parent directory is added to `sys.path` -- the exact
