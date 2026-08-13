@@ -77,10 +77,19 @@ pub fn bin() -> PathBuf {
 /// `daemon start`/`session new`/`session prompt`/`session list`/
 /// `daemon status`/`daemon shutdown` are all one-shot -- only `session
 /// attach` streams, and that goes through [`attach_lines`] instead.
+///
+/// Stdin is explicitly nulled out, not left inherited from this test
+/// process: `-p`'s piped-stdin merging (`lib::merge_piped_stdin`) reads
+/// stdin whenever it isn't a terminal, which a test runner's own stdin
+/// often isn't either -- without this, a `-p` test here could block
+/// forever waiting for an EOF nothing is ever going to send. Tests that
+/// actually want to exercise piped-stdin merging build their own
+/// `Command` with a real `Stdio::piped()` instead of calling this.
 pub fn run(state_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         .args(args)
         .env("RUSTY_PRIME_AGENT_HOME", state_dir)
+        .stdin(Stdio::null())
         .output()
         .expect("failed to run harness")
 }

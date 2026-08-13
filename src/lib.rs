@@ -98,7 +98,9 @@ pub async fn run(args: &[String]) -> Result<()> {
             client::daemon_start(&state_root, &exe_path, output_mode).await
         }
         cli::Command::DaemonStatus => client::daemon_status(&state_root, output_mode).await,
-        cli::Command::DaemonShutdown => client::daemon_shutdown(&state_root, output_mode).await,
+        cli::Command::DaemonShutdown { force } => {
+            client::daemon_shutdown(&state_root, force, output_mode).await
+        }
         cli::Command::SessionNew {
             name,
             model,
@@ -263,8 +265,17 @@ pub async fn run(args: &[String]) -> Result<()> {
         cli::Command::Doctor { fix } => {
             client::doctor(&state_root, &exe_path, fix, output_mode).await
         }
-        cli::Command::Print { text, model } => {
-            client::print_once(&state_root, &exe_path, text, model, output_mode).await
+        cli::Command::Print {
+            text,
+            model,
+            no_session,
+        } => {
+            let text = merge_piped_stdin(text);
+            if no_session {
+                client::print_ephemeral(text, model, output_mode).await
+            } else {
+                client::print_once(&state_root, &exe_path, text, model, output_mode).await
+            }
         }
         cli::Command::SupervisorMain => daemon::run(state_root, exe_path).await,
         cli::Command::WorkerMain {
@@ -300,4 +311,32 @@ pub async fn run(args: &[String]) -> Result<()> {
             .await
         }
     }
+}
+
+/// Parity with a bounded slice of `prime-agent -p`'s piped-stdin
+/// handling: when this process's stdin is not a terminal (i.e. it was
+/// redirected from a file or a pipe, `harness -p "..." < context.txt` or
+/// `cat context.txt | harness -p "..."`), whatever it contains is read
+/// in full and appended to the prompt text, separated by a blank line.
+/// A real terminal (interactive use, the ordinary case) is left alone --
+/// this must never block waiting for a human to type and hit Ctrl-D.
+/// Reading fails open: an I/O error reading an already-non-terminal
+/// stdin (rare -- a closed fd, a already-exhausted pipe) is treated as
+/// "nothing piped" rather than failing the whole command, since the
+/// prompt text the caller already gave on the command line is still a
+/// perfectly valid prompt on its own.
+fn merge_piped_stdin(text: String) -> String {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return text;
+    }
+    let mut piped = String::new();
+    if std::io::stdin().read_to_string(&mut piped).is_err() {
+        return text;
+    }
+    let piped = piped.trim_end_matches('\n');
+    if piped.is_empty() {
+        return text;
+    }
+    format!("{text}\n\n{piped}")
 }

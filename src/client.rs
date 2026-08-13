@@ -178,6 +178,90 @@ pub async fn print_once(
     }
 }
 
+/// `harness -p --no-session`: parity with `prime-agent --no-session`
+/// (`CLAIMS_AUDIT.md`'s "Session flags" entry). Unlike [`print_once`],
+/// this never touches the caller's real `RUSTY_PRIME_AGENT_HOME` at
+/// all -- no daemon, no worker process, no entry in `session list`
+/// afterward. It reuses the exact same in-process path the embeddable
+/// SDK already established for a non-daemon caller (`AgentSession::
+/// create`, see `tests/embedded_session.rs`), pointed at a throwaway
+/// scratch directory under the OS temp dir that's removed again once
+/// the prompt completes -- `AgentSession::create`'s own durable
+/// `state.json`/`transcript.jsonl` writes have no in-memory-only mode to
+/// opt out of, so "no session persists" is enforced by cleaning up
+/// after the fact rather than by skipping the writes in the first
+/// place. That's an implementation detail, not a user-visible gap: by
+/// the time this function returns, nothing durable remains on disk
+/// either way.
+///
+/// `model: Some(..)` reuses `worker::build_provider`, the same
+/// `rp-server` sidecar every real session's `--model` goes through --
+/// started (if not already running) against this same scratch
+/// directory and shut back down before it's removed, so a forced
+/// `--model` here leaves no more of a footprint than the `None` case.
+/// No `--thinking`/`--tools`/`--runtime` here: `-p` itself doesn't
+/// expose those either (see `cli::Command::Print`), and ephemeral mode
+/// isn't a new surface for them to gain first.
+pub async fn print_ephemeral(text: String, model: Option<String>, mode: OutputMode) -> Result<()> {
+    let scratch_root = ephemeral_scratch_root();
+    paths::ensure_dir(Context::Session, &scratch_root)?;
+
+    let result = run_ephemeral_prompt(&scratch_root, text, model, mode).await;
+
+    crate::rp_server::shutdown(&scratch_root);
+    let _ = std::fs::remove_dir_all(&scratch_root);
+
+    result
+}
+
+async fn run_ephemeral_prompt(
+    scratch_root: &Path,
+    text: String,
+    model: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    // Same ordering `daemon::Supervisor::ensure_worker_running` already
+    // enforces for a real session: the sidecar must be up *before*
+    // `build_provider` runs, since `build_provider` itself only reads
+    // back an already-recorded port rather than starting anything.
+    if model.is_some() {
+        crate::rp_server::ensure_running(scratch_root).await?;
+    }
+    let provider = crate::worker::build_provider(scratch_root, model, None)?;
+    let session_id = crate::session::new_session_id();
+    let mut session = crate::session::AgentSession::create(
+        scratch_root,
+        session_id,
+        crate::session::NewSessionMeta::default(),
+        provider,
+        Box::new(crate::tool_runtime::NoopToolRuntime),
+    )
+    .await?;
+
+    let entry = session.prompt(text).await?;
+    match mode {
+        OutputMode::Json => print_json(&entry),
+        OutputMode::Text => println!("{}", entry.text),
+    }
+    Ok(())
+}
+
+/// A unique-enough scratch directory for one `print_ephemeral` call --
+/// same "short hash of pid+time, not a verbose label" shape as `tests/
+/// common/mod.rs`'s own `TempDir`, for the same reason: nothing here
+/// needs a socket path, but there is no reason to spend more of the
+/// filesystem's namespace than a throwaway directory needs either.
+fn ephemeral_scratch_root() -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (std::process::id(), nanos).hash(&mut hasher);
+    std::env::temp_dir().join(format!("rpa-ephemeral-{:x}", hasher.finish()))
+}
+
 async fn connect(state_root: &Path) -> Result<transport::LineStream> {
     let socket_path = paths::daemon_socket_path(state_root);
     transport::connect(Context::Daemon, socket_path)
@@ -225,9 +309,9 @@ pub async fn daemon_status(state_root: &Path, mode: OutputMode) -> Result<()> {
     }
 }
 
-pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> {
+pub async fn daemon_shutdown(state_root: &Path, force: bool, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
-    conn.write_request(Context::Daemon, &Request::DaemonShutdown)
+    conn.write_request(Context::Daemon, &Request::DaemonShutdown { force })
         .await?;
     match read_response(&mut conn).await? {
         response @ Response::DaemonShutdownAck => {

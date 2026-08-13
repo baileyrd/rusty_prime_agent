@@ -748,6 +748,87 @@ build. A caller in a *second* process (a different terminal, a script)
 can already interrupt a running turn today, since the daemon/worker relay
 path doesn't care which process a request came from.
 
+## Bounded candidates batch 3: session/CLI convenience
+
+Four small, independent increments landed together -- see `PARITY.md`'s
+own "Bounded candidates batch 3" entry for the full story of each.
+
+**Resume-by-partial-ID.** New `Daemon::resolve_session_id(&self, partial:
+&str) -> String`: an exact match short-circuits immediately (the fast,
+common path); otherwise `catalog::scan` resolves `partial` to the one
+real session id starting with it, if exactly one matches. Zero or
+multiple matches both return `partial` unresolved, letting every
+caller's own existing "unknown session" error path handle it -- this
+function never itself produces a new error variant. Wired into all seven
+real session-id-validation chokepoints: `resolve_worker` (used by ten
+handlers) plus six standalone handlers that do their own inline
+`state_file_path(...).exists()` check (`handle_schedule_add`/
+`handle_schedule_list`/`handle_schedule_cancel`/`handle_session_stop`/
+`handle_goal_show`/`handle_harness_show`). `session_autonomous`/
+`session_refine`/`session_spawn`/`session_children`/`session_message`/
+`session_rpc`/`session_repl` have no daemon-side handler of their own to
+wire this into -- they're pure client-side orchestration built on
+primitives (`SessionPrompt`, `GoalShow`, ...) that are already covered.
+
+**`daemon shutdown --force`.** `Request::DaemonShutdown` gained a
+`force: bool` field. `handle_daemon_shutdown`'s per-session
+`WorkerShutdown` round trip (`catalog::scan` + connect + send + wait for
+ack, for every `Active` session) now runs only when `!force`; the rest of
+the function (ack this connection, `rp_server::shutdown`, remove
+`daemon.sock`/`daemon.pid`, `std::process::exit(0)`) is unconditional
+either way. A worker skipped this way is not killed -- it keeps running,
+reachable on its own `worker.sock`, until either `resolve_worker`'s
+`is_worker_alive` check on a later daemon adopts it or something else
+stops it. This is not a new state for the rest of the daemon to learn:
+it's exactly the "supervisor restarted, worker survived" case
+`recover_on_startup`/`ensure_worker_running` already handle for a real
+crash.
+
+**`-p --no-session` (ephemeral mode).** New `client::print_ephemeral`,
+reached when `cli::Command::Print::no_session` is set (a third strict
+leading flag on `-p`, alongside `--model`, parsed in either order ahead
+of the prompt text). Unlike `print_once` (which calls through to the
+daemon over `SessionNew`/`SessionPrompt`, creating a session that stays
+listed afterward), `print_ephemeral` never touches the daemon at all:
+it calls `worker::build_provider` (now `pub(crate)`, previously private
+to `worker::mod`) and `AgentSession::create` directly, in-process,
+against a throwaway scratch directory (`ephemeral_scratch_root`, a short
+hash of pid+time under the OS temp dir, the same shape `tests/common/
+mod.rs`'s own `TempDir` already uses for the same "unique, not verbose"
+reasoning) -- the same in-process embeddable-SDK path `tests/
+embedded_session.rs` already proves works with no daemon/worker/socket
+in the loop. `--model` still works: `print_ephemeral` calls `rp_server::
+ensure_running(scratch_root)` itself first (mirroring what `daemon::
+Supervisor::ensure_worker_running` does for a real session before
+`build_provider` ever runs), then `rp_server::shutdown(scratch_root)`
+once the prompt completes, before removing the scratch directory --
+`build_provider` alone only reads back an already-recorded port, it
+never starts anything. `AgentSession::create`'s own `state.json`/
+`transcript.jsonl` writes have no flag to suppress them, so "no session
+persists" is enforced by cleanup after the fact (`std::fs::
+remove_dir_all` on the scratch root, best-effort, run whether the prompt
+succeeded or not) rather than by skipping the writes -- by the time
+`print_ephemeral` returns, nothing durable remains either way.
+
+**Piped-stdin merging for `-p`.** New `merge_piped_stdin` in `lib.rs`,
+called once for `cli::Command::Print` before dispatching to either
+`print_once` or `print_ephemeral`. `std::io::stdin().is_terminal()`
+(`std::io::IsTerminal`) gates it: a real terminal is left alone (this
+must never block waiting on a human), a redirected/piped stdin has its
+full contents read and appended to the prompt text (blank-line
+separated). An I/O error reading an already-non-terminal stdin is
+treated as "nothing piped," not a command failure -- the prompt text
+already on the command line is still valid on its own. This surfaced a
+real hazard in the existing test suite before it could reach CI:
+`tests/common/mod.rs`'s `run()` helper spawns the compiled binary with
+stdin inherited from the test process by default, which is itself
+usually not a terminal -- every pre-existing `-p` test would otherwise
+have started blocking, waiting on an EOF nothing was ever going to send.
+Fixed by having `run()` set `Stdio::null()` explicitly (reads as
+immediate, safe EOF); the two new tests that actually exercise a real
+piped stdin build their own `Command` with `Stdio::piped()` instead of
+calling `run()`.
+
 ## `providers.json` (custom provider registration)
 
 Parity with letting a session point at any self-hosted OpenAI-compatible

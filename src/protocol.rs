@@ -35,7 +35,21 @@ pub enum Request {
     /// idempotency check and every `wait_ready` retry loop.
     Ping,
     DaemonStatus,
-    DaemonShutdown,
+    /// `force: false` (the default, `daemon shutdown` with no flag) is
+    /// the original behavior unchanged: send `Request::WorkerShutdown`
+    /// to every `Active` session's worker and wait for each ack before
+    /// tearing down the daemon's own sockets. `force: true` (`daemon
+    /// shutdown --force`) skips that round trip entirely -- useful when
+    /// a worker has wedged and its ack would otherwise hang the whole
+    /// shutdown. Skipped workers are not killed, just not waited on:
+    /// they keep running headless, exactly the same "supervisor gone,
+    /// worker still alive" state this project's own crash recovery
+    /// (`is_worker_alive`/`resolve_worker`) already has to and does
+    /// handle for an actual crash, so a forced shutdown leaves nothing
+    /// in a state the rest of the daemon can't already cope with.
+    DaemonShutdown {
+        force: bool,
+    },
     SessionNew {
         /// Optional human-readable label; the session id itself is always
         /// generated server-side.

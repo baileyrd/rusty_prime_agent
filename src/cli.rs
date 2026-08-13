@@ -49,7 +49,9 @@ impl OutputMode {
 pub enum Command {
     DaemonStart,
     DaemonStatus,
-    DaemonShutdown,
+    DaemonShutdown {
+        force: bool,
+    },
     SessionNew {
         name: Option<String>,
         /// Parity with `prime-agent --model provider/id`; see
@@ -298,13 +300,17 @@ pub enum Command {
     SessionInterrupt {
         session_id: String,
     },
-    /// `harness -p [--model PROVIDER/MODEL] <text...>`/`harness --print
-    /// ...` -- parity with `prime-agent -p`/`--model`. Unlike every other
-    /// subcommand, does not require `daemon start` first: see
-    /// `client::print_once`'s doc comment.
+    /// `harness -p [--model PROVIDER/MODEL] [--no-session] <text...>`/
+    /// `harness --print ...` -- parity with `prime-agent -p`/`--model`/
+    /// `--no-session`. Unlike every other subcommand, does not require
+    /// `daemon start` first: see `client::print_once`'s doc comment.
+    /// `no_session: true` skips the daemon entirely -- see `client::
+    /// print_ephemeral`'s own doc comment for what that does and doesn't
+    /// mean.
     Print {
         text: String,
         model: Option<String>,
+        no_session: bool,
     },
     /// `harness __supervisor-main` -- spawned by `daemon start`, never
     /// invoked directly by a user.
@@ -364,27 +370,38 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("-p") | Some("--print")
     ) {
         let mut rest = &args[1..];
-        // `--model` is only recognized as a strict leading flag here
-        // (immediately after `-p`/`--print`), not scanned for throughout
-        // -- unlike `session new`, everything after this point is free
-        // prompt text, and text that happens to contain the substring
-        // `--model` must not be misread as the flag.
-        let model = if rest.first().map(String::as_str) == Some("--model") {
-            let value = rest
-                .get(1)
-                .cloned()
-                .ok_or_else(|| usage("--model requires a value"))?;
-            rest = &rest[2..];
-            Some(value)
-        } else {
-            None
-        };
+        // `--model`/`--no-session` are only recognized as strict leading
+        // flags here (immediately after `-p`/`--print`, in either
+        // order), not scanned for throughout -- unlike `session new`,
+        // everything after the last recognized leading flag is free
+        // prompt text, and text that happens to contain either substring
+        // must not be misread as a flag.
+        let mut model = None;
+        let mut no_session = false;
+        loop {
+            match rest.first().map(String::as_str) {
+                Some("--model") => {
+                    let value = rest
+                        .get(1)
+                        .cloned()
+                        .ok_or_else(|| usage("--model requires a value"))?;
+                    rest = &rest[2..];
+                    model = Some(value);
+                }
+                Some("--no-session") => {
+                    rest = &rest[1..];
+                    no_session = true;
+                }
+                _ => break,
+            }
+        }
         if rest.is_empty() {
             return Err(usage("`-p`/`--print` requires prompt text"));
         }
         return Ok(Command::Print {
             text: rest.join(" "),
             model,
+            no_session,
         });
     }
     let mut it = args.iter();
@@ -393,8 +410,14 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("daemon") => match it.next().map(String::as_str) {
             Some("start") => Ok(Command::DaemonStart),
             Some("status") => Ok(Command::DaemonStatus),
-            Some("shutdown") => Ok(Command::DaemonShutdown),
-            other => Err(usage(format!("expected `daemon start|status|shutdown`, got {other:?}"))),
+            Some("shutdown") => {
+                let rest: Vec<&String> = it.collect();
+                let force = rest.iter().any(|a| a.as_str() == "--force");
+                Ok(Command::DaemonShutdown { force })
+            }
+            other => Err(usage(format!(
+                "expected `daemon start|status|shutdown [--force]`, got {other:?}"
+            ))),
         },
         Some("session") => match it.next().map(String::as_str) {
             Some("new") => {
@@ -720,7 +743,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, `doctor [--fix]`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown [--force]>`, `session <new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, `doctor [--fix]`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
