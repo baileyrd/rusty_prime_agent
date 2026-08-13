@@ -253,6 +253,18 @@ action, not nested inside anything, so it fetches the goal
 (`client::fetch_goal`, already shared with `goal_show`/
 `session_autonomous`) and sends the continuation prompt immediately.
 
+Both accept an optional duration string for a repeating variant
+(`rlm_heartbeat(every="10m")`, `/heartbeat every 10m`) --
+`ScheduleKind::Every { interval_ms }` instead of `ScheduleKind::Once` on
+the same `Request::ScheduleAdd`, parsed by `cli::parse_duration_ms`
+(made `pub(crate)`, reused rather than re-implemented). The kernel side
+has no channel back to this process besides stdout, so the duration
+string rides along on the marker's own printed line
+(`session::extract_heartbeat_marker` splits it back out);
+`session_repl`'s `/heartbeat every` registers a real schedule
+(`client::schedule_add`) instead of sending a prompt immediately, since
+a repeating heartbeat is a standing re-entry, not a one-time action.
+
 ## Automatic context compaction
 
 Parity with `prime-agent compaction.md` -- see `PARITY.md` for the full

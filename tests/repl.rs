@@ -119,6 +119,78 @@ fn repl_heartbeat_with_an_active_goal_sends_a_continuation_prompt() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// Parity with `prime-agent /heartbeat every <duration>` -- unlike plain
+/// `/heartbeat` above, this registers a real recurring `session
+/// schedule` entry rather than sending anything immediately (see
+/// `client::session_repl`'s own doc comment for why).
+#[test]
+fn repl_heartbeat_every_with_no_active_goal_sends_nothing() {
+    let state_dir = common::TempDir::new("repl-heartbeat-every-no-goal");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        "/heartbeat every 10m\n/exit\n",
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no active goal"),
+        "expected an explanation, got: {stdout}"
+    );
+
+    let listing = common::run(
+        state_dir.path(),
+        &["session", "schedule", "list", &session_id],
+    );
+    common::assert_success("session schedule list", &listing);
+    assert_eq!(common::stdout_string(&listing), "no schedules");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn repl_heartbeat_every_with_an_active_goal_creates_a_recurring_schedule() {
+    let state_dir = common::TempDir::new("repl-heartbeat-every-active-goal");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "goal", "set", &session_id, "write", "a", "haiku"],
+    );
+    common::assert_success("session goal set", &out);
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        "/heartbeat every 1h\n/exit\n",
+    );
+    common::assert_success("session repl", &out);
+    let schedule_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!schedule_id.is_empty(), "expected a printed schedule id");
+
+    // Nothing sent immediately -- it's a standing recurring schedule,
+    // not a one-shot send.
+    let listing = common::session_list(state_dir.path());
+    assert!(listing.contains("turns=0"), "got: {listing}");
+
+    let schedule_listing = common::run(
+        state_dir.path(),
+        &["session", "schedule", "list", &session_id],
+    );
+    common::assert_success("session schedule list", &schedule_listing);
+    let schedule_listing = common::stdout_string(&schedule_listing);
+    assert!(
+        schedule_listing.contains(&schedule_id),
+        "got: {schedule_listing}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 #[test]
 fn repl_replays_prior_transcript_before_reading_new_input() {
     let state_dir = common::TempDir::new("repl-replay");

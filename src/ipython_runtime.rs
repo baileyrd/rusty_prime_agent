@@ -869,7 +869,7 @@ mod tests {
         // Exactly the code `worker::bootstrap_kernel` sends.
         let marker = crate::session::HEARTBEAT_MARKER;
         let define_code = format!(
-            "def rlm_heartbeat():\n    print({marker:?})\n    return \"heartbeat requested\"\n"
+            "def rlm_heartbeat(every=None):\n    print({marker:?} + (every or \"\"))\n    return \"heartbeat requested\"\n"
         );
         runtime
             .execute(&define_code)
@@ -886,6 +886,20 @@ mod tests {
             outcome.stdout
         );
         assert_eq!(outcome.result.as_deref(), Some("'heartbeat requested'"));
+
+        // The `every` argument (parity with `prime-agent`'s
+        // `rlm_heartbeat.create(interval=...)`) rides along after the
+        // marker on the same printed line -- see `session::
+        // extract_heartbeat_marker`'s own doc comment.
+        let outcome = runtime
+            .execute("rlm_heartbeat(every=\"10m\")")
+            .await
+            .expect("calling rlm_heartbeat(every=...) should round-trip");
+        assert!(
+            outcome.stdout.contains(&format!("{marker}10m")),
+            "expected the marker followed by the every argument, got: {:?}",
+            outcome.stdout
+        );
 
         runtime.shutdown().await.expect("shutdown should succeed");
 
