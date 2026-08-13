@@ -388,6 +388,11 @@ running a `!command` as a side effect of listing; the command only ever
 runs when a real `rp-server` sidecar is actually starting up. Global
 only, same cwd-visibility reason `settings.json` is.
 
+`session repl`'s `/login` (see [Interactive REPL](#interactive-repl)
+above) is an interactive wizard around this same file for a caller who'd
+rather answer two prompts than hand-edit JSON -- it only ever writes a
+literal key, never a `!command` entry.
+
 ### Custom providers (`providers.json`)
 
 Drop a `providers.json` into the state directory to point `--model` at
@@ -530,6 +535,19 @@ session, replaying its transcript; an unknown id reports an error and
 leaves you on the current session. Both refuse to switch while a reply
 is still generating or a message is queued behind them, so a queued
 follow-up never lands on the wrong session.
+
+`/login` is an interactive wizard around `auth.json` -- not a real
+OAuth flow (this project has no account system to log into), but the
+same "configure a model backend" destination `export
+OPENAI_API_KEY=...`/etc. already reach. It prints every provider
+`model list` knows about with its configured status, asks for a
+provider name, then asks for an API key, and saves it to `auth.json`
+(overwriting only that one provider's entry). A blank answer at either
+question cancels; an unrecognized provider name is rejected with a
+message telling you to try again. If a daemon is already running with
+a provider sidecar spawned, restart it (`daemon shutdown` then `daemon
+start`) for a key saved this way to take effect -- see
+[Provider keys (`auth.json`)](#provider-keys-authjson) below.
 
 ### RPC mode
 

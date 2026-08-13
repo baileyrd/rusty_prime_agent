@@ -2444,6 +2444,64 @@ daemon/worker split rather than requiring the Python control environment:
   user-interaction surface (`select`/`confirm`/`input`/`editor`), custom
   rendering, and extension-scoped persistent state. None of these are
   implied to exist by anything here or in `ARCHITECTURE.md`.
+- [x] **`/login`: interactive provider-setup wizard.** Previously filed
+  under "Needs a new subsystem" (see that section's own entry, now
+  narrowed to just the OAuth half) as entirely out of scope, on the
+  grounds that there's no Prime Intellect account system for a local
+  single-user harness to authenticate against. Re-investigated rather
+  than left as-is: that grounds is still true (this project genuinely has
+  no OAuth client and nothing real to send one to), but `prime-agent`'s
+  own quickstart names `/login` and `export ANTHROPIC_API_KEY=...` as two
+  *alternative* paths to the same destination -- a configured model
+  backend -- and this project already has a real destination for that:
+  `auth.json` (see `auth.rs`'s own module doc comment). An interactive
+  wizard around the actual destination is a bounded, honest slice even
+  without the OAuth client bolted on top.
+
+  `/login`, typed in `session_repl`, walks a two-question flow: prints
+  every provider `rp_server::known_providers` knows about with its
+  current configured/not-configured status, asks for a provider name,
+  then asks for an API key, and saves it via the new `auth::write_key`
+  (insert-or-overwrite one entry, preserving every other provider already
+  in the file). A blank answer at either question cancels cleanly; an
+  unrecognized provider name reports `"unknown provider ... -- run
+  /login again"` rather than silently writing an entry `known_providers`
+  would never activate; `ollama` (needs no key at all) short-circuits
+  with its own message instead of prompting for one. Reads its two
+  answers off the same `line_rx` channel every other REPL line already
+  flows through -- safe because, like every other slash command in this
+  loop, `/login` only ever runs while no prompt is in flight (`current`
+  is `None`), so there is never a second concurrent reader racing it for
+  the next line.
+
+  A real caveat, stated rather than glossed over: `rp_server::
+  ensure_running` only spawns its `rp-server` sidecar once and reuses it
+  as long as it stays healthy (see that function's own source), so an
+  `auth.json` edit made while a sidecar is already running doesn't take
+  effect until that sidecar is restarted -- the wizard's own success
+  message says so explicitly (`daemon shutdown` then `daemon start`).
+  This isn't a bug in `/login` itself; it's the same "an `auth.json` edit
+  takes effect on the next sidecar spawn" behavior `auth.rs`'s own module
+  doc comment already documents for hand-editing the file directly --
+  `/login` doesn't change that contract, just makes reaching it easier.
+
+  Verified with three new CI-safe `tests/repl.rs` cases exercising the
+  real daemon/worker/REPL process end to end (`EchoProvider`, no real
+  provider key needed): a full run saves the entered key and every other
+  field in `auth.json` is left as `write_key`'s own unit tests already
+  proved untouched; an unknown provider name reports the friendly error
+  and writes nothing; a blank provider answer cancels and writes nothing.
+  Plus three new `auth.rs` unit tests for `write_key` itself (creates a
+  fresh file, preserves an unrelated existing entry, overwrites a
+  same-provider entry).
+
+  Still genuinely absent: any actual OAuth client, anything resembling a
+  Prime Intellect account, and (unlike a real terminal's password prompt)
+  no input-hiding for the key -- this project's own raw-mode reader
+  (`termctl`) has no "don't echo" mode today, so the key is visible on
+  screen as it's typed, the same as everything else piped through this
+  REPL. Not attempted here; a caller who wants the key hidden can still
+  hand-edit `auth.json` directly instead.
 
 ## Needs a new subsystem
 
@@ -2529,21 +2587,22 @@ attempted here, and not silently implied by anything in
   entries. `/share` stays out of scope: it needs somewhere to send the
   export *to* (a hosted paste/share destination), the same "nothing on
   the other end" shape `/login` has just below.
-- **`/login`**, an in-session OAuth-style flow to Prime Intellect's own
-  hosted account system. `prime-agent`'s own
+- **`/login`, the OAuth half.** `prime-agent`'s real `/login` is an
+  in-session OAuth-style flow to Prime Intellect's own hosted account
+  system. There's no Prime Intellect account for a local single-user
+  harness to log into, and no other identity/account system this project
+  has ever needed -- unlike the rest of this section, the missing piece
+  isn't a Python control environment, it's an OAuth client plus somewhere
+  real to send it, and there's nothing on the other end for this project
+  to authenticate against. What *did* ship: `prime-agent`'s own
   [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md)
   presents `/login` and setting an API key beforehand
   (`export ANTHROPIC_API_KEY=...`) as two alternative paths to the same
-  destination -- a configured model backend. This project only ever had
-  the second path: `rp_server.rs` reads `OPENAI_API_KEY`/
-  `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GROQ_API_KEY` straight from the
-  environment (see the "Medium-effort" section's provider-selection
-  entry above). There's no Prime Intellect account for a local
-  single-user harness to log into, and no other identity/account system
-  this project has ever needed. Unlike the rest of this section, the
-  missing subsystem isn't a Python control environment -- it's an OAuth
-  client plus somewhere real to send it, and there's nothing on the
-  other end for this project to authenticate against.
+  destination -- a configured model backend -- and an interactive wizard
+  around that actual destination is a bounded, honest thing to build even
+  without the OAuth client on top; see the medium-effort section's own
+  "`/login`: interactive provider-setup wizard" entry for what that wizard
+  does and doesn't cover.
 - **ACP mode** (Agent Client Protocol). `prime-agent`'s `--mode acp`
   speaks the Agent Client Protocol (`agentclientprotocol.com`) to
   editor integrations. Re-investigated closely rather than taken on

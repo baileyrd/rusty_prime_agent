@@ -555,6 +555,41 @@ it; `known_providers` (`harness model list`) only checks *presence* of
 an `auth.json` entry, never resolving a `!command`, so a plain listing
 can't run an arbitrary command as a side effect.
 
+## `/login` wizard
+
+Bounded parity with `prime-agent`'s `/login` -- see `PARITY.md` for the
+full story, including why the real OAuth-to-Prime-Intellect half stays
+out of scope. `session_repl`'s `/login` branch is an interactive wizard
+around `auth.json` (the previous section), the same destination
+`prime-agent`'s own quickstart treats `/login` and a plain `export
+...API_KEY=...` as two alternative paths to.
+
+Two questions, both read directly off `line_rx` -- the same channel every
+other REPL line already flows through, safe here because `/login`, like
+every other slash command, only ever runs while `current` is `None` (no
+prompt in flight to race a second reader against): first `rp_server::
+known_providers`' own list (name plus configured/not-configured status),
+then a provider name, then the key. `auth::write_key(state_root,
+provider, key)` inserts or overwrites that one entry while leaving every
+other provider in the file untouched. A blank answer cancels; an
+unrecognized provider name reports a friendly `"unknown provider ... --
+run /login again"` rather than writing an entry `known_providers` would
+never activate; `ollama` short-circuits with its own message since it
+needs no key at all.
+
+One real caveat the wizard's own success message states explicitly
+rather than leaving implicit: `rp_server::ensure_running` only spawns its
+`rp-server` sidecar once per daemon lifetime and reuses it as long as
+`health_check` passes, so an `auth.json` edit made while a sidecar is
+already running only takes effect the next time one spawns (`daemon
+shutdown` then `daemon start`) -- the same behavior hand-editing the file
+directly already has, `/login` doesn't change that contract.
+
+No input-hiding for the typed key: `termctl`'s raw mode disables the
+terminal's own local echo but `read_raw_line` re-echoes every byte itself
+(see that module's own doc comment), so the key is visible on screen as
+it's typed, same as everything else piped through this REPL.
+
 ## `providers.json` (custom provider registration)
 
 Parity with letting a session point at any self-hosted OpenAI-compatible

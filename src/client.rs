@@ -1409,6 +1409,109 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
             }
             continue;
         }
+        if text == "/login" {
+            // Parity with a bounded slice of `prime-agent`'s `/login` --
+            // see `PARITY.md`'s own "`/login`: interactive provider-setup
+            // wizard" entry for the full story. `prime-agent`'s real
+            // `/login` is an OAuth-style flow to Prime Intellect's own
+            // hosted account system; there is no such account system for
+            // a local single-user harness like this one to authenticate
+            // against (this project's own `PARITY.md` already establishes
+            // that, re-confirmed rather than assumed before writing this).
+            // What *is* real and worth building: an interactive wizard
+            // around the actual destination both `/login` and a plain
+            // `export OPENAI_API_KEY=...` reach in `prime-agent`'s own
+            // quickstart -- a configured model backend, here `auth.json`
+            // (see `auth::write_key`). Reads its two answers (provider,
+            // key) the same way this whole loop reads every other line --
+            // `line_rx.recv().await` -- which only works because this
+            // branch, like every other slash command here, only ever runs
+            // while `current` is `None` (no prompt in flight to race
+            // against): see this loop's own top-of-function doc comment
+            // for why `line_rx` is otherwise never read from two places at
+            // once.
+            let providers = crate::rp_server::known_providers(state_root);
+            println!(
+                "{}",
+                crate::theme::colorize(
+                    "no Prime Intellect account to log into -- this saves an API key straight to auth.json instead",
+                    theme.token("dim"),
+                    colors_on,
+                )
+            );
+            for p in &providers {
+                let status = if p.configured {
+                    "configured"
+                } else {
+                    "not configured"
+                };
+                println!("  {}\t{status}", p.name);
+            }
+            println!("provider name (blank to cancel):");
+            let provider = match line_rx.recv().await {
+                Some(Ok(Some(l))) => l.trim().to_string(),
+                Some(Ok(None)) | None => {
+                    reader_done = true;
+                    String::new()
+                }
+                Some(Err(e)) => return Err(e),
+            };
+            if provider.is_empty() {
+                println!("cancelled");
+                continue;
+            }
+            if provider == "ollama" {
+                println!("ollama needs no API key -- nothing to save");
+                continue;
+            }
+            if !providers.iter().any(|p| p.name == provider) {
+                println!(
+                    "{}",
+                    crate::theme::colorize(
+                        &format!(
+                            "unknown provider {provider:?} -- run /login again and pick one from the list above"
+                        ),
+                        theme.token("error"),
+                        colors_on,
+                    )
+                );
+                continue;
+            }
+            println!("API key for {provider} (stored in plain text in auth.json):");
+            let key = match line_rx.recv().await {
+                Some(Ok(Some(l))) => l.trim().to_string(),
+                Some(Ok(None)) | None => {
+                    reader_done = true;
+                    String::new()
+                }
+                Some(Err(e)) => return Err(e),
+            };
+            if key.is_empty() {
+                println!("cancelled -- no key entered");
+                continue;
+            }
+            match crate::auth::write_key(state_root, &provider, &key) {
+                Ok(()) => println!(
+                    "{}",
+                    crate::theme::colorize(
+                        &format!(
+                            "saved -- {provider} will be used the next time a provider sidecar spawns (restart it with `daemon shutdown` then `daemon start` if one is already running)"
+                        ),
+                        theme.token("success"),
+                        colors_on,
+                    )
+                ),
+                Err(e) => println!(
+                    "{}",
+                    crate::theme::colorize(
+                        &format!("failed to save: {e}"),
+                        theme.token("error"),
+                        colors_on,
+                    )
+                ),
+            }
+            continue;
+        }
         if let Some(rest) = text.strip_prefix('/') {
             // Falls through here only after every built-in slash command
             // above has already had a chance to match -- bounded parity
@@ -1638,6 +1741,7 @@ const REPL_SLASH_COMMANDS: &[&str] = &[
     "/reload",
     "/new",
     "/resume",
+    "/login",
 ];
 
 /// The result of a successful Tab completion: replace everything in the
