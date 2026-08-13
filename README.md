@@ -245,6 +245,26 @@ toward the goal: ..."`) -- with no active goal, it prints an explanation
 and sends nothing. A line that's `/compact` or `/compact <instructions>`
 forces context compaction immediately, same as `session compact`.
 
+### RPC mode
+
+```sh
+harness session rpc <id>
+```
+
+Headless, embeddable operation over stdin/stdout -- parity with
+`prime-agent --mode rpc`. Reads one JSON `Request` per stdin line (the
+same wire type `--mode json` already exposes -- `session_prompt`,
+`session_compact`, `goal_update`, `schedule_add`, ...), dispatches it,
+and prints the `Response` as its own JSON line. Concurrently streams
+every live `SessionEvent` for that session, the same event stream
+`--mode json session attach` produces, without needing a second CLI
+invocation. Ends at stdin EOF. `session_attach` is rejected as a
+command -- this mode already streams events automatically.
+
+```sh
+echo '{"type":"session_prompt","session_id":"<id>","text":"hello"}' | harness session rpc <id>
+```
+
 ### Model providers
 
 ```sh

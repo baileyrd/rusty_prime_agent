@@ -718,6 +718,68 @@ daemon/worker split rather than requiring the Python control environment:
   above), and any interaction with `session_autonomous`'s own turn/time
   budget (compaction is orthogonal to that loop, not a third stop
   condition).
+- [x] **RPC mode** (`session rpc <id>`), parity with `prime-agent --mode
+  rpc`. `prime-agent`'s `rpc.md` describes its own ~30-command custom
+  protocol (by its own words, "not JSON-RPC 2.0") over stdin/stdout for
+  embedding the agent in another program. Rather than inventing and
+  maintaining a second command vocabulary, `session_rpc` reuses the wire
+  protocol's own `Request`/`Response`/`SessionEvent` types directly --
+  the same "don't invent a second JSON schema" choice `--mode json`
+  already made (see `cli::OutputMode`'s own doc comment). Any `Request`
+  variant is accepted (not a narrower session-scoped allowlist the way
+  `prime-agent`'s own command set is) -- consistent with this project's
+  blanket single-local-caller trust model, not an oversight.
+
+  Two concurrent lanes share one stdout, serialized through a shared
+  `rusty_tokio::sync::Mutex<()>` so a line from one never interleaves
+  with a line from the other. The initial attach
+  (`Response::SessionAttachStarted` plus the snapshot event) happens
+  synchronously before the stdin loop starts -- caught during manual
+  testing: spawning the event-forwarding lane as pure fire-and-forget
+  before entering the stdin loop raced an empty/immediately-closed stdin
+  against that background task ever running at all, so `harness session
+  rpc <id> </dev/null` could exit with no output whatsoever depending on
+  scheduling. Doing the first attach round trip inline first, then
+  handing the *already-connected* stream to the background task for
+  everything after, makes the initial snapshot deterministic. The
+  foreground loop reads one stdin line at a time, each wrapped in its
+  own `spawn_blocking` call (not one long-lived blocking task) so the
+  loop stays `.await`-able between reads, parses it as a `Request`,
+  dispatches it over an ordinary one-shot connection, and prints the
+  `Response`. `Request::SessionAttach` sent as a command is rejected
+  locally with an explanatory error rather than forwarded -- this mode
+  already streams that session's events automatically, and the one-shot
+  dispatcher isn't built to drain a second, redundant streaming
+  connection.
+
+  A second real race, this one caught by CI rather than manual testing
+  (macOS specifically): a single piped command's own `SessionEvent`s can
+  still be sitting unread on the background lane's socket when stdin
+  hits EOF and this function would otherwise return immediately --
+  `harness session rpc <id>` given exactly one command line could print
+  the command's `Response` but exit before ever printing the `turn`
+  events that same command produced. Not provider/network latency (by
+  the time a `Response` is printed, its `SessionEvent`s are already
+  broadcast -- see `session::AgentSession::append`), purely this
+  process's own task-scheduling latency -- so a bounded 300ms grace sleep
+  after the stdin loop ends, before actually returning, closes the
+  common single-command case deterministically (confirmed with 8
+  back-to-back local runs after the fix). An event from something other
+  than a just-dispatched command (a concurrent schedule firing, another
+  attached client's own prompt) can still race process exit -- an honest
+  limitation no fixed grace window fully closes, and the one genuinely
+  remaining best-effort edge in this design. Ends at stdin
+  EOF, same convention `session_repl` already uses.
+
+  Explicitly not implemented: everything in `rpc.md`'s much larger
+  command surface that has no equivalent `Request` variant yet (`bash`,
+  `set_model`/`cycle_model`, `fork`/`clone`, `get_session_stats`,
+  `export_html`, ...), streaming message deltas (this project's provider
+  path isn't streaming at all -- `provider::ProviderReply` is a complete
+  reply or a complete tool-call batch, never a partial delta), and the
+  Extension UI sub-protocol (`select`/`confirm`/`input`/`editor` dialogs)
+  -- there is no extension system for it to serve (see "Needs a new
+  subsystem" below).
 
 ## Identified gaps, not yet started
 
@@ -727,16 +789,6 @@ reading -- unlike "Needs a new subsystem" below, each of these fits this
 project's existing shape without a new subsystem. None has been scoped
 or implemented yet.
 
-- **RPC mode** (`--mode rpc`). `prime-agent`'s `rpc.md` describes a
-  bidirectional JSON-RPC channel over stdin/stdout (`set_model`,
-  `cycle_model`, `steer`, `follow_up`, `abort`, `bash`, `compact`, ...)
-  for embedding `prime-agent` inside another program. This project's
-  `--mode json` is one-way: it dumps the wire-protocol event stream, but
-  there's no single command channel a client can write back through
-  besides the ordinary `Request`/`Response` calls `client.rs` already
-  makes over `daemon.sock`. Same transport this project already has
-  (JSONL over a socket) -- the gap is a designed command surface, not new
-  plumbing.
 - **Interval-repeating heartbeats.** `prime-agent`'s heartbeats
   (`long-running-agents.md`) support `every <interval>` with a label,
   plus list/pause/resume/clear. This project's `rlm_heartbeat()`/

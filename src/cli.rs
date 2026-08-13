@@ -90,6 +90,11 @@ pub enum Command {
         session_id: String,
         instructions: Option<String>,
     },
+    /// `harness session rpc <id>` -- parity with `prime-agent --mode
+    /// rpc`. See `client::session_rpc`'s own doc comment.
+    SessionRpc {
+        session_id: String,
+    },
     /// `harness session schedule add <id> (--at TIME|--every DURATION)
     /// <text...>` -- parity with `prime-agent schedule add`.
     ScheduleAdd {
@@ -479,8 +484,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     .ok_or_else(|| usage("`session repl` requires a session id"))?;
                 Ok(Command::SessionRepl { session_id })
             }
+            Some("rpc") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session rpc` requires a session id"))?;
+                Ok(Command::SessionRpc { session_id })
+            }
             other => Err(usage(format!(
-                "expected `session new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl`, got {other:?}"
+                "expected `session new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc`, got {other:?}"
             ))),
         },
         Some("prompt-template") => match it.next().map(String::as_str) {
@@ -512,7 +524,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl>`, `prompt-template <list|render>`, `skill list`, `model list`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown>`, `session <new|attach|list|prompt|stop|rename|compact|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }
