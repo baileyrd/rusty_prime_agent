@@ -406,7 +406,15 @@ harness session repl <id>
 
 Reads lines from stdin, sends each as a prompt, prints the reply, until
 EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
-existing transcript first. A line that's exactly `/heartbeat` manually
+existing transcript first. When both stdin and stdout are a real
+interactive terminal, the REPL puts it into raw mode and does its own
+minimal line editing (byte-by-byte echo, Backspace/Delete erases the
+last character, `Ctrl-C` cancels the current line instead of killing the
+process, `Ctrl-D` on an empty line exits) -- the foundation a later
+increment's richer editor (multiline input, `@` fuzzy file search, tab
+completion) builds on. Piped/non-interactive stdin (scripts, this
+project's own tests) is unaffected -- ordinary line-buffered reading,
+exactly as before. A line that's exactly `/heartbeat` manually
 re-enters the session's `Active` goal right away (`"Continue working
 toward the goal: ..."`) -- with no active goal, it prints an explanation
 and sends nothing. `/heartbeat every <duration>` (e.g. `/heartbeat every

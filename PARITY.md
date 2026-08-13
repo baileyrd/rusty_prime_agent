@@ -585,6 +585,89 @@ daemon/worker split rather than requiring the Python control environment:
   (or full interpreter-state serialization) -- a genuinely different,
   much larger mechanism than anything this increment's branch-summary
   work touched, so it stays unimplemented.
+- [x] **Interactive TUI: raw-mode rendering foundation** -- the first of
+  several increments building toward parity with `prime-agent`'s real
+  interactive TUI (panes, cursor control, live re-rendering), previously
+  tracked as one blocked-on-nothing-existing item in "Needs a new
+  subsystem." Scoped deliberately narrow: raw terminal mode plus the
+  minimal live re-rendering it enables (this project's own manual
+  byte-level echo/backspace/cancel handling), not the rich editor
+  (multiline input, `@` fuzzy file search, tab completion -- a later,
+  separate increment) built on top of it.
+
+  New `src/termctl.rs`: hand-rolled direct OS primitives via the
+  `libc`/`windows-sys` FFI this project already depends on
+  (`procutil.rs`'s own precedent -- a handful of small, direct syscalls,
+  not a protocol or a parser), not a new terminal-UI dependency like
+  `crossterm`. The same "hand-roll a narrowly scoped OS/protocol
+  concern, don't hand-roll everything" reasoning that chose to hand-roll
+  SHA-256/HMAC/a ZMTP client for RLM (see this file's "5a"/"5b" entries)
+  while still using `serde_json` rather than a hand-rolled JSON parser --
+  raw-mode terminal control is squarely the former. `termctl::is_tty()`
+  (both stdin and stdout must be a real interactive terminal --
+  `libc::isatty` on unix, `GetConsoleMode` succeeding on Windows) is what
+  `session_repl` checks before engaging any of this at all: every one of
+  this project's own tests pipes stdin/stdout (`Stdio::piped()`), so
+  `is_tty()` reports `false` under test and the loop falls through to
+  exactly the same `BufRead`-equivalent blocking-read behavior it always
+  had -- raw mode is additive for a real interactive caller, never a
+  requirement a non-interactive one has to satisfy.
+
+  `termctl::RawModeGuard::enable()` puts the terminal into the standard
+  raw-mode recipe (no canonical/line-buffered input, no local echo, no
+  signal-generating control characters -- `Ctrl-C` arrives as a plain
+  byte instead of `SIGINT`, handled explicitly by `session_repl`'s own
+  read loop -- no CR-to-NL translation, no output post-processing) via
+  direct `termios`/`tcgetattr`/`tcsetattr` calls on unix and the
+  equivalent `GetConsoleMode`/`SetConsoleMode` input-mode flags on
+  Windows, and restores the original mode on `Drop` -- including on an
+  early return or panic unwind, so a crashed or `?`-short-circuited REPL
+  never leaves the user's shell stuck in raw mode. Deliberately does not
+  include terminal-size querying (`TIOCGWINSZ`/
+  `GetConsoleScreenBufferInfo`) -- nothing in this increment needs it (no
+  line-wrapping, no multi-line rendering yet); left for whichever later
+  increment (the rich editor) actually needs the terminal's width.
+
+  `session_repl`'s stdin loop now reads through `next_repl_line`/
+  `read_raw_line` when connected to a real terminal (falling straight
+  back to the pre-existing `read_line`-based path otherwise, unchanged):
+  byte-by-byte reading with this project's own minimal manual editing --
+  printable bytes echoed and appended, Backspace/Delete erases the last
+  byte (visually and from the buffer), `Ctrl-C` cancels the current line
+  (prints `^C`, starts a fresh one, the same behavior most REPLs already
+  give `Ctrl-C` at a prompt) rather than exiting the process, `Ctrl-D` on
+  an empty line signals EOF, Enter submits -- no multi-line editing, no
+  cursor movement within the line, no history, no completion, all
+  correctly deferred to the rich-editor increment rather than bundled in
+  here. The rest of `session_repl`'s own command dispatch (`/heartbeat`,
+  `/compact`, `/file`, `/fork`, `/tree`, `/branch-summary`, `/export`,
+  ...) is untouched -- raw mode changes only how one line of input is
+  read, layered underneath the existing loop the same way `/tree`
+  layered onto it earlier, not a rewrite of it.
+
+  Verified with CI-safe unit tests for the deterministic half of the
+  raw-mode recipe (`termctl::make_raw`, a pure function taking a `termios`
+  and returning the raw-mode-adjusted one, factored out specifically so
+  it's testable without a real terminal -- confirms `ICANON`/`ECHO`/
+  `ISIG`/`IEXTEN`/`IXON`/`ICRNL`/`BRKINT`/`INPCK`/`ISTRIP`/`OPOST` are
+  cleared, `VMIN`/`VTIME` set to `1`/`0`, and `c_cflag` left untouched).
+  `is_tty()`/`RawModeGuard::enable()` themselves aren't asserted on
+  directly in CI -- their real behavior depends on the test process's
+  own actual stdin/stdout, which isn't consistent across environments
+  the way `cargo test`'s captured output makes other assertions
+  reliable, the same reasoning real-model/real-kernel features in this
+  project use `#[ignore]`d tests instead of CI assertions for. The full
+  existing `tests/repl.rs` suite stayed green unchanged, confirming the
+  piped/non-tty fallback path behaves identically to before this
+  increment. Plus a real end-to-end verification pass in this sandbox
+  against an actual pseudo-terminal (Python's `pty` module): typing
+  `hel<Backspace>lo<Enter>` produced the correctly-edited `helo` prompt
+  (confirming byte-level echo/backspace really ran); sending a raw
+  `Ctrl-C` byte produced this project's own `^C` output and left the
+  process alive and immediately responsive to a following `/exit` line --
+  proof `ISIG` was genuinely disabled (a real terminal's default
+  disposition would otherwise have delivered `SIGINT` and killed the
+  process outright, not produced this project's own handled `^C` text).
 - [x] **`session_repl`'s `/file`, `/fork`, `/export`** -- bounded parity
   with a slice of `prime-agent`'s TUI-side rich-editor/message-queue
   features, investigated piece by piece (see "Needs a new subsystem"
@@ -1859,14 +1942,17 @@ attempted here, and not silently implied by anything in
   bounded increment against" framing was wrong about spec *existence*.
   It's right about there being nothing to build *first*, though, for a
   different reason than originally stated: this project has no theming
-  surface to apply tokens to at all (a plain-text CLI/REPL has none; the
-  interactive TUI a theme would render through is itself a separate,
-  already-tracked, not-yet-attempted item below) -- a theme spec is
-  inert without a renderer to consume it, so this stays blocked on the
-  TUI item, not on missing spec.
-- **The interactive TUI itself** (a real terminal UI -- panes, cursor
-  control, live re-rendering) and the pieces of its rich editor/
-  message-queue surface that genuinely need one: **image paste** (zero
+  surface to apply tokens to at all. Raw mode itself now exists (see the
+  medium-effort section's own "Interactive TUI: raw-mode rendering
+  foundation" entry), but that's the *input* side only -- no styled
+  output rendering, no colored/positioned text, nothing a token would
+  actually color yet. A theme spec is inert without that renderer to
+  consume it, so this stays blocked on a later TUI increment, not on
+  missing spec.
+- **The interactive TUI's rich editor/message-queue surface, the pieces
+  that still need more than raw mode alone gives** (raw mode itself now
+  exists -- see the medium-effort section's own "Interactive TUI:
+  raw-mode rendering foundation" entry): **image paste** (zero
   non-text-content plumbing exists anywhere in this project -- `provider::
   ChatTurn.content` is `Option<String>`, text only, and `mcp_client.rs`'s
   own doc comment already names this exact gap for a different reason;
