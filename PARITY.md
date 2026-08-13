@@ -665,6 +665,59 @@ daemon/worker split rather than requiring the Python control environment:
   any change to `session_autonomous`'s own bounded loop -- these are two
   more manual entry points into the same mechanism, not a third
   continuation policy.
+- [x] **Automatic context compaction** (`session compact <id>
+  [instructions...]`, `/compact [instructions]` in `session_repl`, plus
+  an automatic trigger inside `AgentSession::prompt`'s own loop), parity
+  with `prime-agent`'s `compaction.md`. Previously listed here as an
+  identified-but-unstarted gap: "a real omission specifically because
+  `session_autonomous`, `session schedule --every`, and `rlm_heartbeat()`/
+  `/heartbeat` all exist to keep a session running indefinitely... none of
+  them has any mitigation for the context eventually overflowing the
+  provider's own window". `prime-agent`'s own trigger compares real
+  tracked token usage against a real per-model context window; this
+  project has neither (`provider::parse_response` never reads
+  `rp-server`'s `usage` field, and no per-model context-window catalog
+  exists), so `maybe_compact` uses a single fixed, deliberately
+  approximate token estimate instead (`text.len() / 4`, overridable via
+  `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`/
+  `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS`) -- exact enough to
+  decide "should compaction fire", not exact enough to enforce a hard
+  budget a real token-aware client would. `EchoProvider` sessions
+  (`state.model.is_none()`) never trigger it automatically and treat a
+  manual `session compact`/`/compact` as a plain, honest no-op ("nothing
+  to compact") -- there's no real model to ask for a summary, and
+  `EchoProvider` never risks a real context-window overflow anyway.
+
+  `transcript.jsonl` is never rewritten, truncated, or replayed
+  differently -- compaction only changes what `build_turns` sends to the
+  provider on the *next* prompt (a synthetic `TurnRole::System` turn
+  carrying the running summary, replacing everything at or before the
+  compacted boundary); `session attach`/`session repl` still show every
+  turn that ever happened, preserving `session.rs`'s own "full JSONL
+  replay, single source of truth" load-bearing decision untouched. A
+  fresh `Role::System` transcript entry ("(compacted N turns into a
+  running summary)") is appended each time compaction actually fires, so
+  it's visible in the durable record too, not just inferred from the
+  provider-facing turns. Re-summarized, not appended, on each fire: the
+  summarization call is given the previous summary (if any) plus the
+  newly-old turns, so `CompactionState::summary` always covers everything
+  up through its boundary in one piece.
+
+  Verified against a real model in this sandbox
+  (`ollama_provider_compacts_after_crossing_the_trigger_threshold`,
+  `#[ignore]`d for the same real-infra reasons as this file's other
+  `ollama_provider.rs` tests): with the trigger/keep-recent thresholds set
+  tiny via the env-var overrides above, two real prompts against
+  `qwen2.5:0.5b` produced a genuine model-written summary and the expected
+  transcript marker.
+
+  Explicitly not implemented: real per-provider token accounting (would
+  need `rp-server`'s `usage` field parsed and a per-model context-window
+  catalog neither exists today), a growing chain of separate summaries
+  (deliberately re-summarized into one running summary instead, see
+  above), and any interaction with `session_autonomous`'s own turn/time
+  budget (compaction is orthogonal to that loop, not a third stop
+  condition).
 
 ## Identified gaps, not yet started
 
@@ -674,19 +727,6 @@ reading -- unlike "Needs a new subsystem" below, each of these fits this
 project's existing shape without a new subsystem. None has been scoped
 or implemented yet.
 
-- **Automatic context compaction.** `prime-agent`'s `compaction.md`:
-  triggers when `contextTokens > contextWindow - reserveTokens`
-  (`reserveTokens` defaults to 16,384 tokens, `keepRecentTokens` to
-  20,000), summarizes older turns via the model itself, and is also
-  user-triggerable with `/compact [instructions]`. This project has no
-  equivalent at any layer -- a session's transcript just grows. That's a
-  real omission specifically because `session_autonomous`, `session
-  schedule --every`, and now `rlm_heartbeat()`/`/heartbeat` all exist to
-  keep a session running indefinitely with no human in the loop, and none
-  of them has any mitigation for the context eventually overflowing the
-  provider's own window -- the session just runs until a real provider
-  rejects an oversized request. The most load-bearing gap in this list,
-  since every feature that would need it is already shipped.
 - **RPC mode** (`--mode rpc`). `prime-agent`'s `rpc.md` describes a
   bidirectional JSON-RPC channel over stdin/stdout (`set_model`,
   `cycle_model`, `steer`, `follow_up`, `abort`, `bash`, `compact`, ...)

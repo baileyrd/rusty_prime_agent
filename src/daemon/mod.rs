@@ -270,6 +270,13 @@ impl Supervisor {
                 self.handle_session_rename(&mut conn, session_id, name)
                     .await
             }
+            Request::SessionCompact {
+                session_id,
+                instructions,
+            } => {
+                self.handle_session_compact(&mut conn, session_id, instructions)
+                    .await
+            }
             Request::ScheduleAdd {
                 session_id,
                 text,
@@ -746,6 +753,38 @@ impl Supervisor {
             .await?
             .ok_or_else(|| {
                 HarnessError::protocol(Context::Worker, "worker closed before responding to rename")
+            })?;
+        conn.write_response(Context::Daemon, &response).await
+    }
+
+    async fn handle_session_compact(
+        &self,
+        conn: &mut LineStream,
+        session_id: String,
+        instructions: Option<String>,
+    ) -> Result<()> {
+        let socket_path = match self.resolve_worker(conn, &session_id).await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        private
+            .write_request(
+                Context::Worker,
+                &Request::SessionCompact {
+                    session_id,
+                    instructions,
+                },
+            )
+            .await?;
+        let response = private
+            .read_response(Context::Worker)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::protocol(
+                    Context::Worker,
+                    "worker closed before responding to compact",
+                )
             })?;
         conn.write_response(Context::Daemon, &response).await
     }

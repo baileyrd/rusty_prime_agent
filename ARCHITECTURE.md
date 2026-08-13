@@ -253,6 +253,32 @@ action, not nested inside anything, so it fetches the goal
 (`client::fetch_goal`, already shared with `goal_show`/
 `session_autonomous`) and sends the continuation prompt immediately.
 
+## Automatic context compaction
+
+Parity with `prime-agent compaction.md` -- see `PARITY.md` for the full
+story, including what's approximate about it (no real token accounting,
+no per-model context-window catalog) and the real-model test that
+verifies it. `session::AgentSession::maybe_compact` is checked once per
+round of `prompt`'s own tool-calling loop; when a session has a `model`
+set and its estimated turn-token total crosses
+`compact_trigger_tokens()` (a fixed default, overridable via
+`RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`), `compact_now` asks
+`self.provider` itself to produce an updated running summary of
+everything past the last compacted boundary except the most recent
+`compact_keep_recent_tokens()` worth of turns, and records the result in
+`SessionState::compaction` (`CompactionState`). `build_turns` is the only
+place this is visible to the provider: it replaces every turn at or
+before the compacted boundary with one synthetic system turn carrying
+the summary. `transcript.jsonl`/`self.transcript` are never rewritten or
+truncated -- `session.rs`'s own "full JSONL replay, single source of
+truth" decision stays exactly as true as it was before this feature
+existed; a `Role::System` entry documenting the compaction is appended
+to the durable transcript too, so `session attach`/`session repl` show
+it happened without needing to inspect `state.json` directly.
+`EchoProvider` sessions (no `model`) never trigger this automatically
+and treat a manual `session compact`/`session_repl`'s `/compact` as a
+plain no-op -- there's no real model to summarize with.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

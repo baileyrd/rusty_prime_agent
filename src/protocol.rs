@@ -130,6 +130,21 @@ pub enum Request {
         session_id: String,
         name: Option<String>,
     },
+    /// Parity with `prime-agent /compact [instructions]`: force
+    /// compaction now, regardless of whether the automatic token
+    /// threshold (`session::AgentSession::maybe_compact`) has been
+    /// crossed. Valid on both transports, forwarded to the owning worker
+    /// unchanged, same reasoning as `SessionRename`. `instructions`
+    /// mirrors `prime-agent`'s own optional focus text (e.g. "focus on
+    /// the auth refactor, remember the exact migration command"), folded
+    /// into the summarization prompt when given. A no-op (not an error)
+    /// on a session with no `model` set (`EchoProvider` has nothing to
+    /// summarize with) or with nothing old enough to fold away yet --
+    /// see `Response::SessionCompactAck::compacted`.
+    SessionCompact {
+        session_id: String,
+        instructions: Option<String>,
+    },
     /// Parity with `prime-agent schedule add`: registers a prompt the
     /// daemon itself will inject into `session_id` later, without any
     /// client attached -- see `schedule`'s own module doc comment for
@@ -245,6 +260,17 @@ pub enum Response {
     },
     SessionRenameAck {
         name: Option<String>,
+    },
+    /// `compacted` is false for the two no-op cases `SessionCompact`'s
+    /// own doc comment describes (no `model`, or nothing old enough to
+    /// fold away) -- still a success response, not `Response::Error`,
+    /// the same "an accurate no-op beats a manufactured error" reasoning
+    /// `ScheduleCancelAck::found` already uses. `summary` is the new
+    /// (or unchanged, if `compacted` is false) running summary text, for
+    /// a caller that wants to display it.
+    SessionCompactAck {
+        compacted: bool,
+        summary: Option<String>,
     },
     ScheduleAdded {
         schedule_id: String,
@@ -519,6 +545,34 @@ pub struct SessionState {
     /// `model`/`goal`/`harness`/`parent_id`/`thinking`/`tools` have it.
     #[serde(default)]
     pub runtime: Option<String>,
+    /// See `CompactionState`'s own doc comment. `#[serde(default)]` for
+    /// the same pre-existing-`state.json` reason every other field added
+    /// after Phase 1 has it.
+    #[serde(default)]
+    pub compaction: Option<CompactionState>,
+}
+
+/// A session's running compaction summary, parity with `prime-agent`'s
+/// automatic context compaction (`packages/coding-agent/docs/
+/// compaction.md`). Never mutates `transcript.jsonl` -- that file stays
+/// exactly what `session.rs`'s own module doc comment already promises,
+/// "the single source of truth", full and untouched; compaction only
+/// changes what `session::AgentSession::build_turns` sends to the
+/// provider on the *next* prompt; `session attach`/`session repl` still
+/// show every turn that ever happened. Re-summarized (not appended to)
+/// each time compaction fires again: the new summarization call is
+/// given the previous `summary` as context plus whatever newly-old turns
+/// crossed the keep-recent boundary since, so `summary` always covers
+/// everything up through `compacted_up_to_sequence` in one piece, not a
+/// growing chain of separate summaries to re-read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionState {
+    /// Transcript entries with `sequence <= compacted_up_to_sequence`
+    /// are folded into `summary` rather than sent to the provider
+    /// verbatim; entries after it are unaffected.
+    pub compacted_up_to_sequence: u64,
+    pub summary: String,
+    pub compacted_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

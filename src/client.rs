@@ -554,8 +554,11 @@ fn print_entry(entry: &crate::protocol::TranscriptEntry) {
 /// as an ordinary `SessionPrompt`, and prints the reply, until stdin
 /// hits EOF or a line is exactly `/exit`/`/quit`. None of the TUI's own
 /// editor/message-queue features (file reference, image paste, steering
-/// vs. follow-up queuing, `/tree`/`/fork`/`/clone`/`/compact`/`/export`/
-/// `/share`) -- those stay out of scope, see `PARITY.md`. Replays the
+/// vs. follow-up queuing, `/tree`/`/fork`/`/clone`/`/export`/`/share`)
+/// -- those stay unimplemented, see `PARITY.md`. `/compact
+/// [instructions]` (see below) is implemented, since it's a session-level
+/// mutation like `/heartbeat`, not one of the TUI's own editor features.
+/// Replays the
 /// session's existing transcript first (reusing
 /// [`fetch_transcript_snapshot`]), so resuming a session in the REPL
 /// shows its prior turns the same way `session attach` would.
@@ -614,6 +617,19 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
                     "no active goal -- set one with `session goal set {session_id} <text...>` first"
                 ),
             }
+            continue;
+        }
+        if text == "/compact" || text.starts_with("/compact ") {
+            // Parity with `prime-agent /compact [instructions]`. A fresh
+            // top-level REPL action, same as `/heartbeat` above -- no
+            // reentrancy hazard here, so this calls `session_compact`
+            // directly rather than needing any scheduling indirection.
+            let instructions = text
+                .strip_prefix("/compact")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            session_compact(state_root, session_id.clone(), instructions, mode).await?;
             continue;
         }
         let entry = send_prompt(state_root, &session_id, text.to_string()).await?;
@@ -861,6 +877,57 @@ pub async fn session_rename(
                 (_, OutputMode::Json) => print_json(&response),
                 (Response::SessionRenameAck { name }, OutputMode::Text) => {
                     println!("renamed to {}", name.as_deref().unwrap_or("-"))
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+/// Parity with `prime-agent /compact [instructions]`. Also the
+/// implementation `session_repl`'s own `/compact` line reuses -- see
+/// that branch's own comment for why no separate client-side helper is
+/// needed there.
+pub async fn session_compact(
+    state_root: &Path,
+    session_id: String,
+    instructions: Option<String>,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(
+        Context::Daemon,
+        &Request::SessionCompact {
+            session_id,
+            instructions,
+        },
+    )
+    .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::SessionCompactAck { .. } => {
+            match (&response, mode) {
+                (_, OutputMode::Json) => print_json(&response),
+                (
+                    Response::SessionCompactAck {
+                        compacted: true,
+                        summary,
+                    },
+                    OutputMode::Text,
+                ) => {
+                    println!(
+                        "compacted -- new summary: {}",
+                        summary.as_deref().unwrap_or("")
+                    )
+                }
+                (
+                    Response::SessionCompactAck {
+                        compacted: false, ..
+                    },
+                    OutputMode::Text,
+                ) => {
+                    println!("nothing to compact (no model configured, or nothing old enough yet)")
                 }
                 _ => unreachable!(),
             }

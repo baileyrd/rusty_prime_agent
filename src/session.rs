@@ -38,9 +38,9 @@ use rusty_tokio::sync::broadcast;
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
 use crate::protocol::{
-    GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState,
-    Request, Role, ScheduleKind, SessionEvent, SessionState, SessionStatus, ToolCallRequest,
-    TranscriptEntry,
+    CompactionState, GoalAction, GoalState, GoalStatus, HarnessAction, HarnessNote,
+    HarnessSnapshot, HarnessState, Request, Role, ScheduleKind, SessionEvent, SessionState,
+    SessionStatus, ToolCallRequest, TranscriptEntry,
 };
 use crate::provider::{ChatTurn, ModelProvider, ProviderReply, ToolDef, TurnRole};
 use crate::tool_runtime::ToolRuntime;
@@ -54,6 +54,75 @@ use crate::transport;
 /// `trigger_heartbeat` when found. A plain ASCII marker, not something a
 /// real print() is likely to emit by accident.
 pub(crate) const HEARTBEAT_MARKER: &str = "___RPA_HEARTBEAT___";
+
+/// Conservative, deliberately approximate context-length trigger for
+/// automatic compaction (`maybe_compact`, called every round of
+/// `prompt`'s tool-calling loop) -- parity with `prime-agent`'s
+/// `compaction.md`, whose own trigger compares estimated context tokens
+/// against the model's context window minus a reserved buffer. This
+/// project doesn't know any given model's real context window
+/// (`rp-server`'s `/v1/chat/completions` response isn't parsed for
+/// `usage` at all -- see `provider::parse_response`), so there's no
+/// per-model budget to compare against; this is a single fixed default
+/// instead, chosen low enough to trigger well before even a modest real
+/// model's context window (commonly 8k to 128k tokens) is threatened,
+/// high enough that ordinary short sessions never compact at all.
+/// Overridable via `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`, mainly so
+/// this project's own tests can exercise real compaction against a real
+/// model without needing thousands of tokens of real conversation
+/// first.
+const DEFAULT_COMPACT_TRIGGER_TOKENS: usize = 6_000;
+
+/// How many of the most recent estimated tokens' worth of turns stay
+/// verbatim, uncompacted, every time compaction fires -- parity with
+/// `prime-agent`'s `keepRecentTokens`. Overridable via
+/// `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS`, same testability
+/// reason as the trigger threshold above.
+const DEFAULT_COMPACT_KEEP_RECENT_TOKENS: usize = 2_000;
+
+fn compact_trigger_tokens() -> usize {
+    std::env::var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_COMPACT_TRIGGER_TOKENS)
+}
+
+fn compact_keep_recent_tokens() -> usize {
+    std::env::var("RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_COMPACT_KEEP_RECENT_TOKENS)
+}
+
+/// A deliberately approximate token count: roughly 4 characters per
+/// token, the same rough English-text heuristic used when no real
+/// tokenizer is available. This project has no tokenizer dependency --
+/// exact enough to decide "should compaction fire at all", not exact
+/// enough to enforce a hard budget the way a real token-aware provider
+/// client would.
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+/// Pure boundary-finding logic, separated from `AgentSession::
+/// compact_now` so it's unit-testable without a live session/provider:
+/// walks `candidates` backward (most recent first) accumulating
+/// estimated tokens until `keep_recent_tokens` is exceeded, then returns
+/// how many of the *oldest* entries (a prefix of `candidates`) should be
+/// folded into a summary. Returns 0 when nothing is old enough to fold
+/// away yet (including when `candidates` alone is already under the
+/// keep-recent budget) -- parity with `prime-agent`'s "working backward
+/// through messages until reaching the keepRecentTokens threshold".
+fn find_compaction_fold_count(candidates: &[TranscriptEntry], keep_recent_tokens: usize) -> usize {
+    let mut recent_tokens = 0usize;
+    for (i, entry) in candidates.iter().enumerate().rev() {
+        recent_tokens += estimate_tokens(&entry.text);
+        if recent_tokens > keep_recent_tokens {
+            return i + 1;
+        }
+    }
+    0
+}
 
 /// Generates a session id unique enough for this project's needs: not
 /// cryptographically random (no `rand` dependency for a display id no
@@ -193,6 +262,7 @@ impl AgentSession {
             thinking,
             tools,
             runtime,
+            compaction: None,
         };
         let session = AgentSession {
             state,
@@ -325,6 +395,7 @@ impl AgentSession {
 
         const MAX_TOOL_ROUNDS: usize = 8;
         for _ in 0..MAX_TOOL_ROUNDS {
+            self.maybe_compact().await?;
             let turns = self.build_turns();
             match self.provider.respond(&turns, &tools).await? {
                 ProviderReply::Text(reply) => {
@@ -571,34 +642,183 @@ impl AgentSession {
     /// Maps the persisted transcript into the turn shape a
     /// `ModelProvider` expects -- see `provider::ChatTurn`'s own doc
     /// comment for why this is a separate type from `TranscriptEntry`.
+    /// When `state.compaction` is set, entries at or before its
+    /// `compacted_up_to_sequence` are replaced by one synthetic
+    /// `TurnRole::System` turn carrying the running summary instead of
+    /// being sent verbatim -- `transcript.jsonl`/`self.transcript`
+    /// themselves are untouched either way (see `CompactionState`'s own
+    /// doc comment), so this is the only place compaction is visible to
+    /// the provider.
     fn build_turns(&self) -> Vec<ChatTurn> {
-        self.transcript
+        let boundary = self
+            .state
+            .compaction
+            .as_ref()
+            .map(|c| c.compacted_up_to_sequence)
+            .unwrap_or(0);
+        let mut turns = Vec::new();
+        if let Some(compaction) = &self.state.compaction {
+            turns.push(ChatTurn {
+                role: TurnRole::System,
+                content: Some(format!(
+                    "Summary of earlier conversation (compacted to save context): {}",
+                    compaction.summary
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        turns.extend(
+            self.transcript
+                .iter()
+                .filter(|e| e.sequence > boundary)
+                .map(|entry| {
+                    let role = match entry.role {
+                        Role::User => TurnRole::User,
+                        Role::Assistant => TurnRole::Assistant,
+                        Role::System => TurnRole::System,
+                        Role::Tool => TurnRole::Tool,
+                    };
+                    // An assistant tool-call-request entry is persisted with
+                    // empty `text` (nothing user-visible to show) -- mirror
+                    // that back to `None` rather than `Some("")`, matching
+                    // `rp-server`'s own `content: null` convention for it.
+                    let content = if entry.role == Role::Assistant && entry.tool_calls.is_some() {
+                        None
+                    } else {
+                        Some(entry.text.clone())
+                    };
+                    ChatTurn {
+                        role,
+                        content,
+                        tool_calls: entry.tool_calls.clone(),
+                        tool_call_id: entry.tool_call_id.clone(),
+                        name: entry.name.clone(),
+                    }
+                }),
+        );
+        turns
+    }
+
+    /// Checked once per round of `prompt`'s tool-calling loop, right
+    /// before building the turns that go to the provider. A no-op for
+    /// `EchoProvider` sessions (`state.model.is_none()` -- there's no
+    /// real model to ask for a summary, and `EchoProvider` never risks a
+    /// real context-window overflow anyway) and for a session whose
+    /// current turns are still under `compact_trigger_tokens()`.
+    async fn maybe_compact(&mut self) -> Result<()> {
+        if self.state.model.is_none() {
+            return Ok(());
+        }
+        let turns = self.build_turns();
+        let total: usize = turns
             .iter()
-            .map(|entry| {
-                let role = match entry.role {
-                    Role::User => TurnRole::User,
-                    Role::Assistant => TurnRole::Assistant,
-                    Role::System => TurnRole::System,
-                    Role::Tool => TurnRole::Tool,
-                };
-                // An assistant tool-call-request entry is persisted with
-                // empty `text` (nothing user-visible to show) -- mirror
-                // that back to `None` rather than `Some("")`, matching
-                // `rp-server`'s own `content: null` convention for it.
-                let content = if entry.role == Role::Assistant && entry.tool_calls.is_some() {
-                    None
-                } else {
-                    Some(entry.text.clone())
-                };
-                ChatTurn {
-                    role,
-                    content,
-                    tool_calls: entry.tool_calls.clone(),
-                    tool_call_id: entry.tool_call_id.clone(),
-                    name: entry.name.clone(),
-                }
-            })
-            .collect()
+            .map(|t| estimate_tokens(t.content.as_deref().unwrap_or("")))
+            .sum();
+        if total <= compact_trigger_tokens() {
+            return Ok(());
+        }
+        self.compact_now(None).await?;
+        Ok(())
+    }
+
+    /// Forces compaction now, parity with `prime-agent /compact
+    /// [instructions]`. Returns `(compacted, summary)`: `compacted` is
+    /// false, and `summary` unchanged, for either of two honest no-op
+    /// cases -- no `model` set (nothing to summarize with), or nothing
+    /// past the already-compacted boundary is old enough to fold away
+    /// yet (`find_compaction_fold_count` returns 0). Otherwise, asks
+    /// `self.provider` itself to produce an updated running summary
+    /// (the previous summary, if any, plus the newly-old turns), then
+    /// records a `Role::System` transcript entry documenting that
+    /// compaction happened -- visible in `session attach`/`session
+    /// repl` the same way any other turn is, even though
+    /// `transcript.jsonl` itself is never rewritten or truncated (see
+    /// `CompactionState`'s own doc comment).
+    pub async fn compact_now(
+        &mut self,
+        instructions: Option<String>,
+    ) -> Result<(bool, Option<String>)> {
+        if self.state.model.is_none() {
+            return Ok((false, None));
+        }
+        let already_compacted_seq = self
+            .state
+            .compaction
+            .as_ref()
+            .map(|c| c.compacted_up_to_sequence)
+            .unwrap_or(0);
+        let candidates: Vec<TranscriptEntry> = self
+            .transcript
+            .iter()
+            .filter(|e| e.sequence > already_compacted_seq)
+            .cloned()
+            .collect();
+        let fold_count = find_compaction_fold_count(&candidates, compact_keep_recent_tokens());
+        if fold_count == 0 {
+            return Ok((
+                false,
+                self.state.compaction.as_ref().map(|c| c.summary.clone()),
+            ));
+        }
+        let to_fold = &candidates[..fold_count];
+        let new_boundary_seq = to_fold
+            .last()
+            .expect("fold_count > 0 implies a last element")
+            .sequence;
+
+        let mut prompt_text = String::new();
+        if let Some(prev) = &self.state.compaction {
+            prompt_text.push_str("Previous summary of the conversation so far:\n");
+            prompt_text.push_str(&prev.summary);
+            prompt_text.push_str("\n\n");
+        }
+        prompt_text.push_str("Additional conversation to fold into that summary:\n");
+        for entry in to_fold {
+            prompt_text.push_str(&format!("{:?}: {}\n", entry.role, entry.text));
+        }
+        if let Some(instructions) = &instructions {
+            prompt_text.push_str(&format!("\nFocus the summary on: {instructions}\n"));
+        }
+        prompt_text.push_str(
+            "\nReply with only an updated, concise summary capturing the important facts, \
+             decisions, and current state -- no preamble.",
+        );
+        let ask = [ChatTurn {
+            role: TurnRole::User,
+            content: Some(prompt_text),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let summary = match self.provider.respond(&ask, &[]).await? {
+            ProviderReply::Text(text) => text,
+            ProviderReply::ToolCalls(_) => {
+                "(compaction summary unavailable: model requested tools instead of summarizing)"
+                    .to_string()
+            }
+        };
+
+        self.state.compaction = Some(CompactionState {
+            compacted_up_to_sequence: new_boundary_seq,
+            summary: summary.clone(),
+            compacted_at_ms: now_ms(),
+        });
+        self.write_state().await?;
+        self.append(
+            Role::System,
+            format!(
+                "(compacted {} turn{} into a running summary)",
+                fold_count,
+                if fold_count == 1 { "" } else { "s" }
+            ),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        Ok((true, Some(summary)))
     }
 
     async fn append(
@@ -823,4 +1043,59 @@ async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> 
     })
     .await;
     join.map_err(|_| HarnessError::protocol(Context::Session, "transcript append task panicked"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(sequence: u64, text: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            sequence,
+            timestamp_ms: 0,
+            role: Role::User,
+            text: text.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn estimate_tokens_is_roughly_four_chars_per_token() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        // Rounds down -- an approximate heuristic, not an exact count.
+        assert_eq!(estimate_tokens("abc"), 0);
+    }
+
+    #[test]
+    fn find_compaction_fold_count_folds_nothing_under_the_keep_recent_budget() {
+        let candidates = vec![entry(1, "short"), entry(2, "also short")];
+        assert_eq!(find_compaction_fold_count(&candidates, 1_000), 0);
+    }
+
+    #[test]
+    fn find_compaction_fold_count_folds_the_oldest_entries_past_the_keep_recent_budget() {
+        // Each entry is "abcd" -> 1 estimated token. A keep-recent budget
+        // of 2 tokens should keep the newest 2 entries verbatim and fold
+        // the oldest 3 away.
+        let candidates: Vec<TranscriptEntry> = (1..=5).map(|seq| entry(seq, "abcd")).collect();
+        assert_eq!(find_compaction_fold_count(&candidates, 2), 3);
+    }
+
+    #[test]
+    fn find_compaction_fold_count_folds_everything_when_even_the_newest_exceeds_budget() {
+        // A keep-recent budget of 0 is exceeded by the single newest
+        // entry alone, so every candidate folds -- an honest degenerate
+        // case, not a special-cased minimum.
+        let candidates: Vec<TranscriptEntry> = (1..=5).map(|seq| entry(seq, "abcd")).collect();
+        assert_eq!(find_compaction_fold_count(&candidates, 0), 5);
+    }
+
+    #[test]
+    fn find_compaction_fold_count_empty_candidates_folds_nothing() {
+        assert_eq!(find_compaction_fold_count(&[], 100), 0);
+    }
 }

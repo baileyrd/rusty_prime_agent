@@ -118,7 +118,18 @@ harness session list                 # id, status, name, turns, model, ...
 harness session prompt <id> <text...>
 harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
+harness session compact <id> [instructions...]   # force compaction now
 ```
+
+Sessions with a real `--model` automatically compact their own context
+once it grows past a size threshold -- older turns get folded into a
+running summary the model itself writes, without touching the durable
+transcript (`session attach` still shows everything). `session compact`
+forces it immediately instead of waiting for the automatic trigger,
+optionally focused with free-text `instructions` (parity with
+`prime-agent /compact [instructions]`). A no-op, not an error, on a
+session with no `--model` set (nothing to summarize with) or nothing old
+enough to fold away yet.
 
 ### Scheduling
 
@@ -231,7 +242,8 @@ EOF or a line that's exactly `/exit`/`/quit`. Replays the session's
 existing transcript first. A line that's exactly `/heartbeat` manually
 re-enters the session's `Active` goal right away (`"Continue working
 toward the goal: ..."`) -- with no active goal, it prints an explanation
-and sends nothing.
+and sends nothing. A line that's `/compact` or `/compact <instructions>`
+forces context compaction immediately, same as `session compact`.
 
 ### Model providers
 
