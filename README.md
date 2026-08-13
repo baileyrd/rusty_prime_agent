@@ -18,8 +18,8 @@ tool-calling/MCP integration, and a real persistent IPython kernel for
 its RLM programming model) -- without attempting to reimplement
 `prime-agent` itself. See
 [`PARITY.md`](PARITY.md) for exactly what's mirrored, what's a
-deliberate simplification, and what's out of scope for this project's
-current shape, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
+deliberate simplification, and what's not yet implemented in this
+project's current shape, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
 pieces fit together internally.
 
 ## Build
@@ -271,4 +271,4 @@ instead of the built-in echo provider.
   layout, dependency stack.
 - [`PARITY.md`](PARITY.md) -- what's mirrored from `prime-agent`, what's
   a bounded/simplified version of a larger feature, and what's
-  genuinely out of scope for this project's shape.
+  genuinely not yet implemented for this project's shape.

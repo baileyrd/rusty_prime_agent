@@ -15,8 +15,8 @@ This project deliberately mirrors one slice of
 [`PrimeIntellect-ai/prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent)'s
 daemon/worker operational architecture without attempting to reimplement
 that project itself -- see `PARITY.md` for what's mirrored, what's a
-tractable near-term increment, and what's out of scope for this project's
-current shape.
+tractable near-term increment, and what's not yet implemented in this
+project's current shape.
 
 ## Module map
 
