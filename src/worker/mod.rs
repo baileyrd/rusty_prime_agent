@@ -463,6 +463,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     };
     session.install_extension_registry(extension_registry);
+    // Captured *before* wrapping in `Arc<Mutex<_>>` -- see `protocol::
+    // Request::SessionInterrupt`'s own doc comment for why this needs
+    // to be a plain `Arc<AtomicBool>` a connection handler can flip
+    // without ever taking the session lock (which an in-flight prompt
+    // already holds for its whole duration).
+    let cancel_flag = session.cancel_flag();
     let session = Arc::new(Mutex::new(session));
 
     let socket_path = paths::worker_socket_path(&args.state_root, &args.session_id);
@@ -479,8 +485,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     loop {
         let conn = listener.accept(Context::Worker).await?;
         let session = session.clone();
+        let cancel_flag = cancel_flag.clone();
         rusty_tokio::spawn(async move {
-            if let Err(err) = handle_private_connection(session, conn).await {
+            if let Err(err) = handle_private_connection(session, cancel_flag, conn).await {
                 // One bad connection (malformed request, peer vanished
                 // mid-write) must not take the whole worker down --
                 // that would defeat the entire point of a per-session
@@ -495,6 +502,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
 async fn handle_private_connection(
     session: Arc<Mutex<AgentSession>>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     mut conn: LineStream,
 ) -> Result<()> {
     let request = match conn.read_request(Context::Worker).await? {
@@ -503,6 +511,16 @@ async fn handle_private_connection(
     };
     match request {
         Request::Ping => conn.write_response(Context::Worker, &Response::Pong).await,
+        // Deliberately does *not* take `session.lock().await` -- see
+        // `protocol::Request::SessionInterrupt`'s own doc comment for
+        // why: an in-flight prompt already holds that lock for its
+        // whole duration, and waiting behind it would defeat the entire
+        // point of an asynchronous interrupt.
+        Request::SessionInterrupt { .. } => {
+            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            conn.write_response(Context::Worker, &Response::SessionInterruptAck)
+                .await
+        }
         Request::SessionAttach { .. } => {
             let (session_id, snapshot, pending_marker, mut events) = {
                 let mut guard = session.lock().await;

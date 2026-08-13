@@ -51,6 +51,7 @@ mod catalog;
 mod cli;
 mod client;
 mod daemon;
+mod doctor;
 mod extensions;
 mod frontmatter;
 mod http_client;
@@ -148,6 +149,12 @@ pub async fn run(args: &[String]) -> Result<()> {
             session_id,
             instructions,
         } => client::session_compact(&state_root, session_id, instructions, output_mode).await,
+        cli::Command::SessionHeartbeat { session_id, every } => {
+            client::session_heartbeat(&state_root, session_id, every, output_mode).await
+        }
+        cli::Command::SessionInterrupt { session_id } => {
+            client::session_interrupt(&state_root, session_id, output_mode).await
+        }
         cli::Command::SessionFork {
             session_id,
             at_sequence,
@@ -253,6 +260,9 @@ pub async fn run(args: &[String]) -> Result<()> {
             client::model_list(&state_root, detailed, output_mode).await
         }
         cli::Command::Update { force } => client::self_update(force, output_mode).await,
+        cli::Command::Doctor { fix } => {
+            client::doctor(&state_root, &exe_path, fix, output_mode).await
+        }
         cli::Command::Print { text, model } => {
             client::print_once(&state_root, &exe_path, text, model, output_mode).await
         }

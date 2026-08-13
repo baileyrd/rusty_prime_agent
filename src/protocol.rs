@@ -160,6 +160,27 @@ pub enum Request {
         session_id: String,
         instructions: Option<String>,
     },
+    /// Bounded parity with a slice of `prime-agent`'s "steering" --
+    /// see `PARITY.md`'s own "cancel primitive" entry for the full
+    /// design and what this deliberately can't do (abort a model call
+    /// already in flight to a real provider's HTTP endpoint; that would
+    /// need cooperative cancellation deep in `ModelProvider::respond`
+    /// itself, out of scope here). Sets a flag
+    /// (`session::AgentSession::cancel_flag`) the worker's own
+    /// tool-calling loop checks between rounds -- a multi-round session
+    /// (RLM/MCP tool use) genuinely stops early at its next safe
+    /// checkpoint instead of continuing to a natural finish or the
+    /// `MAX_TOOL_ROUNDS` cap; a single-round session (plain text reply,
+    /// `EchoProvider`) has no round boundary to check at, so this is
+    /// effectively a no-op for it. Valid on both transports, forwarded
+    /// to the owning worker unchanged, same reasoning as
+    /// `SessionCompact` -- but handled by the worker *without* taking
+    /// the session's own lock (unlike every sibling request here), since
+    /// an in-flight prompt already holds that lock for its whole
+    /// duration; waiting for it would defeat the entire point.
+    SessionInterrupt {
+        session_id: String,
+    },
     /// Invokes an extension-registered command (`pi.register_command`,
     /// bounded parity with a slice of `prime-agent`'s extension system --
     /// see `extensions.rs`'s own module doc comment). Valid on both
@@ -362,6 +383,15 @@ pub enum Response {
         compacted: bool,
         summary: Option<String>,
     },
+    /// A plain acknowledgment that the flag was set -- see
+    /// `Request::SessionInterrupt`'s own doc comment for exactly what
+    /// setting it can and can't stop. No `interrupted: bool` field:
+    /// this worker deliberately never locks the session to check whether
+    /// a prompt is actually in flight before acking (that would mean
+    /// waiting behind the very thing it's trying to interrupt), so there
+    /// is no truthful "yes, something was cancelled" fact available at
+    /// ack time to report.
+    SessionInterruptAck,
     /// `output` is a friendly "unknown extension command: /foo" message
     /// (not a `Response::Error`) when `command` names nothing
     /// registered -- the same "accurate no-op beats a manufactured

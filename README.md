@@ -167,6 +167,8 @@ harness session fork <id> [--at N] [--name NAME]  # copy into a brand-new sessio
 harness session tree <id>                     # show every branch of the transcript
 harness session set-active-leaf <id> <sequence>  # switch which entry the next prompt continues from
 harness session branch-summary <id> <sequence>   # ask the model to summarize a branch other than the active one
+harness session heartbeat <id> [--every DURATION]  # manually re-enter the session's active goal
+harness session interrupt <id>                # request an in-flight turn stop before its next round
 ```
 
 `session prompt <id> --image <path>` attaches a local image (recognized
@@ -226,6 +228,22 @@ Parity with `session-format.md`'s `BranchSummaryEntry`. A no-op, not an
 error, with no `--model` set or when `<sequence>` is already part of the
 active chain (nothing "other" to summarize); an unknown `<sequence>` is
 a conflict, same as `session set-active-leaf`.
+
+`session heartbeat <id>` is a top-level entry point into the same
+"continue toward the goal" re-entry mechanism `session repl`'s own
+`/heartbeat` covers -- requires an `Active` goal (`session goal set`
+first), otherwise prints an explanation and does nothing. With
+`--every DURATION` (`30s`/`5m`/`2h`/`1d`), it registers a real recurring
+`session schedule` entry instead of sending anything immediately --
+listed/canceled the same way any other schedule is.
+
+`session interrupt <id>` requests that an in-flight, multi-round
+tool-calling turn (RLM/MCP tool use) stop before its *next* round rather
+than run to a natural finish or the round cap. It can't abort a model
+call already in flight to a real provider, and has no visible effect on
+a plain single-round text reply (nothing multi-round to interrupt) --
+always prints the same confirmation regardless, since there's no way to
+know from the caller's side whether anything was actually running.
 
 ### Scheduling
 
@@ -617,6 +635,25 @@ would touch. Prints what happened; if a daemon is already running,
 restart it (`daemon shutdown` then `daemon start`) to actually pick up
 the rebuilt binary. Fails loudly, naming the expected checkout path, if
 that checkout can't be found (e.g. this binary was copied elsewhere).
+
+### Doctor
+
+```sh
+harness doctor
+harness doctor --fix
+```
+
+Bounded parity with `prime-agent doctor [--fix]`: runs a fixed set of
+diagnostic checks and prints one line per check
+(`<name>\t<ok|warn|error>\t<detail>`, or a JSON array under `--mode
+json`). Checks daemon reachability, whether `rp-server` can be found on
+`PATH` (needed for anything other than `EchoProvider`), and whether
+`settings.json`/`auth.json`/`providers.json` actually parse as JSON --
+each of those files is normally read permissively (a typo silently reads
+as "no config"), so this is the one place a malformed one gets reported
+loudly. Deliberately doesn't duplicate `session list`'s own stale/crashed
+worker detection. `--fix` only ever starts the daemon if it wasn't
+already running -- no config-file auto-repair, no other mutation.
 
 ## Embedding as a library
 

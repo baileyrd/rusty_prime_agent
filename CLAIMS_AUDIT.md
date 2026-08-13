@@ -518,7 +518,13 @@ above:
   in `cli.rs`; no path-based addressing exists at all, only UUIDs.
 - **"`prime-agent status`."** -- **True.** `daemon status` reports
   `protocol_version`/`pid`/`generation`/`sessions_active`.
-- **"`prime-agent doctor [--fix]`."** -- **False.** Confirmed absent.
+- **"`prime-agent doctor [--fix]`."** -- **Partial.** `harness doctor
+  [--fix]` now exists (`src/doctor.rs`): daemon reachability, whether
+  `rp-server` is on `PATH`, and whether `settings.json`/`auth.json`/
+  `providers.json` actually parse. `--fix` only ever starts the daemon
+  if it wasn't running -- no config-file auto-repair, no stale-worker
+  cleanup (already `session list`'s own job). See `PARITY.md`'s "Bounded
+  candidates batch 1" entry.
 - **"`prime-agent update [--force]`."** -- **Partial.** `harness update
   [--force]` now exists (`src/self_update.rs`), but it can't check any
   release channel the way `prime-agent`'s own (published to npm)
@@ -535,10 +541,14 @@ above:
   always unconditional.
 - **"Direct agent-to-agent communication: ...can discover one another,
   exchange messages, and steer active work."** -- **Partial.** `session
-  message`/`session children` deliver directly, but "steer active work"
-  has no analog -- `session_repl`'s stdin loop is fully synchronous, so
-  there's no way for one agent's message to interrupt another's in-flight
-  turn.
+  message`/`session children` deliver directly. "Steer active work" now
+  has a real, if separate, primitive: `session interrupt <id>`
+  (`protocol::Request::SessionInterrupt`, see `PARITY.md`'s "Bounded
+  candidates batch 1" entry) can stop a multi-round tool-calling turn
+  before its next round -- but `session message` doesn't call it
+  automatically, so one agent's message still doesn't *itself* interrupt
+  another's in-flight turn; that would need deliberate wiring this
+  increment didn't attempt.
 
 ## quickstart.md
 
@@ -618,10 +628,14 @@ above:
   in-flight reply lands (see `PARITY.md`'s "Interactive TUI: steering
   vs. follow-up message queue" entry). **Still False**: no `Enter`-vs-
   `Alt+Enter` keybinding distinction (there's exactly one behavior for a
-  submitted line while busy: queue it), no steering at all (interrupting
-  an in-flight prompt -- no cancellation primitive exists anywhere in
-  this project yet), and no queue reordering/editing UI once a line is
-  queued.
+  submitted line while busy: queue it), and no queue reordering/editing
+  UI once a line is queued. A real cancellation primitive exists now
+  (`session interrupt <id>`, see `PARITY.md`'s "Bounded candidates
+  batch 1" entry), but *this* REPL's own dispatch loop still can't use
+  it on itself -- any line typed while busy is unconditionally queued,
+  never dispatched immediately, so there's no way to type `/interrupt`
+  and have this same session act on it right away. A caller in a second
+  terminal/process can already interrupt a running turn today.
 - **Session flags: `-c`, `-r [path|id]`, `--no-session`, `--fork
   <path|id>`.** -- **Partial.** None exist as top-level flags; `--fork`
   exists only as the `session fork <id>` subcommand, keyed by UUID not
@@ -634,8 +648,9 @@ above:
   but requires an existing parent/child relationship rather than
   addressing any agent freely. `update` now exists too (`harness update
   [--force]`, a best-effort translation with no release channel behind
-  it -- see `PARITY.md`'s own "Self-update" entry). `doctor`, `package
-  *`, and `config` are all still absent.
+  it -- see `PARITY.md`'s own "Self-update" entry), and so does `doctor`
+  (`harness doctor [--fix]` -- see `PARITY.md`'s "Bounded candidates
+  batch 1" entry). `package *` and `config` are still absent.
 - **Model options: `--provider`, `--model`, `--api-key`, `--thinking`,
   `--models` (cycling).** -- **Partial.** `--model provider/id` and
   `--thinking low|medium|high` exist. No `--provider` flag (provider is
@@ -1106,13 +1121,17 @@ work, not yet decided or scheduled:
       caller" candidate anymore. Migrating `rlm_heartbeat` and adding the
       first real request `kind` (`rlm.run`) is tracked as ongoing work,
       not a followup.
-- [ ] **`daemon doctor [--fix]`.** No diagnostic/repair command exists.
-      A bounded first slice: check daemon-socket reachability, scan for
-      orphaned `worker.sock` files with no live process behind them
-      (`is_worker_alive` already does the liveness check `session
-      list` uses), and report findings; `--fix` could remove confirmed-
-      orphaned socket files. No self-repair beyond that without a much
-      larger scope.
+- [x] **`daemon doctor [--fix]`** -- shipped as a top-level `harness
+      doctor [--fix]` instead of a `daemon` subcommand (see `PARITY.md`'s
+      "Bounded candidates batch 1" entry). The bounded slice that
+      actually landed differs from what this bullet originally sketched:
+      daemon-socket reachability, whether `rp-server` is on `PATH`, and
+      whether `settings.json`/`auth.json`/`providers.json` parse as
+      valid JSON -- not orphaned-`worker.sock` scanning/removal, which
+      stays unimplemented (`session list`'s own `catalog::scan` already
+      reports a dead worker's session as `Crashed` via `is_worker_alive`,
+      so `doctor` deliberately didn't duplicate that). `--fix` only ever
+      starts the daemon if it wasn't running -- no socket cleanup.
 - [ ] **`/heartbeat status|pause|resume|clear` and a `--follow-up`
       flag.** Today's `/heartbeat`/`rlm_heartbeat(every=...)` are each a
       single implicit per-session trigger with no way to inspect,
@@ -1134,12 +1153,17 @@ work, not yet decided or scheduled:
 
 From the recursive doc-tree pass:
 
-- [ ] **A protocol-level cancel/abort `Request` variant.** `protocol.rs`
-      has no cancellation primitive of any kind today. Surfaced
-      independently by two different docs (rpc.md's `abort`, acp.md's
-      `session/cancel`) as a real prerequisite gap, not just an RPC
-      nicety -- worth its own bounded slice regardless of whether RPC
-      mode or a future ACP spike ever get there.
+- [x] **A protocol-level cancel/abort `Request` variant** -- shipped as
+      `Request::SessionInterrupt`/`harness session interrupt <id>` (see
+      `PARITY.md`'s "Bounded candidates batch 1" entry). Bounded, stated
+      honestly rather than as a full `abort`: it stops a multi-round
+      tool-calling turn before its *next* round, not a model call already
+      in flight to a real provider's HTTP endpoint (that would need
+      cooperative cancellation inside `ModelProvider::respond` itself,
+      still out of scope) -- so this is a real prerequisite primitive for
+      `rpc.md`'s `abort`/`acp.md`'s `session/cancel` to eventually build
+      on, not a claim that either is now wired up. Neither `--mode rpc`
+      nor a future ACP server currently calls it.
 - [ ] **Fix, or explicitly document, the `auth.json`-vs-env-var
       precedence inversion.** `providers.md` states the auth file takes
       priority over environment variables; `resolve_auth_env` does the

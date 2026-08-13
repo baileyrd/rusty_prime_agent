@@ -47,7 +47,10 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// detached supervisor and waits for its socket only if one isn't
 /// already reachable. `Some(pid)` if a fresh supervisor was spawned,
 /// `None` if one was already running.
-async fn ensure_daemon_started(state_root: &Path, exe_path: &Path) -> Result<Option<u32>> {
+pub(crate) async fn ensure_daemon_started(
+    state_root: &Path,
+    exe_path: &Path,
+) -> Result<Option<u32>> {
     let socket_path = paths::daemon_socket_path(state_root);
     if transport::probe(Context::Daemon, socket_path.clone()).await {
         return Ok(None);
@@ -187,6 +190,15 @@ async fn connect(state_root: &Path) -> Result<transport::LineStream> {
         })
 }
 
+/// A pure reachability probe -- `harness doctor`'s own "is the daemon
+/// up" check, using the exact same `transport::probe` `ensure_daemon_
+/// started` already checks with, but without the side effect of
+/// spawning one if it isn't.
+pub(crate) async fn daemon_reachable(state_root: &Path) -> bool {
+    let socket_path = paths::daemon_socket_path(state_root);
+    transport::probe(Context::Daemon, socket_path).await
+}
+
 pub async fn daemon_status(state_root: &Path, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::DaemonStatus)
@@ -227,6 +239,29 @@ pub async fn daemon_shutdown(state_root: &Path, mode: OutputMode) -> Result<()> 
         }
         other => Err(unexpected_response(other)),
     }
+}
+
+/// `harness doctor [--fix]` -- runs `doctor::run`'s fixed set of checks
+/// and renders the results. See `doctor`'s own module doc comment for
+/// exactly what's checked and what `--fix` does and doesn't do. Doesn't
+/// require a daemon to already be running (unlike almost every other
+/// subcommand) -- that's exactly one of the things it checks.
+pub async fn doctor(state_root: &Path, exe_path: &Path, fix: bool, mode: OutputMode) -> Result<()> {
+    let checks = crate::doctor::run(state_root, exe_path, fix).await?;
+    match mode {
+        OutputMode::Json => print_json(&checks),
+        OutputMode::Text => {
+            for check in &checks {
+                let status = match check.status {
+                    crate::doctor::CheckStatus::Ok => "ok",
+                    crate::doctor::CheckStatus::Warn => "warn",
+                    crate::doctor::CheckStatus::Error => "error",
+                };
+                println!("{}\t{status}\t{}", check.name, check.detail);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Shared by [`session_new`] and [`session_spawn`] -- the latter needs
@@ -2429,6 +2464,90 @@ pub async fn session_compact(
                     println!("nothing to compact (no model configured, or nothing old enough yet)")
                 }
                 _ => unreachable!(),
+            }
+            Ok(())
+        }
+        other => Err(unexpected_response(other)),
+    }
+}
+
+/// `harness session heartbeat <id> [--every DURATION]` -- a top-level
+/// CLI entry point into the same "continue toward the goal" re-entry
+/// mechanism `session_repl`'s own `/heartbeat`/`/heartbeat every
+/// <duration>` lines already cover, for a caller who wants it without an
+/// interactive REPL -- parity with `session compact` already existing
+/// alongside `/compact`. Deliberately a separate implementation from
+/// the REPL's own inline lines rather than a shared helper: the REPL
+/// tolerates a bad `/heartbeat every <duration>` by printing an error
+/// and continuing the loop, while this command validates `--every` at
+/// CLI-parse time (`cli::parse_duration_ms`, same as `session schedule
+/// add --every`) and is a hard usage error on a bad value -- the two
+/// call sites have different, correct error-handling contracts, not
+/// accidentally-duplicated logic.
+///
+/// No `Active` goal: prints an explanation and does nothing, the exact
+/// same non-error shape the REPL's own two `/heartbeat` lines already
+/// have. `every: None` sends the continuation prompt immediately
+/// (`send_prompt`); `every: Some(interval_ms)` registers a real
+/// recurring `ScheduleKind::Every` schedule instead (`schedule_add`) --
+/// listed/canceled the same way any other schedule is, no
+/// heartbeat-specific management surface.
+pub async fn session_heartbeat(
+    state_root: &Path,
+    session_id: String,
+    every: Option<u64>,
+    mode: OutputMode,
+) -> Result<()> {
+    let goal = fetch_goal(state_root, &session_id).await?;
+    let Some(goal) = goal.filter(|g| g.status == GoalStatus::Active) else {
+        println!("no active goal -- set one with `session goal set {session_id} <text...>` first");
+        return Ok(());
+    };
+    let continue_text = format!("Continue working toward the goal: {}", goal.text);
+    match every {
+        None => {
+            let entry = send_prompt(state_root, &session_id, continue_text).await?;
+            match mode {
+                OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
+                OutputMode::Text => print_entry(&entry),
+            }
+            Ok(())
+        }
+        Some(interval_ms) => {
+            schedule_add(
+                state_root,
+                session_id,
+                continue_text,
+                crate::protocol::ScheduleKind::Every { interval_ms },
+                mode,
+            )
+            .await
+        }
+    }
+}
+
+/// `harness session interrupt <id>` -- bounded parity with a slice of
+/// `prime-agent`'s "steering." See `protocol::Request::SessionInterrupt`'s
+/// own doc comment for exactly what this can and can't stop. Since the
+/// worker never checks whether a prompt was actually in flight before
+/// acking (see that request's own doc comment for why), this always
+/// prints the same plain confirmation -- there's no more precise, honest
+/// fact available to report.
+pub async fn session_interrupt(
+    state_root: &Path,
+    session_id: String,
+    mode: OutputMode,
+) -> Result<()> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &Request::SessionInterrupt { session_id })
+        .await?;
+    match read_response(&mut conn).await? {
+        response @ Response::SessionInterruptAck => {
+            match mode {
+                OutputMode::Json => print_json(&response),
+                OutputMode::Text => println!(
+                    "interrupt requested -- a multi-round tool-calling turn will stop at its next round boundary"
+                ),
             }
             Ok(())
         }

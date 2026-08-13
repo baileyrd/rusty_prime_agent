@@ -2614,6 +2614,91 @@ daemon/worker split rather than requiring the Python control environment:
   one), any aggregation/summary view over the raw JSONL, and any actual
   transmission anywhere -- there is nothing to disable for privacy
   beyond simply never setting `telemetry_enabled` in the first place.
+- [x] **Bounded candidates batch 1: `doctor`, `session heartbeat`,
+  cancel primitive.** Three small, independent, previously-unattempted
+  gaps closed together in one increment.
+
+  **`harness doctor [--fix]`** (`CLAIMS_AUDIT.md` previously confirmed
+  entirely absent) -- new `src/doctor.rs`, no daemon required (checking
+  reachability is one of its own checks). Deliberately doesn't duplicate
+  `session list`'s own `catalog::scan` (stale/crashed worker detection
+  via `worker_pid` liveness); instead checks what nothing else in this
+  project ever surfaces proactively: daemon reachability, whether
+  `rp-server` can be found on `PATH` (new `rp_server::
+  rp_server_available`, checks existence only -- deliberately never
+  *runs* `rp-server` with a guessed flag to probe it, since this project
+  doesn't control that binary's own CLI surface), and whether
+  `settings.json`/`auth.json`/`providers.json` actually parse as JSON --
+  a real, previously-invisible gap, since every one of `settings::load`/
+  `auth::load`/`providers::load` is deliberately permissive (a malformed
+  file silently reads as "no config," the right default for every other
+  caller, but it means a typo was otherwise undiscoverable). `--fix` is
+  narrow on purpose: it only ever starts the daemon if it wasn't already
+  running (the same idempotent spawn `daemon start` itself uses) --
+  never rewrites a config file or otherwise mutates state on the
+  caller's behalf, the same "no destructive action without an explicit,
+  separate ask" stance `self_update`'s own `--force` already takes.
+
+  **`harness session heartbeat <id> [--every DURATION]`** -- a top-level
+  CLI entry point into the exact same "continue toward the goal"
+  re-entry mechanism `session_repl`'s own `/heartbeat`/`/heartbeat every
+  <duration>` lines already cover (see the "`/heartbeat` and
+  `rlm_heartbeat()`" entry above), for a caller who wants it without an
+  interactive REPL -- parity with `session compact` already existing
+  alongside `/compact`. A deliberately *separate* implementation from
+  the REPL's own inline lines, not a shared helper: the REPL tolerates a
+  bad `/heartbeat every <duration>` by printing an error and continuing
+  the loop, while this command validates `--every` at CLI-parse time
+  (`cli::parse_duration_ms`, same as `session schedule add --every`) and
+  is a hard usage error on a bad value -- correct, different contracts
+  for the two call sites, not accidentally-duplicated logic.
+
+  **Cancel primitive** (`protocol::Request::SessionInterrupt`,
+  `harness session interrupt <id>`) -- see the "Needs a new subsystem"
+  section's own narrowed "Steering" entry for exactly what this can and
+  can't stop, and why REPL-integrated steering (typing `/interrupt` in
+  the *same* REPL session that's waiting on a reply) still isn't
+  attempted. What's real: `AgentSession` gains a `cancel_requested:
+  Arc<AtomicBool>` (`cancel_flag()` returns a clone), cleared at the
+  start of every `prompt_with_images_inner` call (so a flag left set
+  after one turn can never leak into cancelling an unrelated later one --
+  proven by a dedicated test) and checked once per tool-calling round,
+  before that round's own work starts. The worker's own `Request::
+  SessionInterrupt` handler deliberately never takes the session's own
+  lock to set it -- captured as a separate `Arc` clone *before* the
+  session is wrapped in its `Arc<Mutex<_>>`, specifically so setting it
+  doesn't have to wait behind an in-flight prompt that already holds
+  that lock for its whole duration, which would defeat the entire point.
+  `Response::SessionInterruptAck` carries no `interrupted: bool` --
+  stated honestly rather than a placeholder: the worker never checks
+  whether a prompt was actually in flight before acking (that would mean
+  taking the lock it's trying to avoid), so there's no truthful fact
+  available to report beyond "the flag was set."
+
+  Verified three ways: `tests/doctor.rs` (6 cases, real daemon spawn/
+  reachability, `--fix`, malformed/valid/missing config files, JSON
+  mode), `tests/heartbeat_cli.rs` (6 cases: no active goal, an active
+  goal sent immediately, `--every` registering a real recurring
+  schedule, a malformed `--every` rejected at parse time, interrupting
+  an idle session still acks cleanly and leaves it usable, interrupting
+  an unknown session id is a real error), and two new `session.rs` unit
+  tests using a purpose-built `AlwaysToolCallsProvider` test double
+  (`EchoProvider` never emits `ToolCalls` at all, so it can't drive a
+  real multi-round loop to interrupt) -- one proving a flag set while
+  round 1's provider call is "in flight" genuinely stops round 2 before
+  it starts (the provider is called exactly once, not twice), one
+  proving a flag left set *before* a new turn starts gets cleared rather
+  than spuriously cancelling that unrelated turn.
+
+  Still genuinely absent, stated rather than implied complete:
+  `doctor`'s checks don't cover stale worker detection (already
+  `session list`'s job) or a Python/`ipykernel` availability check;
+  `session heartbeat`/`/heartbeat` still have no heartbeat-specific
+  management surface (deliberate, see that entry's own "no separate
+  list/pause/resume/clear surface needed" reasoning); the cancel
+  primitive can't abort a model call already in flight to a real
+  provider's HTTP endpoint, and REPL-integrated steering (see the
+  narrowed "Steering" entry) is still not attempted.
 
 ## Needs a new subsystem
 
@@ -2650,25 +2735,30 @@ attempted here, and not silently implied by anything in
   system, a provider registry, a modal dialog protocol with no rendering
   substrate to build it on) that picking any one of them up is its own
   future increment, not a continuation of this one.
-- **"Steering"** -- interrupting an already-in-flight prompt instead of
-  queuing a follow-up behind it (the other half of `prime-agent`'s
-  "steering vs. follow-up queuing" surface; the follow-up-queuing half
-  is done, see the medium-effort section's own "Interactive TUI:
-  steering vs. follow-up message queue" entry for the full story of what
-  landed there and why this half specifically didn't). Investigated, not
-  assumed: there is no cancellation primitive anywhere in this project's
-  protocol/daemon/worker layers today -- no `Request::SessionInterrupt`,
-  nothing a client could send to abort a `session.lock().await`-held
-  `prompt()` call already running server-side. A client dropping its own
-  connection or spawned task wouldn't cancel the daemon's own in-flight
-  work either; the worker would keep processing the abandoned prompt and
-  could append a stray, unrequested reply to the transcript later,
-  incoherent with whatever the "steering" message produced instead. A
-  real fix needs an actual interrupt primitive threaded through
-  `daemon`/`worker`/`session.rs` -- tracked as its own item (see the
-  "Bounded candidates" batches' own "cancel primitive" entry), not
-  something the REPL's own input-handling increment can absorb as a
-  side effect.
+- **"Steering," the REPL-integrated half.** Interrupting an already-in-
+  flight prompt *from the same REPL session that's waiting on it*
+  (typing while a reply is generating and having it actually cancel that
+  reply) is the other half of `prime-agent`'s "steering vs. follow-up
+  queuing" surface; the follow-up-queuing half is done (see the medium-
+  effort section's own "Interactive TUI: steering vs. follow-up message
+  queue" entry). A real cancellation primitive now exists (`Request::
+  SessionInterrupt`, see the medium-effort section's own "Bounded
+  candidates batch 1" entry) -- what's still missing is wiring it into
+  `session_repl`'s own dispatch loop: today, any line typed while a
+  prompt is in flight is queued (`Wake::Reader` unconditionally pushes
+  onto `queue`, see that loop's own doc comment), never dispatched
+  immediately, so there's no way to type `/interrupt` and have *this*
+  REPL act on it right away rather than after the current reply lands
+  -- it would need its own bypass of the queue, a REPL-loop change this
+  batch didn't attempt. A caller in a *second* terminal/process can
+  already interrupt a running turn today via `session interrupt <id>`
+  (a genuinely different process, so no queue to bypass) -- see
+  `protocol::Request::SessionInterrupt`'s own doc comment for exactly
+  what that can and can't stop (a multi-round tool-calling turn stops
+  before its next round; a model call already in flight to a real
+  provider's HTTP endpoint can't be aborted mid-request without
+  cooperative cancellation inside `ModelProvider::respond` itself, out
+  of scope here too).
 - **Mid-session `/model`/`/effort` switching, `/usage`, `/mcp
   login|logout`.** Surfaced (not previously named as their own bullet)
   while scoping the "full slash-command surface" entry above. Model and
