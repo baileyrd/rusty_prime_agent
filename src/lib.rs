@@ -65,6 +65,7 @@ mod self_update;
 mod settings;
 mod sha256;
 mod skills;
+mod telemetry;
 mod termctl;
 mod theme;
 mod tools;

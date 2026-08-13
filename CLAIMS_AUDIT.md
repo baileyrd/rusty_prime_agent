@@ -1006,14 +1006,22 @@ tables:
 - **`theme`.** -- **Closed.** `Settings` now has a `theme: Option<String>`
   field (`"dark"`/`"light"`, or a path to a custom theme JSON file) --
   see `PARITY.md`'s "Themes: token spec + TUI renderer" entry.
+- **`telemetry.*`.** -- **Partial.** `Settings` now has a single
+  `telemetry_enabled: Option<bool>` field (opt-in, off unless explicitly
+  `true`) -- not the full `telemetry.*` key family `prime-agent`'s own
+  `settings.md` presumably documents (an endpoint/collector config this
+  project has no equivalent of), just an on/off switch for a local-only
+  event log. See `PARITY.md`'s "Telemetry: opt-in settings + local-only
+  stub" entry.
 - **`defaultProvider`/`defaultModel`/`defaultThinkingLevel`,
-  update-check settings, `telemetry.*`, `retry.*`, `branchSummary.*`,
+  update-check settings, `retry.*`, `branchSummary.*`,
   `steeringMode`/`followUpMode`, `terminal.*`/`images.*`, `shellPath`,
   `idleEvictionMinutes`, `sessionDir`, `enabledModels`,
   `markdown.codeBlockIndent`, resource-array settings (`packages`,
   `extensions`, `skills`, `prompts`, `themes`).** -- **False, all of
   them.** None exist as `Settings` fields -- confirmed by the struct's
-  complete field list (three fields as of `theme`'s addition above).
+  complete field list (four fields as of `telemetry_enabled`'s addition
+  above).
 - **Two-tier global+project precedence with nested merge.** --
   **False.** Global-only, single file, no merge logic, already stated
   as deliberate in `PARITY.md`.
