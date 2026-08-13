@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Context, HarnessError, Result};
 
@@ -53,7 +53,7 @@ use crate::error::{Context, HarnessError, Result};
 /// indefinitely.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderAuth {
     pub key: String,
 }
@@ -118,6 +118,32 @@ pub async fn resolve_key(raw: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Writes (inserting or overwriting) one `<provider>` entry in
+/// `<state_root>/auth.json` -- the save half of `client::session_repl`'s
+/// `/login` wizard (see that module's own doc comment for the full
+/// design story, including why this is an interactive `auth.json` editor
+/// rather than a real OAuth client). `key` is stored as a literal string,
+/// never a `!command`; a caller who wants shell-command resolution can
+/// still hand-edit the file afterward, same as before this function
+/// existed -- `/login` only ever needs to write what a human just typed.
+/// Every other entry already in the file is preserved (`load`'s own
+/// permissive "malformed/missing reads as empty" behavior means a
+/// corrupt file is silently replaced with just this one entry, the same
+/// tradeoff `load` already accepts elsewhere).
+pub fn write_key(state_root: &Path, provider: &str, key: &str) -> Result<()> {
+    let mut auth = load(state_root);
+    auth.insert(
+        provider.to_string(),
+        ProviderAuth {
+            key: key.to_string(),
+        },
+    );
+    let path = state_root.join("auth.json");
+    let json = serde_json::to_string_pretty(&auth)
+        .map_err(|e| HarnessError::json(Context::Provider, None, e))?;
+    std::fs::write(&path, json).map_err(|e| HarnessError::io(Context::Provider, Some(path), e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +202,39 @@ mod tests {
     async fn resolve_key_reports_a_failing_command_loudly() {
         let err = resolve_key("!exit 1").await.unwrap_err();
         assert!(err.to_string().contains("exited with"), "got: {err}");
+    }
+
+    #[test]
+    fn write_key_creates_the_file_when_none_existed() {
+        let root = temp_state_root("write-new");
+        write_key(&root, "openai", "sk-new-123").unwrap();
+        let auth = load(&root);
+        assert_eq!(auth.get("openai").unwrap().key, "sk-new-123");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_key_preserves_other_providers_already_present() {
+        let root = temp_state_root("write-preserve");
+        std::fs::write(
+            root.join("auth.json"),
+            r#"{"anthropic": {"key": "sk-anthropic-old"}}"#,
+        )
+        .unwrap();
+        write_key(&root, "openai", "sk-openai-new").unwrap();
+        let auth = load(&root);
+        assert_eq!(auth.get("anthropic").unwrap().key, "sk-anthropic-old");
+        assert_eq!(auth.get("openai").unwrap().key, "sk-openai-new");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_key_overwrites_an_existing_entry_for_the_same_provider() {
+        let root = temp_state_root("write-overwrite");
+        write_key(&root, "openai", "sk-old").unwrap();
+        write_key(&root, "openai", "sk-new").unwrap();
+        let auth = load(&root);
+        assert_eq!(auth.get("openai").unwrap().key, "sk-new");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

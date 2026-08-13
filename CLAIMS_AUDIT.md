@@ -536,7 +536,12 @@ above:
 
 - **`ANTHROPIC_API_KEY` env var / `/login` API-key path.** -- **True in
   substance** for the env-var half (`auth.json` with env-var precedence
-  already covered); OAuth `/login` already confirmed False.
+  already covered); OAuth `/login` stays **False** (no Prime Intellect
+  account system to authenticate against), but `session_repl`'s own
+  `/login` now exists as an interactive `auth.json`-setup wizard reaching
+  the same "configured model backend" destination this quickstart
+  describes `/login` and the env-var path as two alternatives for -- see
+  `PARITY.md`'s "`/login`: interactive provider-setup wizard" entry.
 - **"Restart, or run `/reload`, after changing context files."** --
   **Partial.** Restarting works (context files are re-read fresh every
   `build_turns` call); no `/reload` command exists in `session_repl`.
@@ -586,12 +591,14 @@ above:
   only command), `/session` (list-only, not the full interactive
   picker), `/model` (list-only, not mid-session switching), `/reload`
   (a confirmation, not a missing mechanism -- context files already
-  re-read fresh every turn), `/new`, and `/resume`. **Still absent, real
-  gaps**: `/login` (no account system to log into), mid-session `/model
-  <name>`/`/effort <level>` switching (no protocol support to mutate an
-  already-running session), `/clone`, `/share`. `/usage` and `/mcp
-  login|logout` are also absent, for the same "no underlying data
-  model/primitive exists" reason.
+  re-read fresh every turn), `/new`, `/resume`, and (closed since --
+  bounded, not the real OAuth flow, see `PARITY.md`'s own entry) `/login`
+  as an interactive `auth.json`-setup wizard. **Still absent, real
+  gaps**: `/login`'s actual OAuth half (no account system to log into),
+  mid-session `/model <name>`/`/effort <level>` switching (no protocol
+  support to mutate an already-running session), `/clone`, `/share`.
+  `/usage` and `/mcp login|logout` are also absent, for the same "no
+  underlying data model/primitive exists" reason.
 - **`/export [file]` exports to HTML.** -- **Partial.** `/export <path>`
   exists but writes pretty-printed JSON, not HTML.
 - **`/share` (upload as a private gist).** -- **False**, already tracked

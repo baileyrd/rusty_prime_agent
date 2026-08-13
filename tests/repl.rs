@@ -805,3 +805,69 @@ fn repl_unknown_extension_command_reports_a_friendly_message() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// `/login` walks through its own two-question wizard (provider, then
+/// key), reading each answer off the same `line_rx` channel every other
+/// line in this REPL already flows through -- see `client::session_repl`'s
+/// own `/login` doc comment. No real provider or OAuth backend needed:
+/// this only proves the wizard writes what it's told to `auth.json`.
+#[test]
+fn repl_login_wizard_saves_the_entered_key_to_auth_json() {
+    let state_dir = common::TempDir::new("repl-login");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(
+        state_dir.path(),
+        &session_id,
+        "/login\nopenai\nsk-test-key-123\n",
+    );
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("saved --"), "got: {stdout}");
+
+    let auth_json = std::fs::read_to_string(state_dir.path().join("auth.json"))
+        .expect("auth.json should have been written");
+    let auth: serde_json::Value = serde_json::from_str(&auth_json).unwrap();
+    assert_eq!(auth["openai"]["key"], "sk-test-key-123");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// Answering `/login` with an unrecognized provider name reports a
+/// friendly error and writes nothing, rather than silently accepting an
+/// entry `known_providers` would never activate.
+#[test]
+fn repl_login_wizard_rejects_an_unknown_provider() {
+    let state_dir = common::TempDir::new("repl-login-unknown");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/login\nnot-a-provider\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("unknown provider"), "got: {stdout}");
+    assert!(
+        !state_dir.path().join("auth.json").exists(),
+        "auth.json should not have been written for an unknown provider"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// A blank provider answer cancels the wizard cleanly instead of
+/// treating an empty line as a provider name.
+#[test]
+fn repl_login_wizard_cancels_on_a_blank_provider_answer() {
+    let state_dir = common::TempDir::new("repl-login-cancel");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let out = run_repl(state_dir.path(), &session_id, "/login\n\n");
+    common::assert_success("session repl", &out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cancelled"), "got: {stdout}");
+    assert!(!state_dir.path().join("auth.json").exists());
+
+    common::daemon_shutdown(state_dir.path());
+}
