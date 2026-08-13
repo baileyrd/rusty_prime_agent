@@ -336,15 +336,27 @@ slice).
 
 Real, importable Python packages for `session new --runtime ipython`
 sessions. Drop a directory into `<state-dir>/skills/<name>/`: a
-`SKILL.md` (`description` frontmatter) alongside a real Python package
-(`__init__.py`). The kernel gets the skills directory added to its
-`sys.path` on startup, so the model can `import <name>` directly --
-`session new --runtime ipython`'s `execute_python` tool description
-lists what's installed.
+`SKILL.md` (`description`/`license`/`compatibility`/
+`disable-model-invocation` frontmatter -- the last three are shown by
+`skill list` below, and only `disable-model-invocation` changes any
+actual behavior) alongside a real Python package (`__init__.py`). The
+kernel gets the skills directory added to its `sys.path` on startup, so
+the model can `import <name>` directly -- `session new --runtime
+ipython`'s `execute_python` tool description lists what's installed,
+except a skill whose own `SKILL.md` sets `disable-model-invocation:
+true`, which is never advertised to the model at all (still importable
+if the model somehow already knew the name; a human can always reach it
+on purpose with `/skill:<name>` in the REPL, below).
 
 ```sh
 harness skill list
 ```
+
+In `session repl`, `/skill:<name> [args...]` explicitly asks the model
+to use a given skill (composing an instruction and sending it as an
+ordinary prompt) rather than waiting for the model to notice it's
+relevant on its own -- this is the one way to reach a
+`disable-model-invocation` skill.
 
 ### Extensions
 
@@ -442,16 +454,22 @@ own `auth.json`:
 }
 ```
 
-A `key` is either a literal string, used as-is, or a string prefixed
-with `!`, whose remainder runs as a shell command (`sh -c`/`cmd /C`);
-its trimmed stdout becomes the key. An already-set env var
+A `key` is resolved in this order: a string prefixed with `!` runs the
+remainder as a shell command (`sh -c`/`cmd /C`) and uses its trimmed
+stdout; otherwise, a value shaped like a bare env-var-name identifier
+(e.g. `"MY_KEY"`) is looked up via that env var if it's actually set
+(`{"key": "MY_KEY"}` reads the env var named `MY_KEY`, it does not use
+the literal string `"MY_KEY"` as the key); otherwise the value is used
+as a literal string, unchanged. An already-set env var
 (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GROQ_API_KEY`)
 always wins over an `auth.json` entry for that same provider -- the
-command is never even run in that case. `harness model list` (no
-`--detailed`) only checks whether an `auth.json` entry *exists*, never
-running a `!command` as a side effect of listing; the command only ever
-runs when a real `rp-server` sidecar is actually starting up. Global
-only, same cwd-visibility reason `settings.json` is.
+command is never even run in that case, and this is a deliberate,
+permanent choice, not a bug (`prime-agent` itself documents the opposite
+precedence). `harness model list` (no `--detailed`) only checks whether
+an `auth.json` entry *exists*, never running a `!command` as a side
+effect of listing; the command only ever runs when a real `rp-server`
+sidecar is actually starting up. Global only, same cwd-visibility reason
+`settings.json` is.
 
 `session repl`'s `/login` (see [Interactive REPL](#interactive-repl)
 above) is an interactive wizard around this same file for a caller who'd

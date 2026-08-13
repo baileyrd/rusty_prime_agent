@@ -791,13 +791,19 @@ above:
 ## skills.md
 
 - **Agent Skills standard validation (`name` format/length rules,
-  directory-match check, lenient warnings on violation).** -- **False.**
-  `skills::discover` only ever reads the `description` field; `name`,
-  length rules, and the directory-match check are never read or
-  validated, and there's no warning mechanism of any kind.
+  directory-match check, lenient warnings on violation).** -- **Partial.**
+  `skills::discover` now also reads `license`/`compatibility`/
+  `disable-model-invocation`, and a `name:` field mismatching the skill's
+  own directory produces a lenient (warn, don't fail) `Skill::warnings`
+  entry, surfaced through `harness skill list` -- see `PARITY.md`'s
+  "Bounded candidates batch 4" entry. **Still False**: no `name` format
+  or length rules are validated at all (only the directory-match check).
 - **`disable-model-invocation: true` + `/skill:name` explicit invoke.**
-  -- **False.** Neither half exists -- the field is never read, and no
-  `/skill:name` command surface exists anywhere.
+  -- **True.** Both halves now exist: a flagged skill is filtered out of
+  the model-facing `execute_python` tool description entirely
+  (`AgentSession::execute_python_tool_def_with_skills`), and
+  `session_repl`'s `/skill:<name> [args...]` command reaches any skill
+  (flagged or not) explicitly.
 - **"Skills with missing description are not loaded."** -- **False**,
   inverted: a dedicated unit test
   (`a_skill_with_no_description_field_still_discovers_with_none`) proves
@@ -981,15 +987,17 @@ future spike:
   -- **False, and inverted.** `resolve_auth_env` explicitly skips
   `auth.json` once the matching env var is set -- env var wins, the
   opposite of the documented precedence. This is a real, deliberate
-  divergence already stated plainly in `PARITY.md`'s own `auth.json`
-  entry, not an oversight -- but it means this specific upstream
-  sentence is false as a description of actual behavior here.
+  divergence, now stated as a permanent one directly in `PARITY.md`'s own
+  `auth.json` entry (see "Bounded candidates batch 4") rather than left
+  implicit -- but it still means this specific upstream sentence is false
+  as a description of actual behavior here, and stays that way on
+  purpose.
 - **Key resolution: shell command, env-var-name indirection, or
-  literal.** -- **Partial.** Literal and `!command` both work; the
-  env-var-name-indirection form does not -- any non-`!`-prefixed string
-  is sent as a literal value, so `{"key": "MY_KEY"}` would ship the
-  literal string `"MY_KEY"` as a credential rather than looking up an
-  env var of that name.
+  literal.** -- **True.** Literal, `!command`, and env-var-name
+  indirection (`{"key": "MY_KEY"}`, a non-`!`-prefixed value shaped like
+  a bare identifier is looked up via `std::env::var` before falling back
+  to being used literally) all work now -- see `PARITY.md`'s "Bounded
+  candidates batch 4" entry.
 - **Cloud providers (Azure/Bedrock/Cloudflare/Vertex-specific auth
   flows).** -- **False.** Zero cloud-specific code exists anywhere.
 
@@ -1175,33 +1183,28 @@ From the recursive doc-tree pass:
       `rpc.md`'s `abort`/`acp.md`'s `session/cancel` to eventually build
       on, not a claim that either is now wired up. Neither `--mode rpc`
       nor a future ACP server currently calls it.
-- [ ] **Fix, or explicitly document, the `auth.json`-vs-env-var
-      precedence inversion.** `providers.md` states the auth file takes
-      priority over environment variables; `resolve_auth_env` does the
-      opposite (env var always wins, `auth.json` never even consulted
-      once the var is set) -- already a deliberate, stated design choice
-      in `PARITY.md`'s own `auth.json` entry, but worth a one-line note
-      there marking it as a permanent divergence from upstream's
-      documented contract rather than an open gap.
-- [ ] **Env-var-name indirection in `auth::resolve_key`.** Only literal
-      and `!command` forms exist; upstream's third form (`{"key":
-      "MY_KEY"}` meaning "look up this named env var") is silently
-      treated as a literal today, which would ship a garbage literal
-      string as a credential if anyone copied that pattern from
-      upstream's own docs. Bounded fix: try `std::env::var(raw)` when
-      `raw` matches a bare-identifier shape and isn't `!`-prefixed,
-      falling back to literal otherwise.
-- [ ] **Skill frontmatter validation beyond `description`.** `skills::
-      discover` only ever reads `description`; `name`/`license`/
-      `compatibility`/`disable-model-invocation` are silently ignored.
-      `frontmatter::parse` already returns the full field map -- a
-      bounded slice adds the remaining fields plus lenient (warn, don't
-      fail) validation surfaced through `harness skill list`.
-- [ ] **`disable-model-invocation` + a `/skill:name` explicit-invoke
-      command.** Two small, separable pieces: skip a flagged skill in
-      the `execute_python` tool description, and a `/skill:name [args]`
-      `session_repl` command in the same shape as the existing `/fork`/
-      `/export` commands.
+- [x] **Fix, or explicitly document, the `auth.json`-vs-env-var
+      precedence inversion** -- documented: `PARITY.md`'s own `auth.json`
+      entry now states outright that env-var-wins is a permanent,
+      intentional divergence from `providers.md`'s documented opposite
+      order, not an open gap. No behavior changed.
+- [x] **Env-var-name indirection in `auth::resolve_key`** -- shipped:
+      `looks_like_env_var_name` (`^[A-Za-z_][A-Za-z0-9_]*$`) gates a
+      `std::env::var` lookup attempt for a non-`!`-prefixed value shaped
+      like a bare identifier, falling back to the literal when no such
+      env var is set -- exactly the bounded fix this bullet sketched.
+- [x] **Skill frontmatter validation beyond `description`** -- shipped:
+      `skills::Skill` gained `license`/`compatibility`/
+      `disable_model_invocation` fields plus a `name:`-mismatch
+      `warnings` entry (lenient -- warn, don't fail), all surfaced
+      through `harness skill list`.
+- [x] **`disable-model-invocation` + a `/skill:name` explicit-invoke
+      command** -- shipped, both pieces: `AgentSession::
+      execute_python_tool_def_with_skills` filters a flagged skill out of
+      the model-facing tool description entirely, and `session_repl`
+      gained `/skill:<name> [args...]`, the same command shape `/fork`/
+      `/export` already have, reaching any skill (flagged or not) by
+      composing an instruction and sending it as an ordinary prompt.
 - [x] **Turn-boundary-aware compaction cut points** -- shipped as
       `adjust_fold_count_to_turn_boundary` (see `PARITY.md`'s "Bounded
       candidates batch 2" entry), exactly the bounded fix this bullet

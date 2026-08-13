@@ -18,6 +18,19 @@
 //! than a hard error, the same permissive stance `settings::load`
 //! already takes.
 //!
+//! A third `key` form, parity with `prime-agent`'s own named-env-var-
+//! lookup shape (`{"key": "MY_KEY"}` meaning "read this env var", not
+//! "use the literal string `MY_KEY`"): a value that looks like a bare
+//! identifier (`^[A-Za-z_][A-Za-z0-9_]*$`, not `!`-prefixed) is tried
+//! against `std::env::var` first, falling back to the literal string
+//! only if no such env var is actually set. This is deliberately
+//! conservative -- a real API key almost never has that exact shape
+//! (`sk-...`/`sk-ant-...`/etc. all contain a hyphen, which fails the
+//! identifier check outright), and even one that happens to match only
+//! changes behavior if an env var of that exact name is also set, which
+//! was already true before this indirection existed (env var always
+//! wins over `auth.json` regardless).
+//!
 //! Executing a command named in a config file this project's own single
 //! local user controls is the same trust model `session_autonomous
 //! --quality-gate` and recursive subagents already accept (see
@@ -70,17 +83,23 @@ pub fn load(state_root: &Path) -> Auth {
         .unwrap_or_default()
 }
 
-/// Resolves one `auth.json` `key` value: a literal string as-is, or (a
-/// string prefixed with `!`) the trimmed stdout of running the rest as a
-/// shell command (`sh -c` on Unix, `cmd /C` on Windows -- the same
-/// cross-platform split `client::run_quality_gate` already uses for an
-/// identical "arbitrary shell command from user config" need). A
-/// non-zero exit, or exceeding [`RESOLVE_TIMEOUT`], is a loud error, not
-/// a silent "unconfigured" -- a caller who wrote a `!command` clearly
-/// expects it to work, unlike a provider with no `auth.json` entry at
-/// all.
+/// Resolves one `auth.json` `key` value: a string prefixed with `!` runs
+/// the rest as a shell command and uses its trimmed stdout (see below);
+/// otherwise, if the whole value looks like a bare env-var-name
+/// identifier and that env var is actually set, its value is used (see
+/// this module's own doc comment for the named-env-var-lookup form);
+/// otherwise the value is used as a literal string, unchanged. A
+/// non-zero `!command` exit, or exceeding [`RESOLVE_TIMEOUT`], is a loud
+/// error, not a silent "unconfigured" -- a caller who wrote a `!command`
+/// clearly expects it to work, unlike a provider with no `auth.json`
+/// entry at all.
 pub async fn resolve_key(raw: &str) -> Result<String> {
     let Some(command) = raw.strip_prefix('!') else {
+        if looks_like_env_var_name(raw) {
+            if let Ok(value) = std::env::var(raw) {
+                return Ok(value);
+            }
+        }
         return Ok(raw.to_string());
     };
 
@@ -116,6 +135,23 @@ pub async fn resolve_key(raw: &str) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether `raw` has the shape of a bare env-var-name identifier
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`) -- the trigger [`resolve_key`] uses to
+/// even attempt the named-env-var-lookup form, before checking whether
+/// an env var of that name is actually set. Deliberately not
+/// case-restricted (a real env var name is conventionally
+/// `SCREAMING_SNAKE_CASE`, but nothing stops a caller from configuring
+/// or reading a lowercase one) -- the actual safety net is that
+/// `std::env::var` still has to succeed for this to change anything.
+fn looks_like_env_var_name(raw: &str) -> bool {
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Writes (inserting or overwriting) one `<provider>` entry in
@@ -202,6 +238,57 @@ mod tests {
     async fn resolve_key_reports_a_failing_command_loudly() {
         let err = resolve_key("!exit 1").await.unwrap_err();
         assert!(err.to_string().contains("exited with"), "got: {err}");
+    }
+
+    #[test]
+    fn looks_like_env_var_name_accepts_identifiers_and_rejects_everything_else() {
+        assert!(looks_like_env_var_name("MY_KEY"));
+        assert!(looks_like_env_var_name("_leading_underscore"));
+        assert!(looks_like_env_var_name("lowercase_ok_too"));
+        assert!(!looks_like_env_var_name(""));
+        assert!(!looks_like_env_var_name("sk-literal-123"));
+        assert!(!looks_like_env_var_name("has space"));
+        assert!(!looks_like_env_var_name("9starts_with_digit"));
+    }
+
+    /// Guards the two tests below: both set/clear the same process-wide
+    /// env var, the same "can't run concurrently under `cargo test`'s
+    /// default parallelism" reasoning `session.rs`'s own `COMPACT_ENV_
+    /// GUARD`/`rp_server.rs`'s own `PROVIDER_ENV_GUARD` already document
+    /// -- dropped before the `resolve_key` call each test actually
+    /// awaits, same as `PROVIDER_ENV_GUARD`'s own tests, so a
+    /// `std::sync::MutexGuard` is never held across an `.await`.
+    static ENV_VAR_INDIRECTION_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[rusty_tokio::test]
+    async fn resolve_key_looks_up_a_named_env_var_when_it_is_set() {
+        {
+            let _guard = ENV_VAR_INDIRECTION_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::set_var("RPA_TEST_AUTH_ENV_INDIRECTION", "value-from-env");
+        }
+        assert_eq!(
+            resolve_key("RPA_TEST_AUTH_ENV_INDIRECTION").await.unwrap(),
+            "value-from-env"
+        );
+        std::env::remove_var("RPA_TEST_AUTH_ENV_INDIRECTION");
+    }
+
+    #[rusty_tokio::test]
+    async fn resolve_key_falls_back_to_the_literal_when_the_named_env_var_is_unset() {
+        {
+            let _guard = ENV_VAR_INDIRECTION_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::remove_var("RPA_TEST_AUTH_ENV_INDIRECTION_UNSET");
+        }
+        assert_eq!(
+            resolve_key("RPA_TEST_AUTH_ENV_INDIRECTION_UNSET")
+                .await
+                .unwrap(),
+            "RPA_TEST_AUTH_ENV_INDIRECTION_UNSET"
+        );
     }
 
     #[test]

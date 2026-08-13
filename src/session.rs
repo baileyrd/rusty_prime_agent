@@ -884,12 +884,22 @@ impl AgentSession {
     /// can `import` without a human having to say so in the prompt.
     /// Recomputed on every `prompt` call, same as `enabled_tool_defs`'s
     /// other sources: a skill installed (or removed) between prompts is
-    /// picked up without needing a session restart.
+    /// picked up without needing a session restart. A skill whose own
+    /// `SKILL.md` sets `disable-model-invocation: true` is filtered out
+    /// here entirely -- still importable, still on the kernel's
+    /// `sys.path` (`worker::bootstrap_kernel` doesn't consult this flag
+    /// at all), just never advertised to the model as something it can
+    /// reach for on its own. A human can still reach it on purpose via
+    /// `client::session_repl`'s `/skill:<name>` command.
     fn execute_python_tool_def_with_skills(&self) -> Result<ToolDef> {
         let mut def = crate::tools::execute_python_tool_def();
         let skills = crate::skills::discover(&self.state_root)?;
-        if !skills.is_empty() {
-            let listed: Vec<String> = skills
+        let advertised: Vec<&crate::skills::Skill> = skills
+            .iter()
+            .filter(|s| !s.disable_model_invocation)
+            .collect();
+        if !advertised.is_empty() {
+            let listed: Vec<String> = advertised
                 .iter()
                 .map(|s| match &s.description {
                     Some(d) => format!("{} — {d}", s.name),
@@ -898,7 +908,7 @@ impl AgentSession {
                 .collect();
             def.description.push_str(&format!(
                 " Available skills, importable directly (e.g. `import {}`): {}.",
-                skills[0].name,
+                advertised[0].name,
                 listed.join("; ")
             ));
         }
@@ -2575,6 +2585,109 @@ mod tests {
         assert_eq!(turns.len(), 1, "got: {turns:?}");
         assert_eq!(turns[0].role, TurnRole::System);
         assert_eq!(turns[0].content.as_deref(), Some("be terse"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn write_skill(state_root: &Path, name: &str, manifest: &str) {
+        let dir = crate::paths::global_skills_dir(state_root).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), manifest).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn execute_python_tool_def_with_skills_advertises_an_ordinary_skill() {
+        let root = temp_state_root("skills-advertised");
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\n---\n",
+        );
+
+        let session = AgentSession::create(
+            &root,
+            "sess-skills-advertised".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let def = session.execute_python_tool_def_with_skills().unwrap();
+        assert!(
+            def.description.contains("weather"),
+            "got: {}",
+            def.description
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn execute_python_tool_def_with_skills_omits_a_disabled_skill() {
+        let root = temp_state_root("skills-disabled");
+        write_skill(
+            &root,
+            "internal_only",
+            "---\ndescription: not for the model\ndisable-model-invocation: true\n---\n",
+        );
+
+        let session = AgentSession::create(
+            &root,
+            "sess-skills-disabled".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let def = session.execute_python_tool_def_with_skills().unwrap();
+        assert!(
+            !def.description.contains("internal_only"),
+            "a disable-model-invocation skill must not be advertised, got: {}",
+            def.description
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn execute_python_tool_def_with_skills_advertises_the_rest_even_with_one_disabled() {
+        let root = temp_state_root("skills-mixed");
+        write_skill(
+            &root,
+            "internal_only",
+            "---\ndescription: not for the model\ndisable-model-invocation: true\n---\n",
+        );
+        write_skill(
+            &root,
+            "weather",
+            "---\ndescription: fetch weather data\n---\n",
+        );
+
+        let session = AgentSession::create(
+            &root,
+            "sess-skills-mixed".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let def = session.execute_python_tool_def_with_skills().unwrap();
+        assert!(
+            def.description.contains("weather"),
+            "got: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains("internal_only"),
+            "got: {}",
+            def.description
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
