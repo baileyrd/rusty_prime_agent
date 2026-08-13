@@ -122,17 +122,19 @@ const DEFAULT_COMPACT_TRIGGER_TOKENS: usize = 6_000;
 /// reason as the trigger threshold above.
 const DEFAULT_COMPACT_KEEP_RECENT_TOKENS: usize = 2_000;
 
-fn compact_trigger_tokens() -> usize {
+fn compact_trigger_tokens(state_root: &Path) -> usize {
     std::env::var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
+        .or_else(|| crate::settings::load(state_root).compact_trigger_tokens)
         .unwrap_or(DEFAULT_COMPACT_TRIGGER_TOKENS)
 }
 
-fn compact_keep_recent_tokens() -> usize {
+fn compact_keep_recent_tokens(state_root: &Path) -> usize {
     std::env::var("RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
+        .or_else(|| crate::settings::load(state_root).compact_keep_recent_tokens)
         .unwrap_or(DEFAULT_COMPACT_KEEP_RECENT_TOKENS)
 }
 
@@ -802,7 +804,7 @@ impl AgentSession {
             .iter()
             .map(|t| estimate_tokens(t.content.as_deref().unwrap_or("")))
             .sum();
-        if total <= compact_trigger_tokens() {
+        if total <= compact_trigger_tokens(&self.state_root) {
             return Ok(());
         }
         self.compact_now(None).await?;
@@ -841,7 +843,8 @@ impl AgentSession {
             .filter(|e| e.sequence > already_compacted_seq)
             .cloned()
             .collect();
-        let fold_count = find_compaction_fold_count(&candidates, compact_keep_recent_tokens());
+        let fold_count =
+            find_compaction_fold_count(&candidates, compact_keep_recent_tokens(&self.state_root));
         if fold_count == 0 {
             return Ok((
                 false,
@@ -1309,5 +1312,80 @@ mod tests {
     #[test]
     fn find_compaction_fold_count_empty_candidates_folds_nothing() {
         assert_eq!(find_compaction_fold_count(&[], 100), 0);
+    }
+
+    /// Guards the two tests below: both mutate the *same* process-wide
+    /// env vars `compact_trigger_tokens`/`compact_keep_recent_tokens`
+    /// read, so they can't run concurrently with each other (or with a
+    /// stray reader) the way ordinary `#[test]`s otherwise would under
+    /// `cargo test`'s default parallelism.
+    static COMPACT_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn compact_trigger_tokens_falls_back_to_settings_json_when_env_var_unset() {
+        let _guard = COMPACT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS");
+        let root = temp_state_root("compact-trigger-settings");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compact_trigger_tokens": 999}"#,
+        )
+        .unwrap();
+        assert_eq!(compact_trigger_tokens(&root), 999);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compact_trigger_tokens_env_var_wins_over_settings_json() {
+        let _guard = COMPACT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS", "111");
+        let root = temp_state_root("compact-trigger-env-wins");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compact_trigger_tokens": 999}"#,
+        )
+        .unwrap();
+        assert_eq!(compact_trigger_tokens(&root), 111);
+        std::env::remove_var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compact_keep_recent_tokens_falls_back_to_settings_json_when_env_var_unset() {
+        let _guard = COMPACT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS");
+        let root = temp_state_root("compact-keep-settings");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"compact_keep_recent_tokens": 42}"#,
+        )
+        .unwrap();
+        assert_eq!(compact_keep_recent_tokens(&root), 42);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compact_tokens_with_no_settings_json_and_no_env_var_use_the_hardcoded_default() {
+        let _guard = COMPACT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS");
+        std::env::remove_var("RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS");
+        let root = temp_state_root("compact-tokens-defaults");
+        assert_eq!(
+            compact_trigger_tokens(&root),
+            DEFAULT_COMPACT_TRIGGER_TOKENS
+        );
+        assert_eq!(
+            compact_keep_recent_tokens(&root),
+            DEFAULT_COMPACT_KEEP_RECENT_TOKENS
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
