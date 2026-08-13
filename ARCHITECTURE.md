@@ -279,6 +279,25 @@ it happened without needing to inspect `state.json` directly.
 and treat a manual `session compact`/`session_repl`'s `/compact` as a
 plain no-op -- there's no real model to summarize with.
 
+## RPC mode
+
+Parity with `prime-agent --mode rpc` -- see `PARITY.md` for the full
+story, including the initial-attach ordering fix a real concurrency race
+in manual testing forced. `client::session_rpc` (`session rpc <id>`)
+reuses the wire protocol's own `Request`/`Response`/`SessionEvent` types
+directly as its command/event vocabulary rather than inventing a second
+schema the way `prime-agent`'s own ~30-command RPC surface is. Two
+lanes share one stdout, serialized through a `rusty_tokio::
+sync::Mutex<()>`: the initial `SessionAttach` round trip runs
+synchronously first (so the snapshot line is always first, not raced
+against a background task that might not have started yet), then the
+same connection moves into a background task that keeps streaming
+`SessionEvent`s for as long as the process lives; the foreground loop
+reads one stdin line at a time (each read its own `spawn_blocking` call,
+so the loop stays `.await`-able between reads), dispatches it as a
+`Request` over an ordinary one-shot connection, and prints the
+`Response`. Ends at stdin EOF, same convention `session_repl` uses.
+
 ## Known gaps
 
 Reflecting two addenda from prior work on this project, both worth

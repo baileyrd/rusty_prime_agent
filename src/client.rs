@@ -479,6 +479,136 @@ pub async fn session_message(
     Ok(())
 }
 
+/// `harness session rpc <id>` -- parity with `prime-agent --mode rpc`:
+/// headless, embeddable operation over stdin/stdout, one JSON object per
+/// line each direction. Unlike `prime-agent`'s own ~30-command custom
+/// protocol (`packages/coding-agent/docs/rpc.md`, by its own words "not
+/// JSON-RPC 2.0"), this reuses the wire protocol's own `Request`/
+/// `Response`/`SessionEvent` types directly as the RPC vocabulary --
+/// the same "don't invent a second JSON schema" choice `cli::
+/// OutputMode::Json` already made for `--mode json` (see that type's own
+/// doc comment). Two concurrent lanes share one stdout, serialized
+/// through `stdout_lock` so a line from one never interleaves with a
+/// line from the other:
+///
+/// - The initial attach (`Response::SessionAttachStarted` plus the
+///   snapshot event) happens synchronously, before the stdin loop even
+///   starts -- deliberately, so it's always the first line printed
+///   regardless of how quickly stdin closes, rather than racing a
+///   background task that might not have run yet. The same connection
+///   then moves into a background task (`forward_events`) that keeps
+///   streaming every subsequent `SessionEvent` as its own JSON line --
+///   the exact same event stream `--mode json session attach` produces,
+///   just delivered automatically instead of requiring a second CLI
+///   invocation. Anything after the initial snapshot is genuinely
+///   concurrent with (and thus best-effort relative to) the stdin loop
+///   below -- an event racing the process's own exit can be missed, the
+///   same honest limitation any fire-and-forget background stream has.
+/// - The foreground loop reads one line at a time from stdin (each read
+///   wrapped in its own `spawn_blocking` call, not one long-lived
+///   blocking task, so the loop stays fully `.await`-able between
+///   reads), parses it as a `Request`, dispatches it to the daemon over
+///   an ordinary one-shot connection (`dispatch_one_shot`), and prints
+///   the resulting `Response` as its own JSON line.
+///
+/// Unlike `prime-agent`'s RPC surface (deliberately session/agent-scoped
+/// commands only), any `Request` variant is accepted here -- consistent
+/// with this project's blanket single-local-caller trust model (see
+/// `PARITY.md`), not a narrower allowlist this project would have to
+/// invent and maintain. `Request::SessionAttach` is rejected locally
+/// (not forwarded) since this mode already streams that session's
+/// events automatically; sending it again would open a second,
+/// redundant streaming connection `dispatch_one_shot` isn't built to
+/// drain (it reads exactly one response line, matching every other
+/// one-shot client call in this file). Ends at stdin EOF, same
+/// convention `session_repl` already uses -- the process then exits
+/// (`main`'s own `std::process::exit`), which is what actually tears
+/// down the background event-forwarding task; no explicit cancellation
+/// needed.
+pub async fn session_rpc(state_root: &Path, session_id: String) -> Result<()> {
+    let stdout_lock = std::sync::Arc::new(rusty_tokio::sync::Mutex::new(()));
+
+    let mut events_conn = connect(state_root).await?;
+    events_conn
+        .write_request(Context::Daemon, &Request::SessionAttach { session_id })
+        .await?;
+    match read_response(&mut events_conn).await? {
+        response @ Response::SessionAttachStarted { .. } => print_json(&response),
+        other => return Err(unexpected_response(other)),
+    }
+    let events_lock = stdout_lock.clone();
+    rusty_tokio::spawn(async move {
+        let _ = forward_events(events_conn, events_lock).await;
+    });
+
+    loop {
+        let line = rusty_tokio::spawn_blocking(|| {
+            let mut buf = String::new();
+            match std::io::stdin().read_line(&mut buf) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(buf),
+            }
+        })
+        .await
+        .unwrap_or(None);
+        let Some(line) = line else { break };
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<Request>(text) {
+            Ok(Request::SessionAttach { .. }) => Response::Error {
+                message: "session attach is redundant in rpc mode -- this session's events \
+                          are already streamed automatically"
+                    .to_string(),
+                conflict: false,
+            },
+            Ok(request) => dispatch_one_shot(state_root, request)
+                .await
+                .unwrap_or_else(|e| Response::Error {
+                    message: e.to_string(),
+                    conflict: false,
+                }),
+            Err(e) => Response::Error {
+                message: format!("invalid command JSON: {e}"),
+                conflict: false,
+            },
+        };
+        let _guard = stdout_lock.lock().await;
+        print_json(&response);
+    }
+    Ok(())
+}
+
+async fn dispatch_one_shot(state_root: &Path, request: Request) -> Result<Response> {
+    let mut conn = connect(state_root).await?;
+    conn.write_request(Context::Daemon, &request).await?;
+    read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await
+}
+
+/// Continues an already-attached connection (the initial
+/// `SessionAttachStarted`/snapshot was already handled synchronously by
+/// `session_rpc` before spawning this) -- streams every subsequent
+/// `SessionEvent` as its own JSON line until the session ends or the
+/// connection closes.
+async fn forward_events(
+    mut conn: transport::LineStream,
+    stdout_lock: std::sync::Arc<rusty_tokio::sync::Mutex<()>>,
+) -> Result<()> {
+    while let Some(event) = conn.read_event(Context::Daemon).await? {
+        let ended = matches!(event, SessionEvent::SessionEnded);
+        {
+            let _guard = stdout_lock.lock().await;
+            print_json(&event);
+        }
+        if ended {
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub async fn session_attach(state_root: &Path, session_id: String, mode: OutputMode) -> Result<()> {
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionAttach { session_id })
