@@ -116,6 +116,13 @@ pub enum Command {
         session_id: String,
         sequence: u64,
     },
+    /// `harness session branch-summary <id> <branch-leaf-sequence>` --
+    /// parity with `session-format.md`'s `BranchSummaryEntry`. See
+    /// `protocol::Request::SessionBranchSummarize`'s own doc comment.
+    SessionBranchSummarize {
+        session_id: String,
+        branch_leaf_sequence: u64,
+    },
     /// `harness session schedule add <id> (--at TIME|--every DURATION)
     /// <text...>` -- parity with `prime-agent schedule add`.
     ScheduleAdd {
@@ -461,6 +468,22 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 Ok(Command::SessionSetActiveLeaf {
                     session_id,
                     sequence,
+                })
+            }
+            Some("branch-summary") => {
+                let session_id = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session branch-summary` requires a session id"))?;
+                let branch_leaf_sequence = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| usage("`session branch-summary` requires a sequence"))?
+                    .parse::<u64>()
+                    .map_err(|_| usage("`session branch-summary` requires an integer sequence"))?;
+                Ok(Command::SessionBranchSummarize {
+                    session_id,
+                    branch_leaf_sequence,
                 })
             }
             Some("schedule") => parse_schedule(&mut it),

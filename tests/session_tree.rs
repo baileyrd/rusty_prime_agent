@@ -3,8 +3,14 @@
 //! navigation halves that sit on top of the active-leaf transcript model
 //! (`protocol::TranscriptEntry::parent_sequence`/`SessionState::
 //! active_leaf_sequence`, see that increment's own `PARITY.md` entry).
-//! `/clone`'s live-state duplication stays out of scope, see
-//! `tests/session_fork.rs`'s own doc comment.
+//! Also covers `session branch-summary <id> <sequence>` (parity with
+//! `session-format.md`'s `BranchSummaryEntry`) -- CI-safe no-op coverage
+//! only here (no model configured, unknown sequence, sequence already on
+//! the active chain); the real-summarization half needs a real model, so
+//! it's an `#[ignore]`d test in `tests/ollama_provider.rs` instead, the
+//! same split `compact_now`'s own coverage uses. `/clone`'s live-state
+//! duplication stays out of scope, see `tests/session_fork.rs`'s own
+//! doc comment.
 
 mod common;
 
@@ -139,6 +145,94 @@ fn tree_on_an_empty_session_reports_no_turns_yet() {
     common::assert_success("session tree", &out);
     let stdout = common::stdout_string(&out);
     assert!(stdout.contains("no turns yet"), "got: {stdout}");
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn branch_summary_on_a_session_with_no_model_is_a_no_op() {
+    let state_dir = common::TempDir::new("branch-summary-no-model");
+    common::daemon_start(state_dir.path());
+    let session = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session, "hello");
+    set_active_leaf(state_dir.path(), &session, 1);
+    common::session_prompt(state_dir.path(), &session, "again");
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "branch-summary", &session, "2"],
+    );
+    common::assert_success("session branch-summary", &out);
+    assert_eq!(
+        common::stdout_string(&out).trim(),
+        "nothing to summarize (no model configured, or that sequence is already \
+         part of the active branch)"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn branch_summary_json_mode_reports_summarized_false_and_no_summary() {
+    let state_dir = common::TempDir::new("branch-summary-json-no-model");
+    common::daemon_start(state_dir.path());
+    let session = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session, "hello");
+    set_active_leaf(state_dir.path(), &session, 1);
+    common::session_prompt(state_dir.path(), &session, "again");
+
+    let out = common::run(
+        state_dir.path(),
+        &["--mode", "json", "session", "branch-summary", &session, "2"],
+    );
+    common::assert_success("session branch-summary --mode json", &out);
+    let stdout = common::stdout_string(&out);
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["summarized"], false);
+    assert!(value["summary"].is_null());
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn branch_summary_of_a_sequence_on_the_active_chain_is_a_no_op() {
+    let state_dir = common::TempDir::new("branch-summary-active-chain");
+    common::daemon_start(state_dir.path());
+    let session = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session, "hello");
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "branch-summary", &session, "1"],
+    );
+    common::assert_success("session branch-summary", &out);
+    assert!(
+        common::stdout_string(&out).contains("nothing to summarize"),
+        "got: {}",
+        common::stdout_string(&out)
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+#[test]
+fn branch_summary_rejects_an_unknown_sequence() {
+    let state_dir = common::TempDir::new("branch-summary-unknown");
+    common::daemon_start(state_dir.path());
+    let session = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session, "hello");
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "branch-summary", &session, "999"],
+    );
+    assert!(
+        !out.status.success(),
+        "expected a failure exit code, got success: {}",
+        common::stdout_string(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("999"), "got: {stderr}");
 
     common::daemon_shutdown(state_dir.path());
 }

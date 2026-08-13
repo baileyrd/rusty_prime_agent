@@ -559,12 +559,13 @@ above:
   editor features (`@` fuzzy search, Tab completion, image paste,
   external-editor hotkey).** -- **False/N/A**, all of it -- `session_repl`
   is a plain line-at-a-time stdin loop with no editor layer.
-- **Slash-command table (23 commands).** -- **Partial.** Only `/quit`
-  (aliased `/exit`), `/compact`, `/heartbeat`, a bounded `/fork`/`/file`/
-  `/export` exist. `/login`, `/model`, `/effort`, `/resume`, `/new`,
-  `/name`, `/session`, `/tree`, `/clone`, `/share`, `/reload`, and more
-  are absent from the REPL; some (`/refine`, `rename`) exist only as
-  top-level CLI subcommands instead.
+- **Slash-command table (23 commands).** -- **Partial, one clause now
+  closed.** Only `/quit` (aliased `/exit`), `/compact`, `/heartbeat`, a
+  bounded `/fork`/`/file`/`/export`/`/tree` exist (the last **closed**
+  since this was last written -- see session-format.md below).
+  `/login`, `/model`, `/effort`, `/resume`, `/new`, `/name`, `/session`,
+  `/clone`, `/share`, `/reload`, and more are absent from the REPL; some
+  (`/refine`, `rename`) exist only as top-level CLI subcommands instead.
 - **`/export [file]` exports to HTML.** -- **Partial.** `/export <path>`
   exists but writes pretty-printed JSON, not HTML.
 - **`/share` (upload as a private gist).** -- **False**, already tracked
@@ -659,15 +660,20 @@ above:
   field) is real now, set on every real assistant turn.
 - **`BranchSummaryEntry`, `ChildUsageAttributionEntry`, `LabelEntry`,
   `AgentStatusEntry`, `GitStateEntry`.** -- **`ChildUsageAttributionEntry`
-  now True in spirit (was False); the rest remain False.**
+  and `BranchSummaryEntry` now True in spirit (were False); `LabelEntry`/
+  `AgentStatusEntry`/`GitStateEntry` remain False.**
   `TranscriptEntry.child_usage_attributed: Option<ChildUsageAttribution>`
   is a flat optional field, not a separate typed entry class the way a
   real message-type union would have it, but it carries exactly the data
   `ChildUsageAttributionEntry` would -- `child_session_id`,
   `parent_message_sequence`, `child_usage`, `aggregate_usage`.
-  `BranchSummaryEntry`/`LabelEntry`/`AgentStatusEntry`/`GitStateEntry`
-  still don't exist -- each still depends on the tree structure or an
-  extension system, both already confirmed absent.
+  `TranscriptEntry.branch_summary: Option<Box<BranchSummary>>` is the
+  same shape decision for `BranchSummaryEntry` -- `branch_leaf_sequence`,
+  `entry_count`, `summary`, produced on-demand by `session::AgentSession::
+  branch_summarize`, now that the tree structure this entry always
+  depended on is real (see session-format.md above). `LabelEntry`/
+  `AgentStatusEntry`/`GitStateEntry` still don't exist -- each still
+  depends on an extension system, still absent.
 
 ## rlm.md
 

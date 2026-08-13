@@ -167,10 +167,22 @@ pub enum Request {
         session_id: String,
         sequence: u64,
     },
+    /// Parity with `session-format.md`'s `BranchSummaryEntry` -- see
+    /// [`BranchSummary`]'s own doc comment and `session::AgentSession::
+    /// branch_summarize`. Valid on both transports, forwarded to the
+    /// owning worker unchanged, same reasoning as `SessionSetActiveLeaf`.
+    /// `branch_leaf_sequence` names the branch to summarize by its own
+    /// tip; a sequence that doesn't name a real transcript entry is a
+    /// conflict, one that's already part of the currently active chain
+    /// is a no-op (see `Response::SessionBranchSummarizeAck::summarized`).
+    SessionBranchSummarize {
+        session_id: String,
+        branch_leaf_sequence: u64,
+    },
     /// `session fork <id> [--at N]` -- bounded parity with a slice of
     /// `prime-agent`'s `/fork` (see `PARITY.md`'s "Tree-structured
-    /// session data model" entry for exactly what's NOT attempted: no
-    /// `/tree` visualization, no `/clone`). Public transport only, unlike
+    /// session data model" entry for exactly what's NOT attempted:
+    /// `/clone`). Public transport only, unlike
     /// `SessionRename`/
     /// `SessionCompact` -- this creates a brand-new, independent session
     /// (its own directory, own worker) rather than mutating
@@ -331,6 +343,16 @@ pub enum Response {
     },
     SessionSetActiveLeafAck {
         active_leaf_sequence: u64,
+    },
+    /// `summarized` is false for the no-op case
+    /// `Request::SessionBranchSummarize`'s own doc comment describes
+    /// (no model configured, or `branch_leaf_sequence` is already part
+    /// of the active chain) -- same "accurate no-op beats a manufactured
+    /// error" reasoning `SessionCompactAck`/`ScheduleCancelAck::found`
+    /// already use.
+    SessionBranchSummarizeAck {
+        summarized: bool,
+        summary: Option<String>,
     },
     ScheduleAdded {
         schedule_id: String,
@@ -576,6 +598,27 @@ pub struct ChildUsageAttribution {
     pub aggregate_usage: Usage,
 }
 
+/// Parity with `session-format.md`'s `BranchSummaryEntry` -- previously
+/// tracked as depending on "the tree structure," which now exists (see
+/// `TranscriptEntry::parent_sequence`/`SessionState::
+/// active_leaf_sequence`). Same shape decision as [`ChildUsageAttribution`]:
+/// a flat optional field on `TranscriptEntry`, not a separate typed
+/// message-union class -- see `session::AgentSession::branch_summarize`
+/// for how it's produced (a manual, on-demand summary of a branch other
+/// than the one currently active, not something every leaf switch
+/// generates automatically).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchSummary {
+    /// The summarized branch's own tip at the time it was summarized --
+    /// not necessarily still true later, if that branch keeps growing.
+    pub branch_leaf_sequence: u64,
+    /// How many of that branch's own entries (back to its divergence
+    /// point from the chain active at summarization time) went into the
+    /// summary.
+    pub entry_count: u32,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub sequence: u64,
@@ -629,6 +672,18 @@ pub struct TranscriptEntry {
     /// `transcript.jsonl` to backfill real values into old entries.
     #[serde(default)]
     pub parent_sequence: Option<u64>,
+    /// Set only on a synthetic `Role::System` entry recording a manual,
+    /// on-demand summary of a branch other than the one currently active
+    /// -- see [`BranchSummary`] and `session::AgentSession::
+    /// branch_summarize`. `#[serde(default)]` for the same
+    /// pre-existing-transcript reason every field added after Phase 1
+    /// has it. Boxed for the same reason `SessionEvent::Snapshot` boxes
+    /// its own `SessionState`: `BranchSummary`'s `String` pushes
+    /// `TranscriptEntry` (and every enum that embeds one, e.g.
+    /// `SessionEvent::Turn`) noticeably larger for a field that's
+    /// `None` on the overwhelming majority of entries.
+    #[serde(default)]
+    pub branch_summary: Option<Box<BranchSummary>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

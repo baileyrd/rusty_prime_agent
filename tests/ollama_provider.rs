@@ -319,6 +319,67 @@ fn ollama_provider_compacts_using_settings_json_thresholds() {
     common::daemon_shutdown(state_dir.path());
 }
 
+/// Real end-to-end proof of `session::AgentSession::branch_summarize` --
+/// see `tests/session_tree.rs` for the CI-safe no-op coverage (unknown
+/// sequence, sequence already on the active chain); this is the other
+/// half, a real model actually producing a summary of an abandoned
+/// branch. Deliberately `#[ignore]`d for the same infra reasons as this
+/// file's other tests.
+#[test]
+#[ignore]
+fn ollama_provider_summarizes_an_abandoned_branch() {
+    let model = std::env::var("RUSTY_PRIME_AGENT_MODEL")
+        .expect("set RUSTY_PRIME_AGENT_MODEL (e.g. ollama/qwen2.5:0.5b) to run this ignored test");
+
+    let state_dir = common::TempDir::new("ollama-branch-summary-e2e");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new_with_model(state_dir.path(), None, Some(&model));
+    common::session_prompt(state_dir.path(), &session_id, "Say hello.");
+    // 1 (user), 2 (assistant) -- the branch about to be abandoned.
+
+    let out = common::run(
+        state_dir.path(),
+        &["session", "set-active-leaf", &session_id, "1"],
+    );
+    common::assert_success("session set-active-leaf", &out);
+    common::session_prompt(state_dir.path(), &session_id, "Say goodbye instead.");
+    // 3 (user), 4 (assistant) -- the new active branch.
+
+    let out = common::run(
+        state_dir.path(),
+        &[
+            "--mode",
+            "json",
+            "session",
+            "branch-summary",
+            &session_id,
+            "2",
+        ],
+    );
+    common::assert_success("session branch-summary", &out);
+    let stdout = common::stdout_string(&out);
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["summarized"], true);
+    let summary = value["summary"]
+        .as_str()
+        .expect("a real summary string should come back");
+    assert!(!summary.trim().is_empty(), "got: {summary:?}");
+
+    let lines = common::attach_lines_with_args(
+        state_dir.path(),
+        &["--mode", "json", "session", "attach", &session_id],
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let snapshot = lines.join("\n");
+    assert!(
+        snapshot.contains("\"branch_leaf_sequence\":2") && snapshot.contains("\"entry_count\":1"),
+        "expected a transcript entry carrying a BranchSummary for sequence 2, got: {snapshot}"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
 /// Real end-to-end proof that `<state_dir>/AGENTS.md` actually reaches
 /// the model, not just `session::build_turns`'s own unit-tested output
 /// (see `session::tests::build_turns_prepends_the_context_file_as_a_system_turn`

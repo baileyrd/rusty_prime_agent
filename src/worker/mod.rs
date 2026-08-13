@@ -483,6 +483,41 @@ async fn handle_private_connection(
                 }
             }
         }
+        Request::SessionBranchSummarize {
+            branch_leaf_sequence,
+            ..
+        } => {
+            // Same explicit-match-not-`?` shape as `SessionSetActiveLeaf`
+            // just above -- an unknown `branch_leaf_sequence` is a real
+            // conflict, not a bug to drop the connection over.
+            match session
+                .lock()
+                .await
+                .branch_summarize(branch_leaf_sequence)
+                .await
+            {
+                Ok((summarized, summary)) => {
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::SessionBranchSummarizeAck {
+                            summarized,
+                            summary,
+                        },
+                    )
+                    .await
+                }
+                Err(err) => {
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::Error {
+                            message: err.to_string(),
+                            conflict: true,
+                        },
+                    )
+                    .await
+                }
+            }
+        }
         Request::GoalUpdate { action, .. } => {
             let goal = session.lock().await.update_goal(action).await?;
             conn.write_response(Context::Worker, &Response::GoalUpdateAck { goal })

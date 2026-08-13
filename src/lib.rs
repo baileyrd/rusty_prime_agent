@@ -230,6 +230,18 @@ pub async fn run(args: &[String]) -> Result<()> {
             session_id,
             sequence,
         } => client::session_set_active_leaf(&state_root, session_id, sequence, output_mode).await,
+        cli::Command::SessionBranchSummarize {
+            session_id,
+            branch_leaf_sequence,
+        } => {
+            client::session_branch_summarize(
+                &state_root,
+                session_id,
+                branch_leaf_sequence,
+                output_mode,
+            )
+            .await
+        }
         cli::Command::ModelList { detailed } => {
             client::model_list(&state_root, detailed, output_mode).await
         }

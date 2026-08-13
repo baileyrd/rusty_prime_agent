@@ -166,6 +166,7 @@ harness session compact <id> [instructions...]   # force compaction now
 harness session fork <id> [--at N] [--name NAME]  # copy into a brand-new session
 harness session tree <id>                     # show every branch of the transcript
 harness session set-active-leaf <id> <sequence>  # switch which entry the next prompt continues from
+harness session branch-summary <id> <sequence>   # ask the model to summarize a branch other than the active one
 ```
 
 Sessions with a real `--model` automatically compact their own context
@@ -205,6 +206,16 @@ full mechanism). Unlike `session fork`, nothing new is created: it's one
 session, one transcript, with more than one branch in it. A `<sequence>`
 that doesn't name a real transcript entry is a conflict, not a silent
 no-op.
+
+`session branch-summary <id> <sequence>` asks the session's own model to
+summarize `<sequence>`'s own branch (back to wherever it diverges from
+the branch currently active) and appends the result as a system entry on
+the *current* active chain -- a durable note of "here's what happened
+over on that other branch," visible from wherever you actually are.
+Parity with `session-format.md`'s `BranchSummaryEntry`. A no-op, not an
+error, with no `--model` set or when `<sequence>` is already part of the
+active chain (nothing "other" to summarize); an unknown `<sequence>` is
+a conflict, same as `session set-active-leaf`.
 
 ### Scheduling
 
@@ -421,6 +432,10 @@ displaying anything (`session set-active-leaf` wired into the loop) --
 the next line you type continues from `<sequence>`, and if that entry
 already has a child down the previously-active path, your next prompt
 creates a real branch rather than extending it.
+
+`/branch-summary <sequence>` is `session branch-summary` wired into the
+loop -- asks the model to summarize `<sequence>`'s own branch and
+appends the result as a new entry on your *current* active chain.
 
 ### RPC mode
 
