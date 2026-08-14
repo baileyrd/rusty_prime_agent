@@ -2295,6 +2295,81 @@ daemon/worker split rather than requiring the Python control environment:
   Extension UI sub-protocol (`select`/`confirm`/`input`/`editor` dialogs)
   -- there is no extension system for it to serve (see "Needs a new
   subsystem" below).
+- [x] **ACP mode** (`harness acp [--model PROVIDER/MODEL]`), parity with
+  `prime-agent --mode acp`. Previously deferred (see this document's own
+  "Needs a new subsystem" section, before this entry moved here) for one
+  explicit, honest reason: this project had no field-verified knowledge
+  of ACP's real wire shapes, and writing an implementation against
+  recalled-but-unverified JSON-RPC method signatures "risks producing
+  something that *claims* ACP compliance without actually having it."
+  That's now done properly: every shape `acp.rs` implements was checked
+  against the canonical machine-readable schema
+  (`agentclientprotocol/agent-client-protocol`'s own `schema/v2/
+  schema.json` on GitHub, fetched directly, not recalled or taken from a
+  summary), the same "direct probe of the real thing before any code is
+  written" standard MCP integration and the ZMTP client both already
+  met.
+
+  Scope: the baseline agent method surface ACP's own schema names as a
+  coherent unit -- `AgentCapabilities.session = {}` (an empty object,
+  not omitted) is spec-defined to mean exactly "`session/new`,
+  `session/prompt`, `session/cancel`, and `session/update`", so that's
+  what `initialize`'s response reports and that's what's implemented,
+  plus `session/close` (spec: "MUST... free up any resources associated
+  with the session," so this deliberately maps to `Request::SessionStop`
+  -- the real "worker actually stops" primitive, not this project's
+  usual "closing the client detaches; it does not stop the worker"
+  default, since ACP's own spec explicitly overrides that default here).
+  An ACP `sessionId` *is* this project's own session id string; no
+  second id space or mapping table, since the two concepts already
+  coincide exactly.
+
+  A real gap found and fixed, not inherited: `session_repl`'s own
+  steering gap (see the Interactive TUI entry below) exists because that
+  loop reads and dispatches one stdin line at a time, so a line typed
+  while a prompt is in flight can't be acted on until the prompt
+  finishes. `session/cancel` is genuinely time-sensitive -- a client
+  mid-turn needs it to interrupt *that* turn, not the next one -- so
+  `acp::run` spawns each incoming message as its own task instead of
+  processing the stdin loop sequentially, meaning a `session/cancel`
+  line sitting behind an in-flight `session/prompt` line is read and
+  dispatched immediately. `stdout_lock` (the same `Arc<Mutex<()>>`
+  pattern `client::session_rpc` already uses for its own two-lane
+  stdout) keeps concurrent responses/notifications from interleaving
+  mid-line; every spawned task is awaited before the connection
+  actually closes, so nothing is lost to a stdin-EOF race the way
+  `session_rpc`'s own fixed grace-window sleep has to defend against.
+
+  Also enforced, not just assumed: the client is required to call
+  `initialize` before any session method (`-32600` otherwise) -- cheap
+  to add, and the spec frames this ordering as a hard requirement, not
+  a convention worth trusting callers to follow.
+
+  Explicitly cut, all matching real, already-established gaps elsewhere
+  in this project rather than new ones: `auth/login`/`auth/logout` (no
+  OAuth backend exists anywhere in this project, see `/login`'s own
+  entry -- `authMethods: []` is the spec-legal way to say so);
+  `session/resume`/`session/list` (this project's own
+  `resolve_session_id`/`session list` already cover the underlying need
+  outside ACP); `session/request_permission`/`elicitation/*`
+  (agent-initiated requests *to* the client -- this project's
+  tool-calling loop already auto-executes every tool call with no
+  confirmation step, so nothing today would ever need to ask
+  permission); `tool_call`/`tool_call_update` session/update kinds (a
+  real `execute_python`/`--tools` round trip happens entirely inside one
+  `AgentSession::prompt` call before this module ever sees a result, so
+  there's no natural point to emit an in-progress update from -- only
+  the final `agent_message_chunk` is emitted); true streaming
+  (`ProviderReply` is a complete reply or complete tool-call batch,
+  never a partial delta, so exactly one `agent_message_chunk` carries
+  the whole reply per turn, immediately followed by one `state_update`
+  (`idle`, `stopReason`) -- the "one legal `session/update` chunk per
+  turn" shape this document's own prior ACP entry predicted, now
+  confirmed). A prompt's non-text `ContentBlock` variants (image, audio,
+  resource_link, resource) are represented by an inline
+  `[unsupported content block: <type>]` placeholder rather than
+  silently dropped, matching this project's established "loud, not
+  silent" convention for a genuine gap.
 - [x] **Context files** (`AGENTS.md`/`CLAUDE.md` auto-loading), parity
   with `prime-agent`'s own auto-loaded context files. A prior revision of
   this document filed the whole "Context files" bullet under "Needs a
@@ -3125,41 +3200,6 @@ attempted here, and not silently implied by anything in
   without the OAuth client on top; see the medium-effort section's own
   "`/login`: interactive provider-setup wizard" entry for what that wizard
   does and doesn't cover.
-- **ACP mode** (Agent Client Protocol). `prime-agent`'s `--mode acp`
-  speaks the Agent Client Protocol (`agentclientprotocol.com`) to
-  editor integrations. Re-investigated closely rather than taken on
-  faith, because -- unlike `/login` just above it, or "Extensions"/
-  "Themes" (see the medium-effort section's own entry on those) -- the
-  `/login` reasoning this bullet used to give ("no editor plugin on the
-  other end") turns out to be factually wrong: ACP is a real, openly
-  specified JSON-RPC 2.0 protocol, and Zed is a real, currently-shipping
-  ACP *client* already in people's hands. Implementing an ACP *server*
-  here needs no backend this project would have to build or own, unlike
-  `/login`'s missing Prime Intellect account system -- the "nothing on
-  the other end" framing simply doesn't transfer.
-
-  The honest reason to still hold off: this project doesn't yet have
-  field-verified knowledge of ACP's exact wire shapes (`session/update`'s
-  content union, `session/request_permission`'s parameters, `initialize`'s
-  capability payload, confirmed message framing) the way MCP integration
-  and the ZMTP client both required a direct probe of the real thing
-  before any code was written for either. Writing an implementation
-  against recalled-but-unverified JSON-RPC method signatures risks
-  producing something that *claims* ACP compliance without actually
-  having it -- worse than staying unimplemented. Structurally, this
-  looks tractable once that spike is done: `client::session_rpc`
-  (`--mode rpc`) is already this project's own precedent for "a headless
-  JSON-in/JSON-out protocol reusing existing `Request`/`Response`/
-  `SessionEvent` types rather than inventing a second schema," and
-  `ProviderReply`'s non-streaming shape (a complete reply per turn, no
-  partial deltas -- see the RPC mode entry above) looks like it can
-  still emit a single, spec-legal `session/update` chunk per turn rather
-  than needing this project's whole model-provider path restructured
-  for true incremental streaming. Kept in this section for now (nothing
-  here has actually verified a spike against the real protocol yet), but
-  unlike `/login`'s genuinely missing backend, this one is a tractable
-  near-term increment once that verification step happens, not a
-  structurally missing subsystem -- still unimplemented today.
 - **`SYSTEM.md`/`APPEND_SYSTEM.md`** (system-prompt override/append).
   This project has no base system prompt at all to override or append
   to outside of `AGENTS.md`/`CLAUDE.md` auto-loading (see "Medium-effort"

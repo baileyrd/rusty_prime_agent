@@ -665,6 +665,38 @@ command -- this mode already streams events automatically.
 echo '{"type":"session_prompt","session_id":"<id>","text":"hello"}' | harness session rpc <id>
 ```
 
+### ACP mode
+
+```sh
+harness acp
+harness acp --model ollama/qwen2.5:0.5b
+```
+
+Bounded, spec-verified parity with `prime-agent --mode acp` -- speaks
+the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC
+2.0, newline-delimited, over stdin/stdout) to editor integrations like
+Zed. Implements the baseline agent method surface ACP's own schema
+defines as one unit: `initialize`, `session/new`, `session/prompt`,
+`session/cancel`, `session/update`, plus `session/close`. `--model`
+seeds every session created over this connection with a real backend
+(same `provider/model` string `session new --model` takes); with no
+flag, sessions fall back to `RUSTY_PRIME_AGENT_MODEL` if set, or
+`EchoProvider` otherwise.
+
+Not implemented, deliberately: `auth/login`/`auth/logout` (no OAuth
+backend anywhere in this project -- `initialize` reports
+`authMethods: []`), `session/resume`/`session/list` (covered outside
+ACP by `resolve_session_id`/`session list` already), permission
+requests/elicitation (this project's tool-calling loop never asks for
+confirmation), and per-tool-call `session/update` events (a real tool
+round trip finishes entirely inside one server-side turn before this
+mode ever sees the result -- only the final reply is reported). See
+`PARITY.md` for the full story, including the real concurrency gap
+found and fixed along the way: unlike `session rpc`'s own sequential
+stdin loop, `harness acp` dispatches every incoming message as its own
+task, so a `session/cancel` sent while a `session/prompt` is still in
+flight is acted on immediately instead of queued behind it.
+
 ### Model providers
 
 ```sh

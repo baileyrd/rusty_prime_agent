@@ -277,6 +277,20 @@ pub enum Command {
     Doctor {
         fix: bool,
     },
+    /// `harness acp [--model PROVIDER/MODEL]` -- bounded, spec-verified
+    /// parity with `prime-agent --mode acp`. See `acp`'s own module doc
+    /// comment for exactly what's implemented (the baseline
+    /// `AgentCapabilities.session = {}` surface: `initialize`,
+    /// `session/new`, `session/prompt`, `session/cancel`,
+    /// `session/close`, `session/update`) and what's cut. `--model`
+    /// seeds every `session/new` created over this one connection with
+    /// a real backend -- `None` (the default) falls back to
+    /// `RUSTY_PRIME_AGENT_MODEL` server-side the same way `session new`
+    /// with no `--model` already does, or `EchoProvider` if that's
+    /// unset too.
+    Acp {
+        model: Option<String>,
+    },
     /// `harness session heartbeat <id> [--every DURATION]` -- a
     /// top-level CLI entry point into the same re-entry mechanism
     /// `session_repl`'s own `/heartbeat`/`/heartbeat every <duration>`
@@ -753,10 +767,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
             let fix = rest.iter().any(|a| a.as_str() == "--fix");
             Ok(Command::Doctor { fix })
         }
+        Some("acp") => {
+            let rest: Vec<&String> = it.collect();
+            let model = scan_named_flag(&rest, "--model")?;
+            Ok(Command::Acp { model })
+        }
         Some("__supervisor-main") => Ok(Command::SupervisorMain),
         Some("__worker-main") => parse_worker_main(&mut it),
         other => Err(usage(format!(
-            "expected `daemon <start|status|shutdown [--force]>`, `session <new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, `doctor [--fix]`, or `-p`/`--print <text>`, got {other:?}"
+            "expected `daemon <start|status|shutdown [--force]>`, `session <new|attach|list|prompt|stop|rename|compact|heartbeat|interrupt|schedule|goal|autonomous|prompt-template|harness|refine|spawn|children|message|repl|rpc>`, `prompt-template <list|render>`, `skill list`, `model list`, `update [--force]`, `doctor [--fix]`, `acp [--model PROVIDER/MODEL]`, or `-p`/`--print <text>`, got {other:?}"
         ))),
     }
 }

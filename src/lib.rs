@@ -46,6 +46,7 @@ pub mod provider;
 pub mod session;
 pub mod tool_runtime;
 
+mod acp;
 mod auth;
 mod catalog;
 mod cli;
@@ -276,6 +277,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         cli::Command::Doctor { fix } => {
             client::doctor(&state_root, &exe_path, fix, output_mode).await
         }
+        cli::Command::Acp { model } => acp::run(&state_root, model).await,
         cli::Command::Print {
             text,
             model,

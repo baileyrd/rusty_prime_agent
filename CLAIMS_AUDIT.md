@@ -976,38 +976,63 @@ above:
 
 ## acp.md
 
-Genuinely new information -- `PARITY.md` only knew ACP was deferred
-pending a wire-shape spike, without the shapes themselves. All findings
-below are **N/A** (zero ACP code exists), reported as reference for a
-future spike:
+**Closed since this section was first written** (was: "Genuinely new
+information -- `PARITY.md` only knew ACP was deferred pending a
+wire-shape spike... all findings below are N/A, zero ACP code exists").
+`harness acp [--model PROVIDER/MODEL]` (`src/acp.rs`) now implements a
+bounded first slice -- see `PARITY.md`'s own "ACP mode" entry for the
+full story. Revisiting each original finding below:
 
 - Transport: one JSON-RPC 2.0 message per line, NDJSON on stdin/stdout
   -- the same LF-delimited-JSON framing `transport.rs` already
-  implements, a smaller adaptation than a from-scratch protocol.
-- Exactly five methods (`initialize`, `session/new`, `session/prompt`,
-  `session/cancel`, `session/close`), one session per connection.
-- `session/update` mapping (assistant text -> `agent_message_chunk`,
-  tool start/finish -> `tool_call`/`tool_call_update`, an IPython cell
-  specifically as a `tool_call` of kind `execute`) maps directly onto
-  the real `execute_python` tool with no new abstraction -- confirms
-  `PARITY.md`'s own guess that a non-streaming `ProviderReply` could
-  still emit one legal `session/update` chunk per turn.
-- **Blocker noted at the time, since closed:** at the point this ACP
-  spike survey was written, `protocol::Request` had no cancel/abort
-  primitive at all. `Request::SessionInterrupt`/`harness session
-  interrupt <id>` now exists (see `PARITY.md`'s "Bounded candidates
-  batch 1" entry) -- a real prerequisite for `session/cancel` (and
-  rpc.md's `abort`) to eventually build on, though still bounded exactly
-  as that entry states (stops a multi-round tool-calling turn before its
-  next round, not a model call already in flight), and ACP itself
-  remains entirely unimplemented (zero ACP code exists) so nothing
-  currently calls it for that purpose.
+  implements. **Confirmed and implemented**: `acp::run` reads exactly
+  this way, one `spawn_blocking` `read_line` call per message.
+- "Exactly five methods (`initialize`, `session/new`, `session/prompt`,
+  `session/cancel`, `session/close`)" -- **was itself an
+  oversimplification**, corrected once this pass fetched the real
+  canonical schema directly (`agentclientprotocol/agent-client-protocol`
+  on GitHub, `schema/v2/schema.json`) rather than a summary: the actual
+  `ClientRequest` union also includes `auth/login`, `auth/logout`,
+  `session/resume`, `session/list`, `session/delete` (a v2 addition this
+  original survey never saw), and `SetSessionConfigOptionRequest`. The
+  five methods this survey originally named happen to be exactly the
+  ones `AgentCapabilities.session = {}` is spec-defined to mean as one
+  baseline unit -- `initialize`/`session/new`/`session/prompt`/
+  `session/cancel`/`session/update` plus `session/close` (required to
+  free resources) -- which is what `acp::run` actually implements.
+  Everything else in the real, larger method list is explicitly out of
+  scope for this first slice (see `PARITY.md`'s own entry for exactly
+  why each one).
+- "`session/update` mapping (assistant text -> `agent_message_chunk`,
+  tool start/finish -> `tool_call`/`tool_call_update`...)" -- **half
+  implemented, half a confirmed-and-kept simplification**. The
+  `agent_message_chunk` half is real: one non-streaming `ProviderReply`
+  emits exactly one `agent_message_chunk` (the whole reply text) then
+  one `state_update` (`idle`, `stopReason`) -- confirming this
+  document's own earlier guess. The `tool_call`/`tool_call_update` half
+  was deliberately **not** built: a real `execute_python`/`--tools`
+  round trip happens entirely inside one server-side `AgentSession::
+  prompt` call, finishing before `acp.rs` ever sees a result, so there's
+  no natural point in that call to emit an in-progress update from.
+- **Blocker noted at the time, since closed, and now actually used**:
+  `Request::SessionInterrupt`/`harness session interrupt <id>` (shipped
+  in "Bounded candidates batch 1") is what `acp::run`'s own
+  `session/cancel` notification handler calls. Genuinely time-sensitive
+  unlike `session_rpc`'s own sequential stdin loop: `acp::run` spawns
+  each incoming message as its own task specifically so a
+  `session/cancel` line sitting behind an in-flight `session/prompt`
+  line is dispatched immediately rather than queued behind it -- a real
+  fix, not just a wiring exercise, for the same "busy loop can't act on
+  a new line until it's done" limitation `session_repl`'s own steering
+  gap still has.
   `max_tokens` as a stop reason still has no honest backing today: real
   per-turn token usage is tracked now (`TranscriptEntry.usage`, see the
   RLM Runtime Architecture section's child-usage-attribution entry), but
   nothing consumes it as a stop condition anywhere -- `session_autonomous`
-  still only tracks turns/time, not a token budget, so this is now a
-  missing *policy*, not a missing data source.
+  still only tracks turns/time, not a token budget, so `acp::run` always
+  reports `stopReason: "end_turn"`, never `"max_tokens"`, matching this
+  document's own earlier framing: a missing *policy*, not a missing data
+  source.
 
 ## mcp-integrations.md
 
@@ -1255,10 +1280,13 @@ From the recursive doc-tree pass:
       tool-calling turn before its *next* round, not a model call already
       in flight to a real provider's HTTP endpoint (that would need
       cooperative cancellation inside `ModelProvider::respond` itself,
-      still out of scope) -- so this is a real prerequisite primitive for
-      `rpc.md`'s `abort`/`acp.md`'s `session/cancel` to eventually build
-      on, not a claim that either is now wired up. Neither `--mode rpc`
-      nor a future ACP server currently calls it.
+      still out of scope). Now genuinely consumed, not just a
+      prerequisite sitting unused: `harness acp`'s `session/cancel`
+      notification handler calls it directly (see `PARITY.md`'s own "ACP
+      mode" entry) -- `--mode rpc` still doesn't call it (no `abort`
+      command exists in `session_rpc`'s own vocabulary, since it accepts
+      ordinary `Request` variants directly and `SessionInterrupt` is
+      already one of them, reachable as-is).
 - [x] **Fix, or explicitly document, the `auth.json`-vs-env-var
       precedence inversion** -- documented: `PARITY.md`'s own `auth.json`
       entry now states outright that env-var-wins is a permanent,
