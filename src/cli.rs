@@ -82,6 +82,10 @@ pub enum Command {
         /// `protocol::TranscriptEntry::images`'s own doc comment for the
         /// shape these get loaded into.
         image_paths: Vec<String>,
+        /// `--request-id <id>` -- opts this one prompt into idempotent
+        /// replay protection. See `protocol::Request::SessionPrompt::
+        /// request_id`'s own doc comment.
+        request_id: Option<String>,
     },
     SessionStop {
         session_id: String,
@@ -465,6 +469,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 let rest: Vec<String> = it.cloned().collect();
                 let mut image_paths = Vec::new();
                 let mut text_words = Vec::new();
+                let mut request_id = None;
                 let mut i = 0;
                 while i < rest.len() {
                     if rest[i] == "--image" {
@@ -473,6 +478,13 @@ fn parse_command(args: &[String]) -> Result<Command> {
                             .cloned()
                             .ok_or_else(|| usage("--image requires a value"))?;
                         image_paths.push(path);
+                        i += 2;
+                    } else if rest[i] == "--request-id" {
+                        request_id = Some(
+                            rest.get(i + 1)
+                                .cloned()
+                                .ok_or_else(|| usage("--request-id requires a value"))?,
+                        );
                         i += 2;
                     } else {
                         text_words.push(rest[i].clone());
@@ -486,6 +498,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     session_id,
                     text: text_words.join(" "),
                     image_paths,
+                    request_id,
                 })
             }
             Some("stop") => {

@@ -2958,6 +2958,63 @@ daemon/worker split rather than requiring the Python control environment:
   instruction for a known skill with and without args, rejects an
   unknown one without sending anything, and still reaches a
   `disable-model-invocation` skill).
+- [x] **Bounded candidates batch 5: harness notes feedback + idempotency.**
+  Two small, independent gaps, both named directly in `CLAIMS_AUDIT.md`'s
+  own "Candidate follow-ups" checklist.
+
+  **Feed harness notes back into `build_turns`.** Durable, rollback-able
+  supplemental state (`session harness add`/`rollback`, `/refine`) was
+  previously invisible to the model on an ordinary turn -- the only place
+  it ever surfaced was `/refine`'s own one-off review prompt
+  (`client::build_refine_prompt`). New `format_harness_notes` renders
+  `state.harness.notes` as one system turn, appended in `build_turns`
+  right after the context-file and compaction-summary system turns
+  (only when `notes` is non-empty, the same "gated on presence" shape
+  those two already have). Design decision the checklist itself flagged
+  as open, resolved: every note is included regardless of
+  `HarnessNoteKind` (`Prompt`/`Memory`/`SkillDescription` alike) -- a
+  caller who explicitly added supplemental state meant it to influence
+  the session; the kind is a categorization label for display/filtering
+  (`harness_add`'s CLI dispatch, `harness list`'s rendering), not a
+  signal that some kinds should stay hidden from the model that's
+  supposed to act on them. Verified with new `session.rs` unit tests:
+  notes reach `build_turns` as one system turn containing every note's
+  text; no notes means no extra turn at all; `format_harness_notes`
+  itself lists every note with its kind. Not integration-tested through
+  the CLI/daemon: `EchoProvider` only ever echoes the *last user* turn
+  (see `provider::EchoProvider::respond`), so a black-box round trip
+  can't observe *system*-turn content at all -- the in-process unit
+  tests above are the real, meaningful coverage, the same test-boundary
+  split `build_turns_prepends_the_context_file_as_a_system_turn`
+  already established for the context-file system turn.
+
+  **Idempotent replay protection for in-flight requests.** Bounded first
+  slice, exactly as the checklist scoped it: an in-memory (not durable --
+  lost on a worker crash/restart, a separately larger step), per-session
+  dedup keyed by a caller-supplied request id, rejecting an exact
+  duplicate rather than double-enqueuing. `Request::SessionPrompt` gains
+  a `request_id: Option<String>` field (`#[serde(default)]`); every
+  existing caller except the one new surface passes `None`, unaffected.
+  New `AgentSession::prompt_with_images_and_request_id`: `None` is
+  exactly `prompt_with_images` unchanged; `Some(id)` already present in
+  a new `recent_request_ids: HashMap<String, TranscriptEntry>` field
+  (paired with a `VecDeque<String>` for insertion order) returns the
+  cached entry without prompting the provider again, otherwise prompts
+  normally and remembers the result, evicting the oldest remembered id
+  past `REQUEST_ID_CACHE_CAP` (64) so a long-lived session's memory use
+  stays bounded. Exposed via `harness session prompt <id> --request-id
+  <id> <text...>` -- the one client-facing surface that actually needs
+  retry-safety; `/refine`/`/heartbeat`/`session_autonomous`/subagent
+  messaging/etc. all still pass `None`, since none of them are a client
+  retrying a dropped connection. Verified with new `session.rs` unit
+  tests (a repeated id returns the identical cached entry without a
+  second transcript turn, even when the retried text itself differs --
+  proving the dedup check short-circuits before the provider is asked
+  again, not that it happens to produce the same answer; distinct ids
+  both enqueue; no id at all behaves exactly as before; the cache evicts
+  its oldest entry once the cap is exceeded) and new `tests/
+  idempotent_replay.rs` integration tests proving the same three
+  properties end-to-end through the real daemon/worker.
 
 ## Needs a new subsystem
 

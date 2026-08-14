@@ -140,7 +140,18 @@ pub async fn run(args: &[String]) -> Result<()> {
             session_id,
             text,
             image_paths,
-        } => client::session_prompt(&state_root, session_id, text, image_paths, output_mode).await,
+            request_id,
+        } => {
+            client::session_prompt(
+                &state_root,
+                session_id,
+                text,
+                image_paths,
+                request_id,
+                output_mode,
+            )
+            .await
+        }
         cli::Command::SessionStop { session_id } => {
             client::session_stop(&state_root, session_id, output_mode).await
         }
