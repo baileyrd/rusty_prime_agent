@@ -134,19 +134,31 @@ fn pick_free_port() -> Result<u16> {
 /// being set in this process's own environment -- see this module's own
 /// doc comment for why that's sufficient to reach the spawned
 /// `rp-server` too.
-const OPTIONAL_PROVIDERS: &[(&str, &str, &str)] = &[
-    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+const OPTIONAL_PROVIDERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "openai",
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+        "openai",
+    ),
     (
         "anthropic",
         "https://api.anthropic.com",
         "ANTHROPIC_API_KEY",
+        "anthropic",
     ),
     (
         "gemini",
         "https://generativelanguage.googleapis.com",
         "GEMINI_API_KEY",
+        "gemini",
     ),
-    ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    (
+        "groq",
+        "https://api.groq.com/openai/v1",
+        "GROQ_API_KEY",
+        "openai",
+    ),
 ];
 
 /// One resolved provider `write_config`/`known_providers`/
@@ -186,11 +198,11 @@ fn custom_provider_api_key_env(name: &str) -> String {
 fn all_providers(state_root: &Path) -> Vec<ProviderEntry> {
     let mut entries: Vec<ProviderEntry> = OPTIONAL_PROVIDERS
         .iter()
-        .map(|(name, base_url, api_key_env)| ProviderEntry {
+        .map(|(name, base_url, api_key_env, kind)| ProviderEntry {
             name: name.to_string(),
             base_url: base_url.to_string(),
             api_key_env: api_key_env.to_string(),
-            kind: "openai".to_string(),
+            kind: kind.to_string(),
         })
         .collect();
     for (name, custom) in crate::providers::load(state_root) {
