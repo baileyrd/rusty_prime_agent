@@ -865,8 +865,12 @@ daemon/worker split rather than requiring the Python control environment:
   absent" blob -- follow-up queuing -- turns out to be genuinely
   buildable; the other half, steering (interrupting an in-flight prompt
   rather than queuing behind it), is a real, separately-tracked gap (see
-  "Needs a new subsystem" below for exactly why: there's no cancellation
-  primitive anywhere in this project today).
+  "Needs a new subsystem" below -- as of "Bounded candidates batch 1" a
+  cancellation primitive does exist, `Request::SessionInterrupt`/`harness
+  session interrupt <id>`, but this REPL's own dispatch loop still can't
+  call it on itself: any line typed while busy is unconditionally
+  queued, never dispatched immediately, so there's no way to type
+  `/interrupt` and have this same session act on it right away).
 
   Before this increment, `session_repl`'s stdin loop was fully
   synchronous: read one line, `.await` its full reply, only then read

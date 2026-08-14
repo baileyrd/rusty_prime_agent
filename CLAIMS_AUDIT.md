@@ -9,6 +9,25 @@ Companion to `PARITY.md` (which tracks the full feature-parity surface);
 this document is scoped to just the claims below, one level more
 detailed than `PARITY.md`'s entries for the same features.
 
+**Last freshness pass:** 2026-08-14, against upstream `prime-agent`
+commit `9bf49d8` (checked the `a3b3e75`..`9bf49d8` range, 13 commits,
+2026-08-11 to 2026-08-13). This pass did two things: (1) checked whether
+upstream's own recent changes introduced any new checkable claim -- the
+one that did, a seventh `max` thinking level, is reflected in the
+`custom-provider.md` section below; the rest of that range was TUI
+polish or TypeScript-internal refactoring with no Rust-side analog to
+check. (2) Re-walked every verdict below against this project's own
+work since the previous pass, since a verdict written against the state
+of the code at the time is silently wrong the moment a later increment
+closes that exact gap and nobody comes back to update the sentence --
+found and corrected several bullets that still said **False**/**Partial**
+for gaps `PARITY.md`'s "Bounded candidates batch 1"-"batch 5" entries
+had already closed (harness-notes feedback, idempotent replay,
+self-update, `shutdown --force`, `doctor --fix`, the ACP/`rpc.md`
+cancel primitive, piped-stdin merging, resume-by-partial-ID). Each
+corrected bullet below says so explicitly ("was **False** ... when this
+survey was first written").
+
 The first pass below covers `prime-agent`'s top-level marketing copy and
 `architecture.md`. A second pass extends the same treatment to the four
 detailed docs `architecture.md` links out to: `daemon.md`,
@@ -86,14 +105,18 @@ conditioned differently than the claim implies), **N/A**.
     `SYSTEM.md`/`APPEND_SYSTEM.md` support), so the "never rewrites it"
     guarantee is vacuous rather than an enforced safeguard -- there's
     nothing for `/refine` to be tempted to touch in the first place.
-  - **Harness notes are never fed back into future prompts.**
-    `build_turns` (`src/session.rs:732`, what's actually sent to the
-    model each turn) only injects `AGENTS.md`/`CLAUDE.md` and the
-    compaction summary. Harness notes are stored, rollback-able, and
-    used as input to `/refine`'s own one-shot review prompt -- but not
-    automatically re-injected as context on ordinary turns. The harness
-    records history faithfully; it does not yet close the loop back into
-    the agent's behavior.
+  - **Harness notes are fed back into future prompts** (was **never**
+    fed back when this survey was first written -- closed since, see
+    `PARITY.md`'s "Bounded candidates batch 5" entry). `build_turns`
+    (`src/session.rs:732`, what's actually sent to the model each turn)
+    now injects `state.harness.notes` as a system turn, right after the
+    context-file/compaction-summary turns, whenever any notes exist --
+    every `HarnessNoteKind` (`Prompt`/`Memory`/`SkillDescription`)
+    included, not filtered to `/refine`'s own `Memory` notes. Harness
+    notes are still stored, rollback-able, and used as input to
+    `/refine`'s one-shot review prompt exactly as before -- that part was
+    never the gap. The harness now closes the loop back into the agent's
+    behavior on ordinary turns, not just at `/refine` time.
 
 ## Skills
 
@@ -268,15 +291,28 @@ worker/session code.
   inspection.
 - **Idempotency: mutating commands keyed by `clientId + commandId`,
   recorded in an append-only journal before dispatch, uncertain results
-  reported rather than blindly replayed.** -- **False.** No client
-  ID/command ID concept exists anywhere in this project's protocol or
-  client code -- confirmed by grep, nothing produces or consumes one. A
-  request that times out or whose connection drops before a response
-  arrives has no idempotent-replay protection; a retried `SessionPrompt`
-  after a timeout could in principle double-send.
+  reported rather than blindly replayed.** -- **Partial** (was **False**
+  when this survey was first written; a bounded first slice shipped
+  since -- see `PARITY.md`'s "Bounded candidates batch 5" entry). No
+  `clientId` concept and no durable append-only journal exist -- a
+  crashed/restarted worker still loses all dedup state, unlike a real
+  journal recorded *before* dispatch. What does exist: `Request::
+  SessionPrompt` carries an optional caller-supplied `request_id`
+  (`harness session prompt <id> --request-id <id>`); `AgentSession::
+  prompt_with_images_and_request_id` keeps a small in-memory (capped at
+  64 entries) per-session cache and returns the identical cached
+  `TranscriptEntry` for a repeated id rather than double-enqueuing.
+  Genuinely closes the specific "a retried `SessionPrompt` after a
+  timeout could double-send" risk this bullet originally called out,
+  for a caller that opts in by supplying an id -- just not with journal
+  durability across a crash.
 - **Coordinated two-phase self-update (checkpoint, validate, commit).**
-  -- **False/N/A.** No self-update mechanism exists in this project at
-  all.
+  -- **Partial** (was **False/N/A** when this survey was first written;
+  `harness update [--force]` shipped since -- see `PARITY.md`'s own
+  "Self-update" entry). Still no checkpoint/validate/commit staging of
+  any kind -- it's a best-effort `git pull` + `cargo build --release`
+  translation with no release-channel/binary-distribution concept behind
+  it, a one-shot attempt rather than a coordinated multi-phase rollout.
 - **Backpressure is attachment-local; no unbounded per-client queue.**
   -- **Not directly verified**, but plausible by construction: each
   attach is proxied through one dedicated `LineStream` per connection
@@ -309,7 +345,9 @@ worker/session code.
   resume path, even though `SessionState.generation` and per-event
   sequence numbers both exist and could in principle support one later.
 - **Command lifecycle idempotency (`clientId + commandId` journal).** --
-  **False**, same finding as `daemon.md` above.
+  **Partial**, same finding as `daemon.md` above (a bounded, non-durable
+  `request_id`-keyed dedup now exists; no `clientId` concept and no
+  journal).
 - **Extension UI boundary (select/confirm/input/editor/notification
   dialogs, executable callbacks staying host-side).** -- **False/N/A.**
   A bounded extension slice now exists (see `PARITY.md`'s Extensions
@@ -444,8 +482,13 @@ separately below. The specific points worth calling out individually:
   `stop`/`status` lifecycle commands.** -- **True** for all but one:
   `session list`/`session attach`/`session rename`/`session stop`/
   `daemon status` all exist and match. **`doctor [--fix]`** --
-  **False**, confirmed absent: no diagnostic/repair command exists in
-  this project.
+  **Partial** (was **False, confirmed absent** when this survey was
+  first written; `harness doctor [--fix]` shipped since, see
+  `PARITY.md`'s "Bounded candidates batch 1" entry). Checks daemon
+  reachability, whether `rp-server` is on `PATH`, and whether
+  `settings.json`/`auth.json`/`providers.json` actually parse; `--fix`
+  only ever starts the daemon if it wasn't running -- no config-file
+  auto-repair, no stale-worker cleanup.
 - **Agent-to-agent messaging via a kernel-callable `agent_message`
   Python skill, with `auto`/`steer`/`follow_up` delivery modes, a
   `deliveryStatus` receipt, and `agent_message.send("all", ...)`
@@ -514,8 +557,17 @@ above:
   (`src/daemon/mod.rs:175-204`) -- covers what upstream splits across
   `attach` and `--resume`.
 - **"`prime-agent --resume <path|id>` -- Resume a saved session."** --
-  **False as a distinct flag.** No `--resume`/`-r` flag exists anywhere
-  in `cli.rs`; no path-based addressing exists at all, only UUIDs.
+  **False as a distinct flag** (unchanged by upstream's own recent
+  `--resume` restoration -- confirmed that change is TUI-agents-view-only,
+  no new argument-form behavior). No `--resume`/`-r` flag exists anywhere
+  in `cli.rs`; no path-based addressing exists at all, only UUIDs. One
+  piece of the `<id>` half did get less brittle since this was written:
+  `Daemon::resolve_session_id` (see `PARITY.md`'s "Bounded candidates
+  batch 3" entry) now resolves an unambiguous ID *prefix* everywhere a
+  full session ID is accepted, so `session attach 3f2a` works like a full
+  UUID would -- still no `<path>` addressing of any kind, and still no
+  `--resume` flag, just a shorter ID to type at the interfaces that
+  already existed (`session attach`/`session repl`'s own `/resume <id>`).
 - **"`prime-agent status`."** -- **True.** `daemon status` reports
   `protocol_version`/`pid`/`generation`/`sessions_active`.
 - **"`prime-agent doctor [--fix]`."** -- **Partial.** `harness doctor
@@ -535,10 +587,14 @@ above:
   `--force` means "rebuild even if nothing new was pulled," not
   "discard local changes" -- see `PARITY.md`'s own "Self-update"
   entry.
-- **"`prime-agent shutdown [--force]`."** -- **Partial.** `daemon
-  shutdown` does stop every active worker and the `rp-server` sidecar,
-  matching the substance, but there's no `--force` flag -- shutdown is
-  always unconditional.
+- **"`prime-agent shutdown [--force]`."** -- **True**, both halves (was
+  **Partial** -- no `--force` -- when this survey was first written;
+  `--force` shipped since, see `PARITY.md`'s "Bounded candidates batch
+  3" entry). `daemon shutdown` stops every active worker and the
+  `rp-server` sidecar; `daemon shutdown --force` skips the per-session
+  graceful `WorkerShutdown` round trip (useful if a worker has wedged),
+  leaving any still-running worker orphaned but reachable rather than
+  killed outright.
 - **"Direct agent-to-agent communication: ...can discover one another,
   exchange messages, and steer active work."** -- **Partial.** `session
   message`/`session children` deliver directly. "Steer active work" now
@@ -577,9 +633,12 @@ above:
   flags** -- covered functionally by `session list` + `session attach`
   instead.
 - **Non-interactive mode: `-p`, piped stdin, `--mode json`/`rpc`.** --
-  **Partial.** All exist and work, but `print_once` (`src/client.rs:
-  123-170`) never reads or merges piped stdin -- `text` comes only from
-  argv.
+  **True** (was **Partial** -- no piped-stdin merging -- when this
+  survey was first written; shipped since, see `PARITY.md`'s "Bounded
+  candidates batch 3" entry). `lib::merge_piped_stdin` (checked via
+  `std::io::IsTerminal`) now merges piped stdin into the prompt text for
+  both `print_once` and `print_ephemeral`; `--mode json`/`rpc` were
+  already real.
 
 ## usage.md
 
@@ -901,10 +960,15 @@ above:
   spec.
 - **Full command set (~30 commands: `steer`, `abort`, `cycle_model`,
   `bash`, `fork`, `clone`, `export_html`, etc.).** -- **False** for the
-  overwhelming majority -- only `session_prompt`, `session_compact`,
-  and `session_fork` have any real analog; the rest of `protocol::
-  Request`'s variants don't map to this list at all, and this list's
-  other ~27 entries have no analog in `protocol::Request`.
+  overwhelming majority -- `session_prompt`, `session_compact`, and
+  `session_fork` have a real analog, and now so does `abort`:
+  `Request::SessionInterrupt`/`harness session interrupt <id>` (see
+  `PARITY.md`'s "Bounded candidates batch 1" entry) covers it, bounded
+  exactly as that entry states (stops a multi-round tool-calling turn
+  before its next round, not a model call already in flight). The rest
+  of `protocol::Request`'s variants still don't map to this list at
+  all, and this list's other ~26 entries still have no analog in
+  `protocol::Request`.
 - **`Model` object (`contextWindow`, `cost`, `reasoning`, `input`
   modalities).** -- **False.** The actual model-catalog entry carries
   only `id`/`owned_by`/`context_length` -- no pricing, reasoning-support,
@@ -928,9 +992,16 @@ future spike:
   the real `execute_python` tool with no new abstraction -- confirms
   `PARITY.md`'s own guess that a non-streaming `ProviderReply` could
   still emit one legal `session/update` chunk per turn.
-- **New concrete blocker found:** `protocol::Request` has no
-  cancel/abort primitive of any kind -- `session/cancel` (and rpc.md's
-  `abort`) would need one added first, independent of ACP itself.
+- **Blocker noted at the time, since closed:** at the point this ACP
+  spike survey was written, `protocol::Request` had no cancel/abort
+  primitive at all. `Request::SessionInterrupt`/`harness session
+  interrupt <id>` now exists (see `PARITY.md`'s "Bounded candidates
+  batch 1" entry) -- a real prerequisite for `session/cancel` (and
+  rpc.md's `abort`) to eventually build on, though still bounded exactly
+  as that entry states (stops a multi-round tool-calling turn before its
+  next round, not a model call already in flight), and ACP itself
+  remains entirely unimplemented (zero ACP code exists) so nothing
+  currently calls it for that purpose.
   `max_tokens` as a stop reason still has no honest backing today: real
   per-turn token usage is tracked now (`TranscriptEntry.usage`, see the
   RLM Runtime Architecture section's child-usage-attribution entry), but
@@ -1013,9 +1084,11 @@ tables:
   `maxTokens`, `compat`).** -- **False, essentially all of them.**
   `CustomProvider` has exactly two fields; there is no per-model
   configuration object anywhere in the registration path at all.
-- **Thinking-level map (`off`/`minimal`/`low`/`medium`/`high`/
-  `xhigh`, six levels).** -- **False.** The CLI flag accepts only
-  `low`/`medium`/`high` -- three levels, no per-model override.
+- **Thinking-level map (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/
+  `max`, seven levels -- upstream added `max` after this survey was
+  first written).** -- **False.** The CLI flag accepts only
+  `low`/`medium`/`high` -- three levels, no per-model override, and no
+  `max` level of any kind.
 - **Overriding a built-in provider by reusing its name (upsert-by-id
   merge).** -- **False, inverted.** A custom entry reusing a built-in
   provider's name is silently *dropped*, not merged -- confirmed by a
@@ -1054,8 +1127,9 @@ tables:
   `markdown.codeBlockIndent`, resource-array settings (`packages`,
   `extensions`, `skills`, `prompts`, `themes`).** -- **False, all of
   them.** None exist as `Settings` fields -- confirmed by the struct's
-  complete field list (four fields as of `telemetry_enabled`'s addition
-  above).
+  complete field list (five fields as of `telemetry_enabled`'s addition
+  above: `compact_trigger_tokens`, `compact_keep_recent_tokens`,
+  `compaction_enabled`, `theme`, `telemetry_enabled`).
 - **Two-tier global+project precedence with nested merge.** --
   **False.** Global-only, single file, no merge logic, already stated
   as deliberate in `PARITY.md`.
