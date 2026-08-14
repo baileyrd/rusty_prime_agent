@@ -1115,15 +1115,15 @@ Findings above that describe a real, bounded gap rather than an
 out-of-scope Python-first redesign -- listed as candidates for future
 work, not yet decided or scheduled:
 
-- [ ] **Feed harness notes back into `build_turns`.** The only concrete,
-      bounded gap found in the Continual Harness's actual behavior:
-      notes are durable and rollback-able but invisible to the model
-      except via `/refine`'s own review prompt. A bounded slice would
-      inject `state.harness.notes` as an additional system turn in
-      `build_turns` (`src/session.rs:732`), the same place `AGENTS.md`/
-      compaction already hook in -- needs a design decision on ordering/
-      formatting relative to those two, and on whether all notes or only
-      certain `HarnessNoteKind`s belong in the live prompt.
+- [x] **Feed harness notes back into `build_turns`** -- shipped: new
+      `format_harness_notes` renders `state.harness.notes` as an
+      additional system turn in `build_turns`, right after the
+      `AGENTS.md`/compaction system turns, gated on `notes` being
+      non-empty. The two open design questions this bullet named are
+      both resolved: ordering is context-file, then compaction summary,
+      then harness notes, then the real transcript; every note is
+      included regardless of `HarnessNoteKind` (see `PARITY.md`'s
+      "Bounded candidates batch 5" entry for the reasoning).
 - [ ] **A `session skill create` command** (skill scaffolding: writes a
       `SKILL.md` + package skeleton from a name/description, does not
       need to synthesize skill *logic*) -- would close the "built-in
@@ -1161,14 +1161,16 @@ work, not yet decided or scheduled:
       the same "ordinary prompt vs. explicit follow-up" distinction
       `session message`'s delivery-mode gap below would also need, so
       worth doing together if either is picked up.
-- [ ] **Idempotent replay protection for in-flight requests.** A
-      `SessionPrompt` whose response times out or whose connection drops
-      has no way to know whether the prompt was actually enqueued before
-      retrying -- unlike `daemon.md`'s `clientId + commandId` journal.
-      Bounded first slice: a small in-memory (not necessarily durable)
-      per-worker dedup keyed by a client-supplied request id, rejecting
-      an exact duplicate rather than double-enqueuing -- durability
-      across a worker crash is a separably larger step.
+- [x] **Idempotent replay protection for in-flight requests** -- shipped
+      exactly as the bounded first slice this bullet scoped: `Request::
+      SessionPrompt` gained an optional `request_id`, and new
+      `AgentSession::prompt_with_images_and_request_id` keeps a small
+      in-memory (not durable -- lost on a worker crash/restart, still a
+      separably larger step) per-session dedup cache, returning the
+      cached `TranscriptEntry` again for a repeated id rather than
+      double-enqueuing. Exposed via `harness session prompt <id>
+      --request-id <id> <text...>` -- see `PARITY.md`'s "Bounded
+      candidates batch 5" entry.
 
 From the recursive doc-tree pass:
 

@@ -859,6 +859,50 @@ immediate, safe EOF); the two new tests that actually exercise a real
 piped stdin build their own `Command` with `Stdio::piped()` instead of
 calling `run()`.
 
+## Bounded candidates batch 5: harness notes feedback + idempotency
+
+Two small, independent increments landed together -- see `PARITY.md`'s
+own "Bounded candidates batch 5" entry for the full story of each.
+
+**Harness notes feed `build_turns`.** New `format_harness_notes`
+(`session.rs`), called from `build_turns` right after the context-file
+and compaction-summary system turns, gated the same "only when there's
+something to show" way those two already are (`if !self.state.harness.
+notes.is_empty()`). Every note is included regardless of
+`HarnessNoteKind` -- see `PARITY.md` for why that's the deliberate
+resolution to the design question this bullet's own checklist entry left
+open, not an oversight. Previously the only place `state.harness.notes`
+ever reached the model at all was `client::build_refine_prompt`'s own
+one-off `/refine` review prompt; every ordinary turn since then had
+never seen it.
+
+**Idempotent replay protection.** `Request::SessionPrompt` gained
+`request_id: Option<String>` (`#[serde(default)]`, so an old caller/an
+already-persisted anything is unaffected -- this field is never
+persisted anyway, see below). New `AgentSession::
+prompt_with_images_and_request_id`: `None` behaves exactly like
+`prompt_with_images` (every existing internal caller --
+`/refine`/`/heartbeat`/`session_autonomous`/`fire_one_schedule`/
+`session_message`'s cross-session delivery/etc. -- still passes `None`,
+unaffected); `Some(id)` checks a new `recent_request_ids: HashMap<String,
+TranscriptEntry>` field first, returning the cached entry unchanged for
+a repeat rather than enqueuing a second prompt, otherwise prompting
+normally and remembering the result (a paired `VecDeque<String>` tracks
+insertion order so the oldest entry evicts once `REQUEST_ID_CACHE_CAP`
+(64) is exceeded, keeping a long session's memory bounded). Neither
+field is part of `SessionState` -- in-memory only, per the checklist's
+own "not necessarily durable" scoping, so this cache does not survive a
+worker crash/restart the way `transcript.jsonl`/`state.json` do.
+Threaded end-to-end: `cli::Command::SessionPrompt` gained a
+`--request-id <id>` flag, `daemon::handle_session_prompt` forwards the
+field unchanged from the public request to the private one it sends the
+owning worker, and `worker::run`'s `Request::SessionPrompt` arm calls the
+new `AgentSession` method instead of the old one. The one client-facing
+surface this actually needed: `harness session prompt <id> --request-id
+<id> <text...>`, for a caller wrapping its own retry logic around a
+prompt whose response timed out or whose connection dropped, with no
+other way to tell whether the first attempt actually landed.
+
 ## `providers.json` (custom provider registration)
 
 Parity with letting a session point at any self-hosted OpenAI-compatible

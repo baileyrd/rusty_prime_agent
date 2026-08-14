@@ -160,6 +160,7 @@ pub async fn print_once(
             session_id,
             text,
             images: None,
+            request_id: None,
         },
     )
     .await?;
@@ -1717,7 +1718,8 @@ pub async fn session_repl(state_root: &Path, session_id: String, mode: OutputMod
         let owned_root = state_root.to_path_buf();
         let owned_session_id = session_id.clone();
         current = Some(rusty_tokio::spawn(async move {
-            send_prompt_with_images(&owned_root, &owned_session_id, text_to_send, images).await
+            send_prompt_with_images(&owned_root, &owned_session_id, text_to_send, images, None)
+                .await
         }));
     }
     Ok(())
@@ -2220,15 +2222,21 @@ fn parse_repl_fork_args(rest: &str) -> std::result::Result<(Option<u64>, Option<
 /// `--image <path>` is an unambiguous user intent, so a path that isn't a
 /// readable, recognized image file fails loudly instead of being folded
 /// in as literal text.
+///
+/// `request_id` -- `--request-id <id>` opts this one prompt into
+/// idempotent replay protection; see `protocol::Request::SessionPrompt::
+/// request_id`'s own doc comment. `None` (no flag given) is the ordinary
+/// unprotected path, unchanged from before this parameter existed.
 pub async fn session_prompt(
     state_root: &Path,
     session_id: String,
     text: String,
     image_paths: Vec<String>,
+    request_id: Option<String>,
     mode: OutputMode,
 ) -> Result<()> {
     let entry = if image_paths.is_empty() {
-        send_prompt(state_root, &session_id, text).await?
+        send_prompt_with_images(state_root, &session_id, text, None, request_id).await?
     } else {
         let mut images = Vec::with_capacity(image_paths.len());
         for path in &image_paths {
@@ -2243,7 +2251,7 @@ pub async fn session_prompt(
             })?;
             images.push(data_uri);
         }
-        send_prompt_with_images(state_root, &session_id, text, Some(images)).await?
+        send_prompt_with_images(state_root, &session_id, text, Some(images), request_id).await?
     };
     match mode {
         OutputMode::Json => print_json(&Response::SessionPromptAck { entry }),
@@ -2265,19 +2273,23 @@ async fn send_prompt(
     session_id: &str,
     text: String,
 ) -> Result<crate::protocol::TranscriptEntry> {
-    send_prompt_with_images(state_root, session_id, text, None).await
+    send_prompt_with_images(state_root, session_id, text, None, None).await
 }
 
 /// Parity with a bounded slice of `prime-agent`'s image-paste feature --
 /// see `PARITY.md`'s own "Interactive TUI: image paste support" entry.
 /// `images` is a list of `data:<mime>;base64,<...>` URIs, the same shape
 /// `protocol::TranscriptEntry::images`/`provider::ChatTurn::images`
-/// already use.
+/// already use. `request_id` is `None` for every caller except
+/// [`session_prompt`]'s own `--request-id` flag -- see
+/// `protocol::Request::SessionPrompt::request_id`'s own doc comment for
+/// what it does.
 async fn send_prompt_with_images(
     state_root: &Path,
     session_id: &str,
     text: String,
     images: Option<Vec<String>>,
+    request_id: Option<String>,
 ) -> Result<crate::protocol::TranscriptEntry> {
     let mut conn = connect(state_root).await?;
     conn.write_request(
@@ -2286,6 +2298,7 @@ async fn send_prompt_with_images(
             session_id: session_id.to_string(),
             text,
             images,
+            request_id,
         },
     )
     .await?;

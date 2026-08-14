@@ -567,11 +567,16 @@ async fn handle_private_connection(
             }
             Ok(())
         }
-        Request::SessionPrompt { text, images, .. } => {
+        Request::SessionPrompt {
+            text,
+            images,
+            request_id,
+            ..
+        } => {
             let entry = session
                 .lock()
                 .await
-                .prompt_with_images(text, images)
+                .prompt_with_images_and_request_id(text, images, request_id)
                 .await?;
             conn.write_response(Context::Worker, &Response::SessionPromptAck { entry })
                 .await

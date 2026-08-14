@@ -140,6 +140,24 @@ pub enum Request {
         /// `/file`/`@`-reference image handling and `session prompt
         /// --image <path>`.
         images: Option<Vec<String>>,
+        /// Bounded first slice of idempotent replay protection
+        /// (`CLAIMS_AUDIT.md`'s own "Idempotent replay protection for
+        /// in-flight requests" entry): a caller-supplied id opting this
+        /// one prompt into dedup. `None` (every existing caller except
+        /// `session prompt --request-id <id>`) means no protection at
+        /// all, the same as before this field existed -- a client that
+        /// never retries doesn't need it. When `Some`, the *worker*
+        /// (`AgentSession::prompt_with_images_and_request_id`) keeps a
+        /// small in-memory (not durable -- lost on worker crash/restart,
+        /// a separately larger step) cache of recently-seen ids; a
+        /// second `SessionPrompt` carrying an id already in that cache
+        /// returns the exact same `TranscriptEntry` again instead of
+        /// enqueuing a second prompt -- what a caller retrying after a
+        /// timed-out/dropped connection needs to avoid double-sending,
+        /// without a `daemon.md`-style durable `clientId + commandId`
+        /// journal.
+        #[serde(default)]
+        request_id: Option<String>,
     },
     /// Parity with `prime-agent stop <agent>`: gracefully shut down one
     /// session's worker without touching any other session or the

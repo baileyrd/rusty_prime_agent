@@ -82,6 +82,23 @@ fn read_context_file(state_root: &Path) -> Option<String> {
     None
 }
 
+/// Renders `state.harness.notes` as one system-turn's worth of text --
+/// `build_turns`'s own call site is the only caller, gated on `notes`
+/// being non-empty there. Same `- (Kind) text` bullet-list shape
+/// `client::build_refine_prompt` already uses to show the current notes
+/// back to the model inside `/refine`'s own review prompt -- reusing the
+/// shape, not the function, since that one also has to interleave a
+/// trajectory window this doesn't need.
+fn format_harness_notes(notes: &[HarnessNote]) -> String {
+    let mut text = String::from(
+        "Supplemental harness notes (durable state added via `session harness add`/`/refine`):\n",
+    );
+    for note in notes {
+        text.push_str(&format!("- ({:?}) {}\n", note.kind, note.text));
+    }
+    text.trim_end().to_string()
+}
+
 /// Finds `HEARTBEAT_MARKER` in `stdout` (if present) and returns
 /// `(every_argument, stdout_with_the_marker_line_removed)`.
 /// `worker::bootstrap_kernel`'s `rlm_heartbeat(every=None)` prints
@@ -333,7 +350,29 @@ pub struct AgentSession {
     /// call so a flag set (or left set) after one turn already finished
     /// can never leak into cancelling an unrelated later one.
     cancel_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bounded first slice of idempotent replay protection
+    /// (`CLAIMS_AUDIT.md`'s own "Idempotent replay protection for
+    /// in-flight requests" entry) -- see
+    /// [`prompt_with_images_and_request_id`](Self::
+    /// prompt_with_images_and_request_id) for the actual dedup check.
+    /// In-memory only, never persisted to `state.json`/`transcript.
+    /// jsonl` -- lost on a worker crash/restart, the same "durability is
+    /// a separably larger step" bound the checklist entry itself states.
+    /// `recent_request_id_order` tracks insertion order so
+    /// `REQUEST_ID_CACHE_CAP` can evict the oldest entry first, keeping
+    /// a long-lived session's memory use bounded rather than growing
+    /// forever.
+    recent_request_ids: std::collections::HashMap<String, TranscriptEntry>,
+    recent_request_id_order: std::collections::VecDeque<String>,
 }
+
+/// How many distinct `request_id`s [`AgentSession::
+/// prompt_with_images_and_request_id`] remembers per session before
+/// evicting the oldest -- generous enough to absorb a real retry burst
+/// (a client backing off and retrying a handful of times) without
+/// growing unbounded over a long-lived session that's never actually
+/// crashed.
+const REQUEST_ID_CACHE_CAP: usize = 64;
 
 /// Creation-time-only metadata for a brand-new session -- bundled so
 /// `AgentSession::create`/`worker::spawn`'s own argument lists don't keep
@@ -452,6 +491,8 @@ impl AgentSession {
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
             cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recent_request_ids: std::collections::HashMap::new(),
+            recent_request_id_order: std::collections::VecDeque::new(),
         };
         session.write_state().await?;
         // Opt-in, local-only telemetry -- see `telemetry`'s own module
@@ -517,6 +558,8 @@ impl AgentSession {
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
             cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recent_request_ids: std::collections::HashMap::new(),
+            recent_request_id_order: std::collections::VecDeque::new(),
         };
         session.write_state().await?;
         Ok(session)
@@ -625,6 +668,45 @@ impl AgentSession {
             serde_json::json!({"ok": result.is_ok(), "tool_rounds": tool_rounds}),
         );
         result
+    }
+
+    /// Bounded first slice of idempotent replay protection
+    /// (`CLAIMS_AUDIT.md`'s own "Idempotent replay protection for
+    /// in-flight requests" entry) -- see `protocol::Request::
+    /// SessionPrompt::request_id`'s own doc comment for the wire-level
+    /// story. `request_id: None` (every existing caller) is exactly
+    /// [`prompt_with_images`](Self::prompt_with_images), unchanged.
+    /// `request_id: Some(id)` already present in
+    /// [`recent_request_ids`](Self::recent_request_ids) returns the same
+    /// cached `TranscriptEntry` again without prompting the provider a
+    /// second time -- what a caller retrying after a timed-out/dropped
+    /// connection needs, since it can't otherwise tell whether its first
+    /// attempt actually landed. A *new* `request_id` behaves exactly
+    /// like `prompt_with_images`, then remembers the result, evicting
+    /// the oldest remembered id once [`REQUEST_ID_CACHE_CAP`] is
+    /// exceeded.
+    pub async fn prompt_with_images_and_request_id(
+        &mut self,
+        text: String,
+        images: Option<Vec<String>>,
+        request_id: Option<String>,
+    ) -> Result<TranscriptEntry> {
+        if let Some(id) = &request_id {
+            if let Some(cached) = self.recent_request_ids.get(id) {
+                return Ok(cached.clone());
+            }
+        }
+        let entry = self.prompt_with_images(text, images).await?;
+        if let Some(id) = request_id {
+            self.recent_request_ids.insert(id.clone(), entry.clone());
+            self.recent_request_id_order.push_back(id);
+            if self.recent_request_id_order.len() > REQUEST_ID_CACHE_CAP {
+                if let Some(oldest) = self.recent_request_id_order.pop_front() {
+                    self.recent_request_ids.remove(&oldest);
+                }
+            }
+        }
+        Ok(entry)
     }
 
     async fn prompt_with_images_inner(
@@ -1526,6 +1608,7 @@ impl AgentSession {
                 session_id: to_id.clone(),
                 text: prefixed,
                 images: None,
+                request_id: None,
             },
         )
         .await?;
@@ -1667,7 +1750,18 @@ impl AgentSession {
     /// as an even earlier system turn -- read fresh on every call (no
     /// caching, no persisted state) so an edit takes effect on the very
     /// next prompt, same as `skills::discover`/`prompt_template::
-    /// discover` already do for their own on-disk sources.
+    /// discover` already do for their own on-disk sources. Also where
+    /// `state.harness.notes` (see `format_harness_notes`) becomes
+    /// visible, as a third system turn after those two -- previously
+    /// durable and rollback-able (`session harness add`/`rollback`,
+    /// `/refine`) but invisible to the model on an ordinary turn, only
+    /// ever surfaced via `/refine`'s own one-off review prompt
+    /// (`client::build_refine_prompt`). Every note, regardless of
+    /// `HarnessNoteKind` -- a caller who explicitly added supplemental
+    /// state (`Prompt`/`Memory`/`SkillDescription` alike) meant it to
+    /// influence the session; the kind is a categorization label for
+    /// display/filtering, not a signal that some kinds should stay
+    /// hidden from the model that's supposed to act on them.
     fn build_turns(&self) -> Vec<ChatTurn> {
         let boundary = self
             .state
@@ -1693,6 +1787,16 @@ impl AgentSession {
                     "Summary of earlier conversation (compacted to save context): {}",
                     compaction.summary
                 )),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                images: None,
+            });
+        }
+        if !self.state.harness.notes.is_empty() {
+            turns.push(ChatTurn {
+                role: TurnRole::System,
+                content: Some(format_harness_notes(&self.state.harness.notes)),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -2496,6 +2600,7 @@ async fn append_transcript_line(session_dir: &Path, entry: &TranscriptEntry) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::HarnessNoteKind;
 
     fn entry(sequence: u64, text: &str) -> TranscriptEntry {
         TranscriptEntry {
@@ -2690,6 +2795,93 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn build_turns_includes_harness_notes_as_a_system_turn() {
+        let root = temp_state_root("build-turns-harness-notes");
+
+        let mut session = AgentSession::create(
+            &root,
+            "sess-harness-notes-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session
+            .update_harness(HarnessAction::Add {
+                kind: HarnessNoteKind::Memory,
+                text: "always double-check units".to_string(),
+            })
+            .await
+            .unwrap();
+        session
+            .update_harness(HarnessAction::Add {
+                kind: HarnessNoteKind::Prompt,
+                text: "be terse".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let turns = session.build_turns();
+        assert_eq!(turns.len(), 1, "got: {turns:?}");
+        assert_eq!(turns[0].role, TurnRole::System);
+        let content = turns[0].content.as_deref().unwrap();
+        assert!(
+            content.contains("always double-check units"),
+            "got: {content}"
+        );
+        assert!(content.contains("be terse"), "got: {content}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn build_turns_has_no_harness_notes_turn_when_none_exist() {
+        let root = temp_state_root("build-turns-no-harness-notes");
+
+        let session = AgentSession::create(
+            &root,
+            "sess-no-harness-notes-test".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        assert!(session.build_turns().is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn format_harness_notes_lists_every_note_with_its_kind() {
+        let notes = vec![
+            HarnessNote {
+                id: "note-1".to_string(),
+                kind: HarnessNoteKind::Memory,
+                text: "remember this".to_string(),
+                added_at_ms: 0,
+            },
+            HarnessNote {
+                id: "note-2".to_string(),
+                kind: HarnessNoteKind::SkillDescription,
+                text: "weather skill fetches forecasts".to_string(),
+                added_at_ms: 0,
+            },
+        ];
+        let text = format_harness_notes(&notes);
+        assert!(text.contains("remember this"), "got: {text}");
+        assert!(
+            text.contains("weather skill fetches forecasts"),
+            "got: {text}"
+        );
+        assert!(text.contains("Memory"), "got: {text}");
+        assert!(text.contains("SkillDescription"), "got: {text}");
     }
 
     #[rusty_tokio::test]
@@ -3828,6 +4020,161 @@ mod tests {
             .find(|e| e.role == Role::User)
             .expect("a user entry should exist");
         assert_eq!(user_entry.images, Some(images));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn a_repeated_request_id_returns_the_same_entry_without_prompting_again() {
+        let root = temp_state_root("request-id-dedup");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-request-id-dedup".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        let first = session
+            .prompt_with_images_and_request_id("hello".to_string(), None, Some("req-1".to_string()))
+            .await
+            .unwrap();
+        let second = session
+            .prompt_with_images_and_request_id(
+                // Different text on purpose -- a genuine retry sends the
+                // *same* request, but this proves the dedup check
+                // short-circuits before the provider is ever asked
+                // again, rather than happening to produce the same
+                // answer by coincidence.
+                "a different prompt entirely".to_string(),
+                None,
+                Some("req-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.sequence, second.sequence,
+            "a duplicate request id must return the exact cached entry, not a fresh one"
+        );
+        assert_eq!(first.text, second.text);
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|e| e.role == Role::User)
+                .count(),
+            1,
+            "a duplicate request id must not have enqueued a second prompt"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn distinct_request_ids_are_not_deduped_against_each_other() {
+        let root = temp_state_root("request-id-distinct");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-request-id-distinct".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session
+            .prompt_with_images_and_request_id("one".to_string(), None, Some("req-a".to_string()))
+            .await
+            .unwrap();
+        session
+            .prompt_with_images_and_request_id("two".to_string(), None, Some("req-b".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|e| e.role == Role::User)
+                .count(),
+            2,
+            "two distinct request ids must both be enqueued"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn a_missing_request_id_never_dedupes_anything() {
+        let root = temp_state_root("request-id-none");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-request-id-none".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        session
+            .prompt_with_images_and_request_id("one".to_string(), None, None)
+            .await
+            .unwrap();
+        session
+            .prompt_with_images_and_request_id("two".to_string(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|e| e.role == Role::User)
+                .count(),
+            2,
+            "no request id at all must behave exactly like the ordinary unprotected path"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn the_request_id_cache_evicts_the_oldest_entry_once_the_cap_is_exceeded() {
+        let root = temp_state_root("request-id-cap");
+        let mut session = AgentSession::create(
+            &root,
+            "sess-request-id-cap".to_string(),
+            NewSessionMeta::default(),
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("session creation should succeed");
+
+        for i in 0..=REQUEST_ID_CACHE_CAP {
+            session
+                .prompt_with_images_and_request_id(
+                    format!("turn {i}"),
+                    None,
+                    Some(format!("req-{i}")),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session.recent_request_ids.len(),
+            REQUEST_ID_CACHE_CAP,
+            "the cache must stay bounded at the cap, not grow without limit"
+        );
+        assert!(
+            !session.recent_request_ids.contains_key("req-0"),
+            "the oldest entry should have been evicted"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

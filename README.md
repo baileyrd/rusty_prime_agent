@@ -176,7 +176,7 @@ stays reachable, the same as after any other supervisor crash.
 harness session new [--name NAME] [--model PROVIDER/MODEL] [--goal TEXT] [--thinking low|medium|high] [--tools read|mcp] [--runtime ipython]
 harness session attach <id>          # streams the transcript live
 harness session list                 # id, status, name, turns, model, ...
-harness session prompt <id> [--image PATH]... <text...>
+harness session prompt <id> [--image PATH]... [--request-id ID] <text...>
 harness session stop <id>            # gracefully shuts down one worker
 harness session rename <id> <name>
 harness session compact <id> [instructions...]   # force compaction now
@@ -193,6 +193,15 @@ session id instead of the full string -- `session stop sess-1a2b3` works
 as long as exactly one session starts with `sess-1a2b3`. A prefix
 matching zero or more than one session is reported the same as an
 unknown id outright, not guessed at.
+
+`session prompt <id> --request-id <id>` opts that one prompt into
+idempotent replay protection: if the connection drops or the response
+times out and you retry with the *same* `--request-id`, the worker
+recognizes it and returns the original reply again instead of sending
+the prompt a second time. Bounded and in-memory only -- lost if the
+worker itself crashes/restarts, and only ever a defense against a
+retried client, not a durable request journal. Omit the flag (the
+default) for the ordinary, unprotected behavior.
 
 `session prompt <id> --image <path>` attaches a local image (recognized
 by extension: png/jpg/jpeg/gif/webp/bmp) to the prompt, encoded as a
@@ -516,7 +525,11 @@ harness session refine <id>          # reviews the trajectory, proposes one smal
 ```
 
 Every `add`/`rollback` is recorded in history, so a rollback is itself
-auditable rather than destructive.
+auditable rather than destructive. Every current note is fed back into
+the model's own prompt as a system turn on every ordinary `session
+prompt`/`session repl` turn (not just visible during `/refine`'s own
+review pass) -- add a note and it starts influencing the session
+immediately.
 
 ### Recursive subagents
 
