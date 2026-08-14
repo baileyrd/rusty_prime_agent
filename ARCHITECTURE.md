@@ -30,6 +30,7 @@ project's current shape.
 | `worker` | The per-session process: binds a private socket, owns one `AgentSession`, serves `SessionAttach`/`SessionPrompt`/`WorkerShutdown` |
 | `session` | `AgentSession` -- transcript, `state.json` (including the persistent `goal: Option<GoalState>`, Continual Harness `harness: HarnessState`, recursive-subagent `parent_id: Option<String>`, `thinking: Option<String>` (`--thinking low/medium/high`), `tools: Option<String>` (`--tools read|mcp`), and `runtime: Option<String>` (`--runtime ipython`), see `PARITY.md`), the (fake) model provider, a lazily-connected `mcp_client::McpClient`, a real or no-op `tool_runtime::ToolRuntime`, the per-worker event broadcast. `prompt`'s own tool-calling loop (build the turn history, call the provider, execute any requested tools -- `tools::execute` for `--tools read`, `McpClient::call_tool` for `--tools mcp`, `tool_runtime::ToolRuntime::execute` for the `execute_python` tool `--runtime ipython` offers, independent of and combinable with `--tools` -- loop) lives here too, capped at 8 rounds. Also owns `NewSessionMeta`, the bundled creation-time metadata (`name`/`model`/`goal`/`parent_id`/`thinking`/`tools`/`runtime`, plus the RLM admission fields `rlm_depth`/`rlm_max_depth`/`spawned_from_sequence` -- see the RLM programming-model section below) `AgentSession::create`/`worker::spawn` both take, keeping their own argument lists from growing every time a new `session new`-seedable field is added |
 | `catalog` | `session list`'s directory scan, cross-checked against process liveness |
+| `acp` | `harness acp [--model PROVIDER/MODEL]` -- the ACP (Agent Client Protocol) server, a bounded, schema-verified slice reusing `client::dispatch_one_shot` for every session operation rather than its own daemon-side handler -- see "ACP mode" below |
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
@@ -542,6 +543,40 @@ background lane gets one real chance to drain events the last command
 already produced -- see `PARITY.md` for why this is closing this
 process's own scheduling latency, not waiting on the provider), same
 convention `session_repl` uses.
+
+## ACP mode
+
+Parity with `prime-agent --mode acp` -- see `PARITY.md` for the full
+story, including exactly which of ACP's own schema-defined methods are
+implemented and which are deliberately cut. `acp::run` (`harness acp
+[--model PROVIDER/MODEL]`) implements the baseline agent method surface
+ACP's own schema names as one coherent unit (`AgentCapabilities.session
+= {}` is spec-defined to mean `session/new`/`session/prompt`/
+`session/cancel`/`session/update`), plus `session/close`. Every shape
+was checked against ACP's own canonical `schema/v2/schema.json` (fetched
+directly from `agentclientprotocol/agent-client-protocol` on GitHub),
+the same "direct probe of the real thing" standard MCP integration and
+the ZMTP client both already met before either had a line of code
+written against them.
+
+Unlike `session_rpc`, this connection's own message loop doesn't process
+one stdin line at a time: `acp::run` spawns each incoming message as its
+own task, so a `session/cancel` notification arriving while a prior
+`session/prompt` request is still in flight is read and dispatched
+immediately (`Request::SessionInterrupt`) rather than queued behind it
+-- a real fix for the same class of "busy loop can't act on a new line
+until it's done" limitation `session_repl`'s own steering gap has (see
+`PARITY.md`'s Interactive TUI entry). `stdout_lock` (the same
+`Arc<Mutex<()>>` pattern `session_rpc` already uses) keeps concurrent
+responses/notifications from interleaving mid-line; every spawned task
+is awaited before the connection closes, so nothing from stdin's last
+line is lost the way `session_rpc`'s own fixed grace-window sleep has to
+defend against. An ACP `sessionId` is this project's own session id
+string directly -- no separate mapping table, since the two id spaces
+already coincide. `session/close` maps to `Request::SessionStop` (the
+worker actually stops), not this project's usual "closing the client
+detaches; it does not stop the worker" default, because ACP's own spec
+explicitly requires freeing the session's resources on close.
 
 ## Context files (`AGENTS.md`/`CLAUDE.md`)
 
