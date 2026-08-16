@@ -1806,6 +1806,46 @@ check is repeated under the lock, re-reading `state.json` rather than
 trusting the pre-lock snapshot, since dropping that second read would
 trade the queueing problem for a double-spawn.
 
+**Ruled out, with evidence: routing `catalog.rs`/`schedule.rs`'s reads
+through `spawn_blocking`.** The residual "daemon did not respond in
+time" flake (still present after the two fixes above -- unchanged rate
+across measurement, not merely unclaimed) looked, by inspection, like
+the same class of bug: `catalog::scan`/`catalog::read_session_state`
+and every function in `schedule.rs` ran a synchronous `std::fs` call
+directly inside an async daemon handler, unlike every write path
+(`session::write_state`, `request_journal`), which already went
+through `spawn_blocking`. A standalone repro against the pinned
+`rusty_tokio` rev confirmed the abstract mechanism is real: occupying
+every worker thread with a 300ms blocking call delays an unrelated
+concurrent task's own response by the same ~300ms, regardless of
+worker-thread count; moving that work into `spawn_blocking` drops the
+delay to microseconds. Routing the reads through `spawn_blocking` to
+match was tried, and measured on real CI before landing --
+`nightly-stress`'s own `flake-watch` job, run before and after on the
+same 20-run budget. It made the rate *worse*: 16/20 clean before
+dropped to 13/20 clean after, and the flake spread to commands that had
+never shown it (`session_prompt`, `branch-summary`, a request-journal
+replay test), plus two new, previously-unseen `acp_cancel_notification`
+timeouts. Reverted.
+
+Why: `rusty_tokio`'s `spawn_blocking` grows its blocking-thread pool by
+calling `std::thread::Builder::spawn()` synchronously, inline, on
+whatever thread called `spawn_blocking` -- i.e. on one of this
+process's own async worker threads, the exact resource the fix was
+trying to protect. Every test here spins a brand-new, short-lived
+daemon process, so that pool starts cold every time; routing these
+reads through it meant nearly every request in nearly every test now
+had a real chance of paying an OS thread-creation cost on the request
+path that the original direct-inline read never did. Multiplied across
+the ~30 test binaries `flake-watch` runs concurrently, that is *more*
+total thread-creation activity contending for the same constrained
+runner, not less blocking-on-the-executor. The mechanism the standalone
+repro proved does not transfer to this workload shape, where the pool
+never lives long enough to amortize its own setup cost. Left open for a
+future session: a pre-warmed pool, a narrower scope, or a different
+primitive entirely would all need the same before/after measurement,
+not reasoning alone, before landing.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
