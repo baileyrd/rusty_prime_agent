@@ -1580,15 +1580,38 @@ stale-socket classification in this project depends on -- have no
 supervisor identity to present. Fencing liveness probes would make a
 worker undetectable rather than unreachable, which is strictly worse.
 
-The handshake read is bounded (`FENCE_HANDSHAKE_TIMEOUT`, 5s) rather than
-unbounded, and that bound is load-bearing rather than defensive padding.
-A `connect()` to a worker socket can succeed against a *dead* listener's
-accept backlog -- the exact hazard `transport::probe`'s own doc comment
-exists to warn about -- so an unbounded read waits forever for a reply
-nobody will send, turning "this worker is gone" into a hang that only
-surfaces when the client's own 120s prompt timeout expires. Failing fast
-lets the supervisor report something true, and lets the next attempt
-respawn the worker once its pid stops reading as alive.
+**Acceptance is silent, and that is a performance requirement rather
+than a style choice.** The supervisor writes the preamble and its real
+request back to back and reads one response, so a fenced request costs
+exactly one round trip -- what it cost before fencing existed. An earlier
+revision had the worker answer `WorkerAuthOk` first, and the cost was
+real: waiting for it forces the worker to be *scheduled twice* per
+request, and under a saturated reactor (this project's own suite runs
+~30 daemon/worker pairs at once) that queuing stacks up against the
+client's 5s `RESPONSE_TIMEOUT`. Measured over three full-suite runs,
+counting `daemon did not respond in time`: **3 on `main`, 10 with the
+ack, 2 with it removed** -- i.e. the ack accounted for every added
+failure, against a pre-existing baseline of ~3. It first showed up as
+two CI failures on different ubuntu tests, each stalling at exactly 5.0s.
+
+The fence property is untouched by that: the worker still validates the
+preamble *before acting on* the request that follows it. Only the
+supervisor's blocking-to-hear-it-passed is gone. On rejection the worker
+drains the in-flight request line before answering -- the supervisor's
+request is already on its way, so replying and closing without consuming
+it would race into an `EPIPE` and replace the specific "you are fenced
+out" message with a generic broken-pipe error, at exactly the moment the
+specific one matters.
+
+`adopt_worker` does still wait for its reply, and that read is bounded
+(`FENCE_HANDSHAKE_TIMEOUT`, 2s, deliberately under the client's 5s
+`RESPONSE_TIMEOUT` so the supervisor gives up first and its own
+diagnosis is what reaches the caller). The bound is load-bearing: a
+`connect()` to a worker socket can succeed against a *dead* listener's
+accept backlog -- the exact hazard `transport::probe`'s doc comment
+warns about -- so an unbounded read there waits forever for a reply
+nobody will send. Adoption is a once-per-restart operation, so the round
+trip it costs is not on any hot path.
 
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal

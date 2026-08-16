@@ -116,12 +116,27 @@ daemon/worker split rather than requiring the Python control environment:
   `handle_public_connection` now converts a `Conflict` into a terminal
   `Response::Error`, gated on `LineStream::has_written()` so a
   partially-streamed attach never gets a stray trailing line appended to
-  its event stream. And the handshake read needed a bound
-  (`FENCE_HANDSHAKE_TIMEOUT`): a `connect()` can succeed against a dead
-  listener's accept backlog -- the hazard `transport::probe` already
-  documents -- so an unbounded read turned "this worker is gone" into a
-  120s hang instead of a fast, true error. That one was found by a test,
-  not by inspection.
+  its event stream. And `adopt_worker`'s reply read needed a bound
+  (`FENCE_HANDSHAKE_TIMEOUT`, 2s, under the client's own 5s
+  `RESPONSE_TIMEOUT` so the supervisor gives up first): a `connect()` can
+  succeed against a dead listener's accept backlog -- the hazard
+  `transport::probe` already documents -- so an unbounded read turned
+  "this worker is gone" into a hang instead of a fast, true error. That
+  one was found by a test, not by inspection.
+
+  One thing the first cut got outright wrong, worth recording because
+  only measurement caught it. The handshake originally waited for a
+  `WorkerAuthOk` before the caller could send its request, making every
+  private request two round trips instead of one -- which forces the
+  worker to be scheduled twice per request, and under a saturated
+  reactor stacks up against that same 5s client budget. It surfaced as
+  two CI failures on different ubuntu tests, each stalling at exactly
+  5.0s. Counting `daemon did not respond in time` over three full-suite
+  runs: **3 on `main`, 10 with the ack, 2 once acceptance was made
+  silent** -- the ack accounted for every added failure. The supervisor
+  now writes the preamble and the real request back to back, so a fenced
+  request costs exactly what it cost before fencing existed; the worker
+  still validates before acting, so nothing about the guarantee changed.
 
   Tested in `tests/worker_fence.rs` (5 tests), which covers the refusal
   direction a passing happy path structurally cannot show, plus the
