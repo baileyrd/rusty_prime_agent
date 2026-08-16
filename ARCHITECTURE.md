@@ -1839,6 +1839,41 @@ window. Fixed by routing every read in `catalog.rs`/`schedule.rs`
 through `spawn_blocking`, the same way the write paths already did --
 see those modules' own doc comments.
 
+**First attempt at this fix measured worse, and was reverted before it
+was understood why.** `rusty_tokio`'s `spawn_blocking` grows its
+blocking-thread pool by calling `std::thread::Builder::spawn()`
+synchronously, inline, on whatever thread called `spawn_blocking` --
+i.e. on one of this process's own async worker threads, the exact
+resource this fix protects. Every test here spins a brand-new,
+short-lived daemon process, so that pool starts cold every time;
+routing `catalog.rs`/`schedule.rs`'s reads through it without warming
+it first meant nearly every request in nearly every test had a real
+chance of paying an OS thread-creation cost on the request path that
+the original direct-inline read never did -- multiplied across the ~30
+test binaries `flake-watch` runs concurrently, more total
+thread-creation activity contending for the same constrained runner,
+not less blocking-on-the-executor. Measured on `nightly-stress`'s own
+`flake-watch` job before landing (the same discipline this document
+asks of every claim in this section): 16/20 clean on `main`, 13/20
+clean with the unwarmed fix -- worse, and not merely unclaimed to be
+better.
+
+**Fixed properly by pre-warming the pool once, at supervisor startup,
+before `recover_on_startup`'s own first read** (`daemon::run`, right
+after the state directories are created) -- `let _ =
+rusty_tokio::spawn_blocking(|| {}).await;`. That pays the one
+thread-creation cost off the client-visible critical path entirely:
+`client::wait_ready`'s poll is waiting on `daemon.sock` to bind, which
+happens well after this. One thread is enough for the common case,
+since sequential requests reuse an already-alive pool thread rather
+than growing it further; a genuine burst can still grow the pool same
+as it always could, just no longer guaranteed to on request one. Same
+`flake-watch` measurement, same 20-run budget: 19/20 clean, one target
+flake hit instead of two. Best of the three measurements, though a
+single 20-run sample is still a small denominator -- read the rate a
+future `flake_runs=50`+ dispatch reports before treating this as fully
+closed.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
