@@ -165,6 +165,16 @@ jobs:
         # that is merely non-zero is not by itself actionable. The
         # `process-stress` job above is what gates.
         continue-on-error: true
+        env:
+          # Overrides the workflow-level `RUST_BACKTRACE: 1` for this
+          # step only. These panics come through the shared
+          # `common::assert_success` helper, so the frames are identical
+          # unwind boilerplate on every failure while the message is what
+          # differs -- and 30 frames per panic would push the next
+          # message out of the `-A 6` window below. `process-stress`
+          # keeps backtraces: it gates, and a gating failure is one
+          # someone will actually debug from the log.
+          RUST_BACKTRACE: 0
         run: |
           set -uo pipefail
           runs="${{ github.event.inputs.flake_runs || '5' }}"
@@ -192,6 +202,22 @@ jobs:
               # herestring reports 1, not 0, which would have made every
               # clean run read as "1 failing".
               echo "run $i: $(wc -l <<<"$names" | tr -d ' ') failing"
+
+              # `$out` is captured, so without this the panic text is
+              # discarded and the job reports *which* test failed while
+              # throwing away *why*. That is not a hypothetical loss: a
+              # 1/20 failure here had to be re-reproduced locally purely
+              # to read one line of stderr, and that line ("daemon did
+              # not respond in time") was the whole diagnosis -- it
+              # identified a 5s client-side deadline rather than any
+              # fault in the test that happened to be holding the bag.
+              #
+              # Grouped so 20 runs of detail stay collapsed in the UI,
+              # and grepped rather than dumped because `$out` is a full
+              # ~30-binary suite log.
+              echo "::group::run $i failure detail"
+              grep -A 6 -E '^thread .* panicked at ' <<<"$out" || true
+              echo "::endgroup::"
             fi
           done
 
