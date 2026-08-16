@@ -157,7 +157,15 @@ jobs:
             out=$(cargo test --no-fail-fast 2>&1) || true
             # Failing test names are listed one per line, indented, under
             # the trailing `failures:` block of each test binary.
-            names=$(grep -E '^    [a-z0-9_:]+$' <<<"$out" | tr -d ' ' | sort -u)
+            # `|| true` is load-bearing, not defensive. GitHub invokes
+            # `shell: bash` as `bash --noprofile --norc -e -o pipefail`,
+            # and the `set` above cannot clear that inherited `-e`. On a
+            # clean run `grep` exits 1, `pipefail` makes the pipeline exit
+            # 1, and `-e` then kills the script here -- before a single
+            # `run N:` line or the summary block. Which is exactly what it
+            # did: this job reported nothing at all until the `|| true`
+            # was added, and `continue-on-error` hid the exit code.
+            names=$(grep -E '^    [a-z0-9_:]+$' <<<"$out" | tr -d ' ' | sort -u || true)
             if [ -z "$names" ]; then
               clean=$(( clean + 1 ))
               echo "run $i: clean"
