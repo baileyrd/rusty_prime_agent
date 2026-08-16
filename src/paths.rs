@@ -8,6 +8,7 @@
 //!     <session-id>/
 //!       transcript.jsonl   append-only event log (source of truth)
 //!       state.json         small recovery-pointer snapshot
+//!       worker-fence.json  supervisor generation fence + worker token
 //!       worker.sock        private worker socket (supervisor <-> worker)
 //! ```
 //!
@@ -92,6 +93,20 @@ pub fn transcript_path(session_dir: &std::path::Path) -> PathBuf {
 
 pub fn state_file_path(session_dir: &std::path::Path) -> PathBuf {
     session_dir.join("state.json")
+}
+
+/// The worker's generation fence (`crate::fence::WorkerFence`) -- which
+/// supervisor process is currently authorized to command this session's
+/// worker, plus the per-worker token required to change that answer.
+///
+/// Nested under the readable `session_dir` alongside `state.json` rather
+/// than flattened the way `worker_socket_path` has to be: this is an
+/// ordinary file, so it carries none of AF_UNIX's `sun_path` length
+/// limit. Written owner-only (`fence::WorkerFence::write`), matching
+/// `daemon.md`'s own "worker descriptors, auth tokens ... are written
+/// with owner-only permissions".
+pub fn worker_fence_path(session_dir: &std::path::Path) -> PathBuf {
+    session_dir.join("worker-fence.json")
 }
 
 /// Parity with `prime-agent schedule` -- see `crate::schedule`'s own

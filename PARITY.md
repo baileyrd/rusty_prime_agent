@@ -74,6 +74,80 @@ environment:
 Would need a new subsystem, but one that composes with the existing
 daemon/worker split rather than requiring the Python control environment:
 
+- [x] **Generation-fenced per-worker tokens** (`daemon.md`: "private
+  worker connections authenticate with a per-worker token fenced to the
+  current supervisor generation, preventing a stale replacement
+  supervisor from commanding an adopted worker"). Surfaced by
+  `COMPARISON.md`'s structural pass as the highest-leverage idea in the
+  reference design this project hadn't taken, and it composes with the
+  existing split rather than changing it: `src/fence.rs` writes an
+  owner-only `worker-fence.json` per session (a per-worker 128-bit token
+  plus the `SupervisorIdentity` currently authorized), `worker::spawn`
+  writes it *before* the spawn so no worker is ever briefly unfenced, and
+  `daemon::Supervisor::connect_worker` became the single chokepoint every
+  private connection in the codebase goes through -- the old
+  ~15 direct `transport::connect(Context::Worker, ...)` call sites were
+  all routed through it, so there is exactly one place the preamble could
+  be forgotten.
+
+  One deliberate divergence from the reference design, forced by
+  something this project doesn't have. Upstream compares generations by
+  identity-equality only, never ordering (`R-PROTO-18`), because its
+  atomic supervisor launch lease (`R-SUP-03`) already guarantees a single
+  legitimate supervisor. This project's `Supervisor::spawn_lock` is
+  in-process memory standing in for that lease, so equality alone would
+  have been unsound: a stale supervisor can read the token off disk (same
+  OS user -- this was never a privilege boundary) and re-adopt the worker
+  back, making the fence a no-op. `SupervisorIdentity` is therefore a
+  `(counter, instance)` pair, with adoption requiring a **strictly
+  greater** counter -- the one thing a stale supervisor cannot produce.
+  The residual hole is a concurrent-startup tie, which fails closed in
+  both directions (visible adoption failure, never two supervisors
+  commanding one worker); closing it properly needs the real on-disk
+  launch lease, tracked separately below.
+
+  Three things fell out of the work that weren't in its original scope
+  but were wrong to leave. `Request::Ping` had to stay exempt from the
+  fence (`transport::probe`/`wait_ready` have no supervisor identity to
+  present, and fencing liveness probes would make a worker *undetectable*
+  rather than unreachable). A fence rejection was initially propagating
+  all the way out to the accept loop's `eprintln!`, leaving the client
+  staring at a connection that closed without answering --
+  `handle_public_connection` now converts a `Conflict` into a terminal
+  `Response::Error`, gated on `LineStream::has_written()` so a
+  partially-streamed attach never gets a stray trailing line appended to
+  its event stream. And `adopt_worker`'s reply read needed a bound
+  (`FENCE_HANDSHAKE_TIMEOUT`, 2s, under the client's own 5s
+  `RESPONSE_TIMEOUT` so the supervisor gives up first): a `connect()` can
+  succeed against a dead listener's accept backlog -- the hazard
+  `transport::probe` already documents -- so an unbounded read turned
+  "this worker is gone" into a hang instead of a fast, true error. That
+  one was found by a test, not by inspection.
+
+  One thing the first cut got outright wrong, worth recording because
+  only measurement caught it. The handshake originally waited for a
+  `WorkerAuthOk` before the caller could send its request, making every
+  private request two round trips instead of one -- which forces the
+  worker to be scheduled twice per request, and under a saturated
+  reactor stacks up against that same 5s client budget. It surfaced as
+  two CI failures on different ubuntu tests, each stalling at exactly
+  5.0s. Counting `daemon did not respond in time` over three full-suite
+  runs: **3 on `main`, 10 with the ack, 2 once acceptance was made
+  silent** -- the ack accounted for every added failure. The supervisor
+  now writes the preamble and the real request back to back, so a fenced
+  request costs exactly what it cost before fencing existed; the worker
+  still validates before acting, so nothing about the guarantee changed.
+
+  Tested in `tests/worker_fence.rs` (5 tests), which covers the refusal
+  direction a passing happy path structurally cannot show, plus the
+  fail-closed behavior when the fence file goes missing and the
+  unfenced-worker upgrade path -- the last one a genuine regression test,
+  since `adopt_worker` originally minted a placeholder fence for the
+  missing-file case and then hit its own "already ours" short-circuit on
+  it, so a pre-fence session would have stayed unfenced forever.
+  `tests/supervisor_restart_recovery.rs` now silently exercises the whole
+  adopt-then-authenticate path as a side effect.
+
 - [x] **A real `ModelProvider` backend.** `provider::EchoProvider` was a
   deliberate Phase 1 stand-in (Non-Goal: "stub with a fake provider that
   echoes turns"); `prime-agent` streams real model responses through

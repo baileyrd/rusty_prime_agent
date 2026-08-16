@@ -54,6 +54,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_Threading",
+    # `src/fence.rs` only: `BCryptGenRandom` for the per-worker token and
+    # per-supervisor instance id. The OS CSPRNG rather than a `rand`-
+    # shaped crate, matching this project's existing "reach for the
+    # platform directly" posture (see `ARCHITECTURE.md` "Dependency
+    # stack"); `/dev/urandom` is the Unix arm and needs no dependency at
+    # all.
+    "Win32_Security_Cryptography",
 ] }
 
 [target.'cfg(unix)'.dependencies]

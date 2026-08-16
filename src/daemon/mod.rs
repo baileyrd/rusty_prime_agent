@@ -39,6 +39,21 @@ const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// within a few seconds of its due time rather than minutes.
 const SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long a fence handshake (`Supervisor::connect_worker`/
+/// `adopt_worker`) waits for the worker's one-line reply. Generous for
+/// what it is -- a live worker answers a local socket round trip
+/// essentially instantly, even loaded -- but bounded, for the reason
+/// `Supervisor::handshake_response` documents.
+///
+/// **Must stay strictly below `client::RESPONSE_TIMEOUT` (5s).** This
+/// was first written as 5s, exactly equal to it, which made the bound
+/// useless in the one case it exists for: a stalled handshake and the
+/// client's own patience expired at the same instant, so the caller saw
+/// the generic "daemon did not respond in time" instead of this layer's
+/// specific "its socket is reachable but nothing is serving it". The
+/// supervisor has to give up *first* for its diagnosis to reach anyone.
+const FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Recorded in `daemon.pid` across restarts so a replacement supervisor
 /// (Required Behavior's crash-recovery path) has a generation number to
 /// hand out, mirroring the reference architecture's worker generations.
@@ -53,6 +68,14 @@ pub struct Supervisor {
     exe_path: PathBuf,
     pid: u32,
     generation: u64,
+    /// This supervisor process's own fencing identity -- `generation`
+    /// above paired with 128 fresh random bits. Presented on every
+    /// private worker connection ([`Supervisor::connect_worker`]) and
+    /// required to match the worker's fence exactly; see `crate::fence`
+    /// for why a stale supervisor holding a valid worker token still
+    /// cannot command or re-adopt a worker a replacement already took
+    /// over.
+    identity: crate::fence::SupervisorIdentity,
     /// Serializes "check liveness, spawn/recover if needed" per the
     /// whole supervisor (coarse-grained, not per-session): Phase 1's
     /// traffic volume does not need finer locking, and a single lock is
@@ -74,6 +97,7 @@ pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
         exe_path,
         pid: std::process::id(),
         generation,
+        identity: crate::fence::SupervisorIdentity::new(generation)?,
         spawn_lock: Mutex::new(()),
     });
 
@@ -149,6 +173,155 @@ fn record_daemon_pid(state_root: &Path) -> Result<u64> {
 }
 
 impl Supervisor {
+    /// The one way this process opens a private connection to a worker.
+    ///
+    /// Connects, presents this supervisor's [`crate::fence::
+    /// SupervisorIdentity`] as a `Request::WorkerAuth` preamble, and only
+    /// hands back a usable [`LineStream`] once the worker has accepted
+    /// it. Every `transport::connect(Context::Worker, ...)` call site in
+    /// this module goes through here rather than connecting directly, so
+    /// there is exactly one place the fence can be forgotten -- and it
+    /// isn't.
+    ///
+    /// A rejection surfaces as a `Conflict` error naming both identities.
+    /// That is the whole point of the mechanism: a supervisor that has
+    /// been superseded finds out by being told, on the first thing it
+    /// tries to do, rather than by silently racing the replacement.
+    /// **Deliberately does not wait for an acknowledgement.** The
+    /// preamble is written and the stream handed straight back, so the
+    /// caller's own request follows immediately and the whole exchange
+    /// stays at *one* round trip -- exactly what it cost before fencing
+    /// existed.
+    ///
+    /// An earlier revision did wait for a `WorkerAuthOk`, and that was a
+    /// measurable regression rather than a theoretical one: it forces the
+    /// worker to be *scheduled twice* per request instead of once, and
+    /// under a saturated reactor (the test suite runs ~30 daemon/worker
+    /// pairs at once) those queuing delays stack up against the client's
+    /// 5s `client::RESPONSE_TIMEOUT`. Measured over 3 full-suite runs:
+    /// 10 request timeouts with the ack, 3 without -- 3 being exactly
+    /// the pre-existing baseline this project's suite already had.
+    ///
+    /// The fence property is unchanged. The worker still validates the
+    /// preamble *before acting on* the request that follows it; what went
+    /// away is only the supervisor blocking to hear that it passed.
+    /// Silence means accepted, and a rejection arrives as the
+    /// `conflict: true` [`Response::Error`] the caller reads instead of
+    /// the reply it expected.
+    async fn connect_worker(&self, socket_path: PathBuf) -> Result<LineStream> {
+        let mut conn = transport::connect(Context::Worker, socket_path).await?;
+        conn.write_request(
+            Context::Worker,
+            &Request::WorkerAuth {
+                supervisor: self.identity.clone(),
+            },
+        )
+        .await?;
+        Ok(conn)
+    }
+
+    /// Reads the one response a fence handshake expects, under
+    /// [`FENCE_HANDSHAKE_TIMEOUT`].
+    ///
+    /// The timeout is load-bearing, not defensive padding. A `connect()`
+    /// to a worker socket can succeed against a *dead* listener's accept
+    /// backlog -- the precise hazard `transport::probe`'s own doc comment
+    /// exists to warn about -- and an unbounded read there waits forever
+    /// for a reply nobody will send, converting "this worker is gone"
+    /// into a hang that only surfaces when the client's own much larger
+    /// prompt timeout finally expires. Failing fast instead lets the
+    /// caller report something true, and lets the next attempt (once the
+    /// dead worker's pid stops reading as alive) respawn it.
+    async fn handshake_response(conn: &mut LineStream) -> Result<Response> {
+        let read = conn.read_response(Context::Worker);
+        match rusty_tokio::time::timeout(FENCE_HANDSHAKE_TIMEOUT, read).await {
+            Ok(Ok(Some(response))) => Ok(response),
+            Ok(Ok(None)) => Err(HarnessError::protocol(
+                Context::Daemon,
+                "worker closed the connection during the fence handshake",
+            )),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(HarnessError::conflict(
+                Context::Daemon,
+                "worker did not answer the fence handshake -- \
+                 its socket is reachable but nothing is serving it",
+            )),
+        }
+    }
+
+    /// Takes over a worker this supervisor did not spawn -- the
+    /// supervisor-restart half of `daemon.md`'s "a replacement supervisor
+    /// adopts every still-live worker" (`R-SUP-04`), now with the fence
+    /// (`R-PROTO-11`) that makes the adoption exclusive rather than
+    /// merely additive.
+    ///
+    /// Reads `worker_token` off the owner-only fence file -- being able
+    /// to read it is what stands in for "same OS user, same state root",
+    /// which is the only trust boundary this project has ever claimed --
+    /// then presents it alongside this supervisor's own identity, whose
+    /// strictly-greater counter is what the *previous* supervisor cannot
+    /// produce.
+    async fn adopt_worker(&self, session_id: &str, socket_path: PathBuf) -> Result<()> {
+        let fence_path =
+            paths::worker_fence_path(&paths::session_dir(&self.state_root, session_id));
+        let worker_token = match crate::fence::WorkerFence::read(Context::Daemon, &fence_path)? {
+            Some(fence) if fence.supervisor == self.identity => {
+                // Already ours: a worker this process spawned itself.
+                // The ordinary `WorkerAuth` path covers it, and adopting
+                // from yourself would fail the strictly-greater check
+                // anyway.
+                return Ok(());
+            }
+            Some(fence) => fence.worker_token,
+            // Unfenced worker (predates this mechanism -- see
+            // `worker::FenceCell`). Adopt it anyway, so an in-place
+            // upgrade converges on a fenced state instead of leaving
+            // pre-existing sessions permanently unfenced. The token
+            // minted here is arbitrary precisely because there is
+            // nothing to match it against; the worker accepts it and
+            // adopts *this* token as the one future adoptions must
+            // present. Deliberately not short-circuited by the
+            // equality check above: with no file on disk there is no
+            // fence to compare against, and skipping the round trip
+            // here is exactly how the upgrade would silently never
+            // happen.
+            None => crate::fence::random_hex_128(Context::Daemon)?,
+        };
+        let mut conn = transport::connect(Context::Worker, socket_path).await?;
+        conn.write_request(
+            Context::Worker,
+            &Request::WorkerAdopt {
+                worker_token,
+                supervisor: self.identity.clone(),
+            },
+        )
+        .await?;
+        match Self::handshake_response(&mut conn).await? {
+            Response::WorkerAdopted { previous } => {
+                match previous {
+                    Some(previous) => eprintln!(
+                        "daemon: adopted worker for session {session_id} from {previous} \
+                         (now {})",
+                        self.identity
+                    ),
+                    None => eprintln!(
+                        "daemon: fenced the previously-unfenced worker for session \
+                         {session_id} to {}",
+                        self.identity
+                    ),
+                }
+                Ok(())
+            }
+            Response::Error { message, .. } => {
+                Err(HarnessError::conflict(Context::Daemon, message))
+            }
+            other => Err(HarnessError::protocol(
+                Context::Daemon,
+                format!("expected WorkerAdopted from worker, got {other:?}"),
+            )),
+        }
+    }
+
     /// Required Behavior: "supervisor restart recovers in-flight session
     /// state from disk". Best-effort and non-fatal per session -- one
     /// session's respawn failing must not stop the supervisor from
@@ -165,9 +338,27 @@ impl Supervisor {
             .into_iter()
             .filter(|s| s.status == SessionStatus::Active)
         {
-            if let Err(err) = self.ensure_worker_running(&summary.session_id).await {
+            let socket_path = match self.ensure_worker_running(&summary.session_id).await {
+                Ok(socket_path) => socket_path,
+                Err(err) => {
+                    eprintln!(
+                        "daemon: startup recovery of session {} failed: {err}",
+                        summary.session_id
+                    );
+                    continue;
+                }
+            };
+            // Fence takeover is deliberately here rather than in
+            // `ensure_worker_running`: startup is the *only* moment a
+            // live worker can legitimately belong to a different
+            // supervisor, so putting the adoption on the ordinary
+            // request path would buy nothing and cost a file read per
+            // prompt. A worker `ensure_worker_running` just spawned is
+            // already fenced to this process, and `adopt_worker`
+            // short-circuits on that without opening a connection.
+            if let Err(err) = self.adopt_worker(&summary.session_id, socket_path).await {
                 eprintln!(
-                    "daemon: startup recovery of session {} failed: {err}",
+                    "daemon: could not adopt the live worker for session {}: {err}",
                     summary.session_id
                 );
             }
@@ -235,6 +426,7 @@ impl Supervisor {
                 // admitted from doesn't change across a respawn either.
                 spawned_from_sequence: state.spawned_from_sequence,
             },
+            &self.identity,
         )
         .await?;
         worker::wait_ready(&socket_path, WORKER_READY_TIMEOUT).await?;
@@ -246,12 +438,38 @@ impl Supervisor {
             Some(r) => r,
             None => return Ok(()),
         };
+        let result = self.dispatch_public(&mut conn, request).await;
+        // A `Conflict` is an *expected*, structured condition the caller
+        // should be told about, not a bug -- and the one that matters
+        // most here is a fence rejection (`connect_worker`), which
+        // otherwise propagates all the way out to the accept loop's
+        // `eprintln!` and leaves the client staring at a connection that
+        // closed without ever answering. Reported only when the handler
+        // hasn't already written something: a partially-streamed attach
+        // must not get a stray trailing `Response` line appended to its
+        // event stream, where the client would try to parse it as a
+        // `SessionEvent` and fail on a *different* error than the real
+        // one.
+        match result {
+            Err(err) if matches!(err, HarnessError::Conflict { .. }) && !conn.has_written() => {
+                conn.write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: err.to_string(),
+                        conflict: true,
+                    },
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    async fn dispatch_public(&self, conn: &mut LineStream, request: Request) -> Result<()> {
         match request {
             Request::Ping => conn.write_response(Context::Daemon, &Response::Pong).await,
-            Request::DaemonStatus => self.handle_daemon_status(&mut conn).await,
-            Request::DaemonShutdown { force } => {
-                self.handle_daemon_shutdown(&mut conn, force).await
-            }
+            Request::DaemonStatus => self.handle_daemon_status(conn).await,
+            Request::DaemonShutdown { force } => self.handle_daemon_shutdown(conn, force).await,
             Request::SessionNew {
                 name,
                 model,
@@ -263,7 +481,7 @@ impl Supervisor {
                 runtime,
             } => {
                 self.handle_session_new(
-                    &mut conn,
+                    conn,
                     crate::session::NewSessionMeta {
                         name,
                         model,
@@ -291,9 +509,9 @@ impl Supervisor {
                 )
                 .await
             }
-            Request::SessionList => self.handle_session_list(&mut conn).await,
+            Request::SessionList => self.handle_session_list(conn).await,
             Request::SessionAttach { session_id } => {
-                self.handle_session_attach(&mut conn, session_id).await
+                self.handle_session_attach(conn, session_id).await
             }
             Request::SessionPrompt {
                 session_id,
@@ -301,46 +519,43 @@ impl Supervisor {
                 images,
                 request_id,
             } => {
-                self.handle_session_prompt(&mut conn, session_id, text, images, request_id)
+                self.handle_session_prompt(conn, session_id, text, images, request_id)
                     .await
             }
-            Request::SessionStop { session_id } => {
-                self.handle_session_stop(&mut conn, session_id).await
-            }
+            Request::SessionStop { session_id } => self.handle_session_stop(conn, session_id).await,
             Request::SessionRename { session_id, name } => {
-                self.handle_session_rename(&mut conn, session_id, name)
-                    .await
+                self.handle_session_rename(conn, session_id, name).await
             }
             Request::SessionCompact {
                 session_id,
                 instructions,
             } => {
-                self.handle_session_compact(&mut conn, session_id, instructions)
+                self.handle_session_compact(conn, session_id, instructions)
                     .await
             }
             Request::SessionInterrupt { session_id } => {
-                self.handle_session_interrupt(&mut conn, session_id).await
+                self.handle_session_interrupt(conn, session_id).await
             }
             Request::SessionExtensionCommand {
                 session_id,
                 command,
                 args,
             } => {
-                self.handle_session_extension_command(&mut conn, session_id, command, args)
+                self.handle_session_extension_command(conn, session_id, command, args)
                     .await
             }
             Request::SessionSetActiveLeaf {
                 session_id,
                 sequence,
             } => {
-                self.handle_session_set_active_leaf(&mut conn, session_id, sequence)
+                self.handle_session_set_active_leaf(conn, session_id, sequence)
                     .await
             }
             Request::SessionBranchSummarize {
                 session_id,
                 branch_leaf_sequence,
             } => {
-                self.handle_session_branch_summarize(&mut conn, session_id, branch_leaf_sequence)
+                self.handle_session_branch_summarize(conn, session_id, branch_leaf_sequence)
                     .await
             }
             Request::SessionFork {
@@ -348,38 +563,32 @@ impl Supervisor {
                 at_sequence,
                 name,
             } => {
-                self.handle_session_fork(&mut conn, session_id, at_sequence, name)
+                self.handle_session_fork(conn, session_id, at_sequence, name)
                     .await
             }
             Request::ScheduleAdd {
                 session_id,
                 text,
                 kind,
-            } => {
-                self.handle_schedule_add(&mut conn, session_id, text, kind)
-                    .await
-            }
+            } => self.handle_schedule_add(conn, session_id, text, kind).await,
             Request::ScheduleList { session_id } => {
-                self.handle_schedule_list(&mut conn, session_id).await
+                self.handle_schedule_list(conn, session_id).await
             }
             Request::ScheduleCancel {
                 session_id,
                 schedule_id,
             } => {
-                self.handle_schedule_cancel(&mut conn, session_id, schedule_id)
+                self.handle_schedule_cancel(conn, session_id, schedule_id)
                     .await
             }
             Request::GoalUpdate { session_id, action } => {
-                self.handle_goal_update(&mut conn, session_id, action).await
+                self.handle_goal_update(conn, session_id, action).await
             }
-            Request::GoalShow { session_id } => self.handle_goal_show(&mut conn, session_id).await,
+            Request::GoalShow { session_id } => self.handle_goal_show(conn, session_id).await,
             Request::HarnessUpdate { session_id, action } => {
-                self.handle_harness_update(&mut conn, session_id, action)
-                    .await
+                self.handle_harness_update(conn, session_id, action).await
             }
-            Request::HarnessShow { session_id } => {
-                self.handle_harness_show(&mut conn, session_id).await
-            }
+            Request::HarnessShow { session_id } => self.handle_harness_show(conn, session_id).await,
             Request::WorkerShutdown => {
                 conn.write_response(
                     Context::Daemon,
@@ -396,6 +605,22 @@ impl Supervisor {
                     Context::Daemon,
                     &Response::Error {
                         message: "AttributeChildUsage is only valid on the private worker \
+                                  transport"
+                            .into(),
+                        conflict: false,
+                    },
+                )
+                .await
+            }
+            // Same private-only rejection as the two above, and for a
+            // sharper reason: a public client presenting a supervisor
+            // identity is either confused or trying to talk its way past
+            // the fence. Neither is something to serve.
+            Request::WorkerAuth { .. } | Request::WorkerAdopt { .. } => {
+                conn.write_response(
+                    Context::Daemon,
+                    &Response::Error {
+                        message: "WorkerAuth/WorkerAdopt are only valid on the private worker \
                                   transport"
                             .into(),
                         conflict: false,
@@ -431,7 +656,7 @@ impl Supervisor {
                 .filter(|s| s.status == SessionStatus::Active)
             {
                 let socket_path = paths::worker_socket_path(&self.state_root, &summary.session_id);
-                if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
+                if let Ok(mut private) = self.connect_worker(socket_path).await {
                     let _ = private
                         .write_request(Context::Worker, &Request::WorkerShutdown)
                         .await;
@@ -530,6 +755,7 @@ impl Supervisor {
             &session_id,
             WorkerMode::New,
             meta,
+            &self.identity,
         )
         .await
         {
@@ -676,6 +902,7 @@ impl Supervisor {
                 // parent message to ever attribute usage back to.
                 spawned_from_sequence: None,
             },
+            &self.identity,
         )
         .await
         {
@@ -887,7 +1114,7 @@ impl Supervisor {
     /// already uses for `SessionPrompt`.
     async fn attribute_one_child_usage(&self, parent_id: &str, child_id: &str) -> Result<()> {
         let socket_path = paths::worker_socket_path(&self.state_root, parent_id);
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -906,7 +1133,7 @@ impl Supervisor {
     /// to (nobody is attached), so `fire_due_schedules` just logs it.
     async fn fire_one_schedule(&self, session_id: &str, text: String) -> Result<()> {
         let socket_path = self.ensure_worker_running(session_id).await?;
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1011,7 +1238,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(Context::Worker, &Request::SessionAttach { session_id })
             .await?;
@@ -1071,7 +1298,7 @@ impl Supervisor {
                 .await;
         }
         let socket_path = paths::worker_socket_path(&self.state_root, &session_id);
-        if let Ok(mut private) = transport::connect(Context::Worker, socket_path).await {
+        if let Ok(mut private) = self.connect_worker(socket_path).await {
             let _ = private
                 .write_request(Context::Worker, &Request::WorkerShutdown)
                 .await;
@@ -1098,7 +1325,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1129,7 +1356,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1155,7 +1382,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1187,7 +1414,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1219,7 +1446,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1257,7 +1484,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(Context::Worker, &Request::SessionInterrupt { session_id })
             .await?;
@@ -1284,7 +1511,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,
@@ -1317,7 +1544,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(Context::Worker, &Request::GoalUpdate { session_id, action })
             .await?;
@@ -1362,7 +1589,7 @@ impl Supervisor {
             Some(p) => p,
             None => return Ok(()),
         };
-        let mut private = transport::connect(Context::Worker, socket_path).await?;
+        let mut private = self.connect_worker(socket_path).await?;
         private
             .write_request(
                 Context::Worker,

@@ -118,6 +118,16 @@ pub struct LineStream {
     /// Bytes read past the last complete line, kept across calls since
     /// one `read` can return more than one line's worth at once.
     buf: Vec<u8>,
+    /// Whether anything has been written on this connection yet.
+    ///
+    /// Exists for exactly one caller: `daemon::Supervisor::
+    /// handle_public_connection` turns a late `Conflict` (a fence
+    /// rejection, most often) into a terminal `Response::Error` so the
+    /// client is told why rather than watching the connection close --
+    /// but only when the handler hasn't already started streaming, since
+    /// appending a `Response` line to a half-written `SessionEvent`
+    /// stream would replace one error with a worse, more confusing one.
+    wrote_any: bool,
 }
 
 impl LineStream {
@@ -125,7 +135,13 @@ impl LineStream {
         LineStream {
             stream,
             buf: Vec::new(),
+            wrote_any: false,
         }
+    }
+
+    /// See [`LineStream::wrote_any`].
+    pub fn has_written(&self) -> bool {
+        self.wrote_any
     }
 
     /// Reads one `\n`-terminated line (the trailing `\n`, and a `\r`
@@ -165,6 +181,10 @@ impl LineStream {
 
     pub async fn write_line(&mut self, context: Context, mut line: String) -> Result<()> {
         line.push('\n');
+        // Set before the write, not after: a *partial* write still put
+        // bytes on the wire, so a follow-up `Response` would corrupt the
+        // stream just as badly as it would after a complete one.
+        self.wrote_any = true;
         self.stream
             .write_all(line.as_bytes())
             .await

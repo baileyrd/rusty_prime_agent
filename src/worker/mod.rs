@@ -477,6 +477,18 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let cancel_flag = session.cancel_flag();
     let session = Arc::new(Mutex::new(session));
 
+    // Read once at startup, then held in memory as the authority for
+    // this process's whole life -- a later on-disk edit does not change
+    // who may command a running worker; only a successful
+    // `Request::WorkerAdopt` does (which rewrites the file itself, so
+    // the two stay consistent). See `crate::fence` for the mechanism and
+    // `FenceCell` for why a missing file is permissive rather than fatal.
+    let fence_path = paths::worker_fence_path(&session_dir);
+    let fence: FenceCell = Arc::new(Mutex::new(crate::fence::WorkerFence::read(
+        Context::Worker,
+        &fence_path,
+    )?));
+
     let socket_path = paths::worker_socket_path(&args.state_root, &args.session_id);
     paths::ensure_dir(
         Context::Worker,
@@ -492,8 +504,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let conn = listener.accept(Context::Worker).await?;
         let session = session.clone();
         let cancel_flag = cancel_flag.clone();
+        let fence = fence.clone();
+        let fence_path = fence_path.clone();
         rusty_tokio::spawn(async move {
-            if let Err(err) = handle_private_connection(session, cancel_flag, conn).await {
+            if let Err(err) =
+                handle_private_connection(session, cancel_flag, fence, fence_path, conn).await
+            {
                 // One bad connection (malformed request, peer vanished
                 // mid-write) must not take the whole worker down --
                 // that would defeat the entire point of a per-session
@@ -506,13 +522,209 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
 }
 
+/// The worker's live view of its own [`crate::fence::WorkerFence`],
+/// shared across every connection handler.
+///
+/// `None` means **unfenced**, and is deliberately permissive: it means
+/// no `worker-fence.json` existed at startup, which in practice only
+/// happens for a worker whose state directory predates fencing. Refusing
+/// to serve those would turn an in-place upgrade into a hard outage for
+/// every already-running session, so an unfenced worker behaves exactly
+/// as it did before this mechanism existed. Every worker spawned by a
+/// current supervisor is fenced before its process even starts
+/// (`daemon::Supervisor::ensure_worker_running` writes the fence, then
+/// spawns), so this is a transitional state, not a bypass anyone can
+/// arrange.
+type FenceCell = Arc<Mutex<Option<crate::fence::WorkerFence>>>;
+
+/// Reads the fence preamble on a private connection and decides whether
+/// the rest of that connection may be served.
+///
+/// Returns the request to dispatch, or `None` when the connection is
+/// already complete (a bare `Ping`, or a finished adoption round trip).
+async fn authorize_private_connection(
+    fence: &FenceCell,
+    fence_path: &Path,
+    conn: &mut LineStream,
+    request: Request,
+) -> Result<Option<Request>> {
+    match request {
+        // Exempt on purpose. `Ping` mutates nothing and reveals nothing,
+        // and `transport::probe`/`wait_ready` -- which every readiness
+        // wait and every stale-socket classification in this project
+        // depends on -- have no supervisor identity to present. Fencing
+        // liveness probes would make a worker undetectable rather than
+        // unreachable, which is strictly worse.
+        Request::Ping => {
+            conn.write_response(Context::Worker, &Response::Pong)
+                .await?;
+            Ok(None)
+        }
+        Request::WorkerAuth { supervisor } => {
+            let guard = fence.lock().await;
+            match guard.as_ref() {
+                Some(current) if current.supervisor != supervisor => {
+                    let current = current.supervisor.clone();
+                    drop(guard);
+                    // Drained before answering, and the order matters.
+                    // The supervisor does not wait for an ack (see
+                    // `Supervisor::connect_worker`), so its real request
+                    // is already on its way; replying and closing without
+                    // consuming that line would race it into an `EPIPE`
+                    // on the supervisor's side, replacing this specific
+                    // "you are fenced out" message with a generic broken
+                    // -pipe error at exactly the moment the operator most
+                    // needs the specific one.
+                    let _ = conn.read_request(Context::Worker).await;
+                    reject(conn, &current, &supervisor, "command").await?;
+                    Ok(None)
+                }
+                // Fenced and matching, or unfenced (see `FenceCell`).
+                //
+                // No `WorkerAuthOk`: silence is acceptance. The
+                // supervisor never waits to hear it, so sending one would
+                // buy nothing and cost this worker an extra scheduling
+                // round per request -- see `Supervisor::connect_worker`
+                // for the measurement that made that a real problem
+                // rather than a stylistic one.
+                _ => {
+                    drop(guard);
+                    match conn.read_request(Context::Worker).await? {
+                        Some(inner) => Ok(Some(inner)),
+                        // Auth preamble then a clean disconnect: the
+                        // supervisor probing that it still holds the
+                        // fence without having anything to ask for.
+                        None => Ok(None),
+                    }
+                }
+            }
+        }
+        Request::WorkerAdopt {
+            worker_token,
+            supervisor,
+        } => {
+            let mut guard = fence.lock().await;
+            let current = match guard.as_mut() {
+                Some(current) => current,
+                None => {
+                    // An unfenced worker has no token to check against,
+                    // so adoption can't be authorized -- but it also
+                    // doesn't need to be, since an unfenced worker
+                    // serves everyone. Take the fence as offered so the
+                    // session stops being unfenced from here on.
+                    let adopted = crate::fence::WorkerFence {
+                        worker_token,
+                        supervisor,
+                    };
+                    adopted.write(Context::Worker, fence_path)?;
+                    *guard = Some(adopted);
+                    drop(guard);
+                    // `previous: None`, not "previous == the new owner":
+                    // there was genuinely no predecessor here, and
+                    // saying otherwise would make the supervisor log a
+                    // takeover that never happened.
+                    conn.write_response(
+                        Context::Worker,
+                        &Response::WorkerAdopted { previous: None },
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+            };
+            // Constant-time comparison is deliberately *not* used: this
+            // is not a privilege boundary (`ARCHITECTURE.md`'s own
+            // repeated stance, matching `prime-agent`'s `R-ARCH-04`),
+            // the token never crosses a network, and the caller already
+            // had to read an owner-only file in this user's own state
+            // root to have a candidate at all.
+            let token_ok = current.worker_token == worker_token;
+            let counter_ok = supervisor.may_adopt_from(&current.supervisor);
+            if !token_ok || !counter_ok {
+                let displaced = current.supervisor.clone();
+                drop(guard);
+                let why = if token_ok {
+                    // The load-bearing case: a stale supervisor holding
+                    // a valid token trying to take a worker back after a
+                    // replacement already adopted it.
+                    "adopt (its generation does not supersede the current one)"
+                } else {
+                    "adopt (worker token mismatch)"
+                };
+                reject(conn, &displaced, &supervisor, why).await?;
+                return Ok(None);
+            }
+            let previous = current.supervisor.clone();
+            current.supervisor = supervisor;
+            let updated = current.clone();
+            drop(guard);
+            updated.write(Context::Worker, fence_path)?;
+            conn.write_response(
+                Context::Worker,
+                &Response::WorkerAdopted {
+                    previous: Some(previous),
+                },
+            )
+            .await?;
+            Ok(None)
+        }
+        // No preamble at all. Permitted only while unfenced -- see
+        // `FenceCell`.
+        other => {
+            let guard = fence.lock().await;
+            match guard.as_ref() {
+                None => {
+                    drop(guard);
+                    Ok(Some(other))
+                }
+                Some(current) => {
+                    let current = current.supervisor.clone();
+                    drop(guard);
+                    Err(HarnessError::conflict(
+                        Context::Worker,
+                        format!(
+                            "worker is fenced to {current}; \
+                             private requests must open with WorkerAuth (got {other:?})"
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// The one place a fence rejection is turned into a wire response, so
+/// both rejection paths phrase it identically. `conflict: true` -- this
+/// is an expected, structured condition (a supervisor discovering it has
+/// been superseded), not a bug for the caller to report as one.
+async fn reject(
+    conn: &mut LineStream,
+    current: &crate::fence::SupervisorIdentity,
+    presented: &crate::fence::SupervisorIdentity,
+    action: &str,
+) -> Result<()> {
+    conn.write_response(
+        Context::Worker,
+        &Response::Error {
+            message: format!("worker is fenced to {current}; {presented} may not {action} it"),
+            conflict: true,
+        },
+    )
+    .await
+}
+
 async fn handle_private_connection(
     session: Arc<Mutex<AgentSession>>,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    fence: FenceCell,
+    fence_path: PathBuf,
     mut conn: LineStream,
 ) -> Result<()> {
-    let request = match conn.read_request(Context::Worker).await? {
+    let first = match conn.read_request(Context::Worker).await? {
         Some(r) => r,
+        None => return Ok(()),
+    };
+    let request = match authorize_private_connection(&fence, &fence_path, &mut conn, first).await? {
+        Some(request) => request,
         None => return Ok(()),
     };
     match request {
@@ -760,6 +972,7 @@ pub async fn spawn(
     session_id: &str,
     mode: WorkerMode,
     meta: crate::session::NewSessionMeta,
+    supervisor: &crate::fence::SupervisorIdentity,
 ) -> Result<u32> {
     use rusty_tokio::process::{Command, Stdio};
 
@@ -823,6 +1036,15 @@ pub async fn spawn(
     // its private socket would otherwise fail completely silently.
     let session_dir = paths::session_dir(state_root, session_id);
     paths::ensure_dir(Context::Worker, &session_dir)?;
+    // Written *before* the spawn, never after: the worker reads it once
+    // at startup, so a fence that landed later would leave a window
+    // where a freshly spawned worker is unfenced and serving anyone.
+    // Minted fresh per spawn rather than carried across a respawn --
+    // `worker_token` authorizes changing the fence, and a token that
+    // outlived the process it was minted for would let a supervisor
+    // that is stale *by two generations* adopt the replacement worker.
+    crate::fence::WorkerFence::mint(supervisor.clone())?
+        .write(Context::Daemon, &paths::worker_fence_path(&session_dir))?;
     let log_path = paths::worker_log_path(&session_dir);
     let log_file = std::fs::File::create(&log_path)
         .map_err(|e| HarnessError::io(Context::Worker, Some(log_path), e))?;

@@ -34,7 +34,7 @@ project's current shape.
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
-| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,schedules.json}`, `provider.{json,log}`) |
+| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,worker-fence.json,schedules.json}`, `provider.{json,log}`) |
 | `provider` | `ModelProvider` trait (`respond(turns, tools) -> ProviderReply`) + `EchoProvider` (the default, ignores `tools`); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md`. Also owns the turn/tool wire types (`ChatTurn`/`TurnRole`/`ToolDef`/`ProviderReply`) the real tool-calling loop uses, hand-rolled to `rp-server`'s own shape |
 | `tools` | Built-in tools offered to a model via `session new --tools read` (`read_file`/`list_dir`, no path sandboxing), plus `execute_python_tool_def`'s `ToolDef` for `session new --runtime ipython` (its call is routed to `tool_runtime::ToolRuntime` by `AgentSession`, not to this module's own `execute`) -- see `PARITY.md`. A separate capability from `tool_runtime::ToolRuntime` below, not a second backend for it |
 | `mcp_client` | Minimal MCP (Model Context Protocol) client against `rp-server`'s own built-in `/mcp` gateway (`session new --tools mcp`) -- `initialize`/`notifications/initialized` + `tools/list` + `tools/call` only, hand-rolled to the exact wire behavior a direct probe of a real sidecar confirmed (SSE-framed responses, chunked transfer encoding, `Mcp-Session-Id` session affinity) -- see `PARITY.md` |
@@ -51,6 +51,7 @@ project's current shape.
 | `settings` | `<state_dir>/settings.json` read/parse (`load`) -- see below |
 | `auth` | `<state_dir>/auth.json` read/parse plus `!command` key resolution (`load`/`resolve_key`) -- see below |
 | `providers` | `<state_dir>/providers.json` read/parse for custom/arbitrary OpenAI-compatible provider registration (`load`) -- see below |
+| `fence` | Generation-fenced per-worker tokens: `SupervisorIdentity` (the `(counter, instance)` pair a supervisor presents), `WorkerFence` (the per-session `worker-fence.json`), and the OS-randomness source both are minted from -- see "Generation-fenced per-worker tokens" below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
 ## Embeddable SDK
@@ -1529,7 +1530,9 @@ newline-delimited `Request`/`Response`/`SessionEvent`) over
   never lets a client connect to a worker's private socket directly --
   every worker interaction is relayed, which is what lets the supervisor
   restart/recover a worker transparently without the client having to
-  know a new process now owns the session.
+  know a new process now owns the session. Every connection on this tier
+  opens with a `Request::WorkerAuth` fence preamble (bare `Request::Ping`
+  excepted) -- see "Generation-fenced per-worker tokens" below.
 
 `transport::Listener::bind_with_retry` retries a bind on `AddrInUse` for
 a short window -- see that function's own doc comment, and
@@ -1538,6 +1541,147 @@ repo, for the specific Windows dead-listener-reclaim race this exists
 alongside (fixed upstream in `rustils`' own `unix_listen`, not papered
 over here; `bind_with_retry`'s retry is about a real, load-bearing
 `AddrInUse` transient, not a substitute for that fix).
+
+## Generation-fenced per-worker tokens (`fence.rs`)
+
+Which supervisor process is allowed to command a given worker is decided
+by an explicit fence, not by "whichever one can reach the socket."
+Parity with `prime-agent`'s `daemon.md` ("private worker connections
+authenticate with a per-worker token fenced to the current supervisor
+generation, preventing a stale replacement supervisor from commanding an
+adopted worker"), and the single largest idea `COMPARISON.md` found this
+project was missing from that reference design.
+
+**What it is.** Each session gets a `worker-fence.json` next to its
+`state.json` (owner-only, `0600` on Unix), written by whichever
+supervisor spawned the worker and read by the worker exactly once at
+startup:
+
+- `worker_token` -- 128 random bits, minted per worker, stable for that
+  worker *process*'s life. Presenting it authorizes *changing* the fence,
+  not ordinary traffic.
+- `supervisor` -- the `SupervisorIdentity` currently authorized: the
+  monotonic `daemon.pid` generation counter paired with 128 random bits
+  identifying that specific supervisor process.
+
+**How it is enforced.** Every private supervisor->worker connection opens
+with `Request::WorkerAuth { supervisor }`, and the worker serves nothing
+else until that matches its fence exactly. `daemon::Supervisor::
+connect_worker` is the *only* place this project opens such a connection
+-- every former `transport::connect(Context::Worker, ...)` call site was
+routed through it -- so there is one place the preamble could be
+forgotten, and it isn't. A replacement supervisor adopting a still-live
+worker it did not spawn sends `Request::WorkerAdopt { worker_token,
+supervisor }` instead, which advances the fence and rewrites the file.
+
+`Request::Ping` is deliberately exempt. It mutates nothing, and
+`transport::probe`/`wait_ready` -- which every readiness wait and every
+stale-socket classification in this project depends on -- have no
+supervisor identity to present. Fencing liveness probes would make a
+worker undetectable rather than unreachable, which is strictly worse.
+
+**Acceptance is silent, and that is a performance requirement rather
+than a style choice.** The supervisor writes the preamble and its real
+request back to back and reads one response, so a fenced request costs
+exactly one round trip -- what it cost before fencing existed. An earlier
+revision had the worker answer `WorkerAuthOk` first, and the cost was
+real: waiting for it forces the worker to be *scheduled twice* per
+request, and under a saturated reactor (this project's own suite runs
+~30 daemon/worker pairs at once) that queuing stacks up against the
+client's 5s `RESPONSE_TIMEOUT`. Measured over three full-suite runs,
+counting `daemon did not respond in time`: **3 on `main`, 10 with the
+ack, 2 with it removed** -- i.e. the ack accounted for every added
+failure, against a pre-existing baseline of ~3. It first showed up as
+two CI failures on different ubuntu tests, each stalling at exactly 5.0s.
+
+The fence property is untouched by that: the worker still validates the
+preamble *before acting on* the request that follows it. Only the
+supervisor's blocking-to-hear-it-passed is gone. On rejection the worker
+drains the in-flight request line before answering -- the supervisor's
+request is already on its way, so replying and closing without consuming
+it would race into an `EPIPE` and replace the specific "you are fenced
+out" message with a generic broken-pipe error, at exactly the moment the
+specific one matters.
+
+`adopt_worker` does still wait for its reply, and that read is bounded
+(`FENCE_HANDSHAKE_TIMEOUT`, 2s, deliberately under the client's 5s
+`RESPONSE_TIMEOUT` so the supervisor gives up first and its own
+diagnosis is what reaches the caller). The bound is load-bearing: a
+`connect()` to a worker socket can succeed against a *dead* listener's
+accept backlog -- the exact hazard `transport::probe`'s doc comment
+warns about -- so an unbounded read there waits forever for a reply
+nobody will send. Adoption is a once-per-restart operation, so the round
+trip it costs is not on any hot path.
+
+**Failure surfacing.** A rejection is a `Conflict`, and
+`handle_public_connection` converts a `Conflict` into a terminal
+`Response::Error` so the client is told what happened rather than
+watching its connection close -- gated on `LineStream::has_written()`, so
+a partially-streamed attach never gets a stray trailing line appended to
+its event stream. A superseded supervisor therefore finds out on the
+first thing it tries to do, and so does whoever asked it.
+
+**A missing fence file fails closed.** If `worker-fence.json` is deleted
+or lost under a worker that is genuinely fenced, the next supervisor has
+no token to present and the worker refuses it: that session becomes
+unreachable rather than silently changing hands. Fail-closed is the right
+direction (the alternative would let anyone bypass the fence by deleting
+a file), and the way back is the one this project already has -- killing
+the worker drops the session onto the ordinary crash-recovery path, which
+respawns it with a freshly minted fence. Deliberately *not* automatic: a
+supervisor that force-respawned a worker on refusal would hand a
+misclassified-as-dead supervisor a way to take over anyway, which is
+precisely the thing being prevented.
+
+**Why the counter, when the reference design uses pure identity.**
+`prime-agent`'s generation is a bare per-instance UUID compared only for
+equality, never ordering, because a separate atomic launch lease already
+guarantees one legitimate supervisor at a time. This project has no such
+lease -- `Supervisor::spawn_lock` is in-process memory standing in for
+one -- so equality alone would be unsound here: a stale supervisor can
+read `worker_token` off disk (same OS user; this was never a privilege
+boundary) and simply re-adopt the worker back, making the fence a no-op.
+Requiring a **strictly greater** counter to adopt is what a stale
+supervisor cannot satisfy, since its counter is by construction lower
+than its replacement's.
+
+**Known bounded weakness, stated rather than hidden.** Two supervisors
+starting concurrently can both read the same previous generation and both
+write `counter = N + 1`; neither can then adopt the other's workers,
+because strictly-greater fails both ways. That degrades to "adoption
+fails, visibly, on stderr" rather than to "two supervisors command one
+worker" -- the correct failure direction, but still a failure. Closing it
+properly needs a real on-disk supervisor launch lease, which is tracked
+separately and is not a change to this mechanism.
+
+**What it does not change.** This is process coordination, not a security
+boundary -- the same stance `prime-agent` states for its own equivalent
+(`R-ARCH-04`). Anyone who can read `worker-fence.json` is already the
+same OS user with write access to this state root, and could do far worse
+than forge an adoption. The fence exists so that *correct* software with
+a wrong liveness verdict cannot corrupt a session, not to stop an
+attacker who is already inside the trust boundary. That is also why the
+token comparison is a plain `==` rather than a constant-time one.
+
+**Relationship to `bind_with_retry`.** That function answers "is the
+process owning this stale socket genuinely dead, or merely wedged?"
+empirically, with a real `Ping`/`Pong` round trip and a 20-second budget,
+after a Windows `AF_UNIX` reclaim race that took several rounds of
+upstream `rustils` fixes to characterize. It is still needed and still
+correct. The fence does not replace it -- it makes being *wrong* about it
+survivable: even if a supervisor is misclassified as dead and keeps
+running, a worker a replacement has adopted refuses its commands outright
+instead of serving two masters.
+
+**Upgrade path.** A worker whose state directory predates this mechanism
+starts *unfenced*, and an unfenced worker behaves exactly as it did
+before: it serves requests with no preamble, and accepts an
+unauthenticated adoption so the next supervisor restart converges it onto
+a real fence. Refusing to serve those instead would turn an in-place
+upgrade into a hard outage for every already-running session. Every
+worker a current supervisor spawns is fenced before its process starts
+(`worker::spawn` writes the fence, *then* spawns), so this is a
+transitional state, not a bypass anyone can arrange.
 
 ## Recovery model
 
