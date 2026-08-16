@@ -154,8 +154,10 @@ simplification and starts looking like an early arrival.
 
 ### 3.2 Scheduler placement: supervisor vs worker
 
-This is a direct contradiction of an upstream invariant, and it is worth
-being blunt about.
+This contradicts an upstream invariant outright. Having looked at *why*
+the invariant exists, the contradiction is the right call here — but that
+conclusion is the end of this section, not an excuse to soften the start
+of it.
 
 - Upstream: `R-SUP-01` — the supervisor **must not** execute schedules.
   `R-SCHED-01` — each worker runs exactly one scheduler for its root and
@@ -169,21 +171,50 @@ being blunt about.
   `attribute_pending_child_usage`.
 
 Job storage is per-session in both (this project does *not* have a global
-cron file), so `R-SCHED-01`'s second half holds. But the *execution* of
-schedules sits on the wrong side of the supervisor/worker line relative
-to the reference design.
+cron file), so `R-SCHED-01`'s second half holds. What differs is where
+execution lives.
 
-**Why it matters concretely.** Upstream's `R-SCHED-02`/`R-SCHED-03`
-(claim-and-advance before delivery; coalesce missed ticks rather than
-build backlog) are cheap when the scheduler and the session runtime share
-a process — the claim and the delivery are the same transaction. Across
-a socket they are not, and a supervisor restart mid-fire has no
-worker-local claim record to reconcile against. This project's scheduler
-also cannot be as precise as upstream's: a 5s global poll is a
-coarser timing guarantee than a per-worker scheduler with its own timer.
+**Correction to an earlier revision of this document.** This section used
+to claim that `R-SCHED-02`/`R-SCHED-03` — claim-and-advance before
+delivery, and coalescing missed ticks rather than building a backlog —
+are "cheap when the scheduler and the session runtime share a process"
+and hard across a socket. That was wrong, and reading
+`schedule::take_due` settles it: it advances `next_fire_ms` and writes
+the file back **before** returning the due list, so a crash between claim
+and delivery cannot replay; and it skips forward past `now_ms` rather
+than emitting a catch-up burst. Both invariants already hold here. The
+gap was overstated.
 
-This is the one place where the divergence looks less like a deliberate
-simplification and more like a design decision worth revisiting. See §12.
+**What actually differs**, in descending order of consequence:
+
+1. **Scheduling stops while the supervisor is down.** Upstream's
+   `R-SCHED-04` has resident workers keep scheduling across a supervisor
+   replacement; here the loop dies with the supervisor. Bounded rather
+   than lossy, because of the coalescing above: a restart produces one
+   late fire, not a burst and not silence forever.
+2. **Head-of-line blocking between sessions.** `fire_due_schedules`
+   iterates sessions sequentially in one loop, so a session whose worker
+   is wedged delays every other session's schedules by up to
+   `FENCE_HANDSHAKE_TIMEOUT`. Per-worker schedulers are isolated by
+   construction.
+3. **Coarser timing.** A 5s global poll against a per-worker timer.
+
+**Why the invariant does not transfer cleanly.** `R-SUP-01` is written
+for upstream's topology, where a worker owns a whole root *tree* and is
+**resident** — it stays running, so a worker-owned scheduler is always
+there to fire. This project's workers are per-session and stoppable
+(§3.1). `fire_due_schedules` deliberately scans *every* session
+regardless of status, so a schedule fires for a `Stopped` or `Crashed`
+session and respawns its worker. Moving the scheduler worker-side would
+silently drop that: no worker, no scheduling, and a stopped session's
+schedules would never fire again.
+
+That makes supervisor-side scheduling an adaptation to a different
+process model rather than a shortcut around the reference design — the
+same reasoning that makes §3.1's per-session worker a real choice rather
+than a simplification. The cost is items 1–3 above, and they are named
+here rather than discovered later. `ARCHITECTURE.md`'s "Scheduler
+placement" section carries the decision itself.
 
 ### 3.3 Session ownership: lease vs process-wide lock
 
@@ -570,15 +601,18 @@ since each implies a small follow-up.
    pricing table in this repo. Worth deciding explicitly rather than
    leaving implied.
 
-3. **`ARCHITECTURE.md`'s scheduler description doesn't flag the
-   divergence.** The supervisor runs schedules (§3.2), contradicting the
-   reference design's `R-SUP-01`. `PARITY.md` and `ARCHITECTURE.md` both
-   describe the scheduler without noting that it sits on the opposite
-   side of the supervisor/worker line from upstream's. Given how
-   carefully every other divergence in this repo is documented, this one
-   reads as an oversight rather than a decision — and if it *is* a
-   decision, it deserves the same paragraph of rationale everything else
-   here gets.
+3. ~~**`ARCHITECTURE.md`'s scheduler description doesn't flag the
+   divergence.**~~ **Closed** — `ARCHITECTURE.md` now has a "Scheduler
+   placement" section.
+
+   The finding was right that the divergence was undocumented, and wrong
+   in what it implied about the cause. It read as an oversight; it turned
+   out to be load-bearing. `R-SUP-01` is written for upstream's *resident
+   per-tree* workers, and this project's are per-session and stoppable —
+   so `fire_due_schedules` scanning every session regardless of status is
+   what lets a schedule wake a stopped one. Worker-side scheduling would
+   drop that silently. The rationale, and the three costs it accepts, are
+   now written down where the code is.
 
 ---
 
@@ -631,11 +665,12 @@ Not "smaller but adequate" — actually better on its own terms:
 3. ~~**Add start-time fingerprinting to `procutil::is_alive`**~~ (§5) —
    **done**, and it turned up a zombie-handling gap in the same check
    that was actively wedging sessions. See §5.
-4. **Decide the scheduler's home explicitly** (§3.2, §12.3). Either move
-   it worker-side to match `R-SUP-01`/`R-SCHED-01` and gain per-session
-   claim-and-advance semantics, or document why supervisor-side is right
-   for a process-per-session topology. Both are defensible; silence is
-   not.
+4. ~~**Decide the scheduler's home explicitly**~~ (§3.2, §12.3) —
+   **decided**: supervisor-side, deliberately. `R-SUP-01` assumes
+   resident per-tree workers; this project's are per-session and
+   stoppable, and a worker-owned scheduler would stop firing for exactly
+   the stopped sessions that most need waking. Rationale and the three
+   costs it accepts are in `ARCHITECTURE.md`'s "Scheduler placement".
 5. ~~**Add a stress/soak CI job**~~ (§11) — **done**, on all three OSes
    rather than upstream's ubuntu-only, plus a non-gating `flake-watch`
    job that measures the ambient failure rate instead of leaving it to

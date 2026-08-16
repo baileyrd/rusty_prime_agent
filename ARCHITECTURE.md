@@ -43,7 +43,7 @@ project's current shape.
 | `ipython_runtime` | `IpythonKernelRuntime`, the real `tool_runtime::ToolRuntime` backend (`session new --runtime ipython`) -- see below |
 | `rp_server` | Sidecar lifecycle for `rusty_provider`'s `rp-server` (spawn, health-check, teardown) -- owned by the supervisor, read by workers. Also owns `known_providers`, the env-var-driven provider catalog `harness model list` reads (see `PARITY.md`) -- the same check `write_config` itself uses, so the two can't drift -- `fetch_model_catalog`, a direct `GET /v1/models` query against a sidecar `harness model list --detailed` starts itself (no daemon involved) -- and emits `[mcp] enabled = true` unconditionally in every generated `provider-config.toml`, the same "harmless with nothing configured" reasoning `[providers.ollama]` already gets |
 | `http_client` | Minimal hand-rolled HTTP/1.1 client `RustyProviderModel`/`rp_server`/`mcp_client` use to talk to `rp-server`. Decodes `Transfer-Encoding: chunked` responses (`decode_chunked`) -- needed only for `mcp_client`'s SSE-framed calls, a no-op for every other caller, which had only ever seen `Content-Length` framing |
-| `schedule` | Per-session `schedules.json` read/write/take-due -- fired by `daemon`'s own background poll loop, see `PARITY.md` |
+| `schedule` | Per-session `schedules.json` read/write/take-due -- `take_due` claims and advances a tick before it is delivered, and coalesces missed ones. Fired by `daemon`'s own background poll loop, which is supervisor-side on purpose: see "Scheduler placement" below |
 | `prompt_template` | Discovery (`paths::global_prompts_dir`/`project_prompts_dir`) and `$1`/`$@`/`${@:N}`-style positional-argument expansion for `prompt-template list/render` and `session prompt-template` -- see `PARITY.md`. Frontmatter parsing itself lives in `frontmatter`, shared with `skills` |
 | `frontmatter` | Hand-rolled `---\nkey: value\n---\n<body>` parsing shared by `prompt_template` and `skills` -- both only ever read a couple of flat string keys |
 | `skills` | Discovery of real, importable Python packages for `session new --runtime ipython` (`paths::global_skills_dir`, `SKILL.md` frontmatter) -- see below and `PARITY.md` |
@@ -1542,6 +1542,65 @@ repo, for the specific Windows dead-listener-reclaim race this exists
 alongside (fixed upstream in `rustils`' own `unix_listen`, not papered
 over here; `bind_with_retry`'s retry is about a real, load-bearing
 `AddrInUse` transient, not a substitute for that fix).
+
+## Scheduler placement: supervisor-side, deliberately
+
+`prime-agent`'s `R-SUP-01` says the supervisor **must not** execute
+schedules, and `R-SCHED-01` puts exactly one scheduler in each worker.
+This project does the opposite: `daemon::Supervisor::fire_due_schedules`
+is a single background loop (`SCHEDULE_POLL_INTERVAL`, 5s) that polls
+every session's `schedules.json` and fires due entries as internal
+`SessionPrompt`s.
+
+That is a real contradiction of the reference design, and it is
+deliberate. The reasoning belongs here rather than being inferred from
+the code.
+
+**The invariant assumes a topology this project does not have.**
+Upstream's worker owns a whole root *tree* and is **resident** -- it
+stays running, so a worker-owned scheduler is always present to fire.
+This project's workers are per-session and stoppable (see the
+per-session-vs-per-tree split in `COMPARISON.md` §3.1). `fire_due_schedules`
+scans every session *regardless of status*, so a schedule fires for a
+`Stopped` or `Crashed` session and respawns its worker on the way. Move
+the scheduler worker-side and that stops working: no worker, no
+scheduling, and a stopped session's schedules never fire again. The
+capability that lets a schedule wake a dormant session would be traded
+away to satisfy an invariant written for workers that are never dormant.
+
+**What already matches upstream, contrary to first appearances.**
+`schedule::take_due` advances `next_fire_ms` and writes the file back
+*before* returning the due list, so a crash between claim and delivery
+cannot replay a tick (`R-SCHED-02`); and it skips forward past `now_ms`
+rather than emitting a catch-up burst (`R-SCHED-03`). Both hold across
+the process boundary, because the claim is durable on disk rather than
+held in the scheduler's memory. Per-session job storage matches too --
+there is no global cron file.
+
+**The three costs this accepts**, named here so they are not rediscovered
+as surprises:
+
+1. **No fires while the supervisor is down.** Upstream's `R-SCHED-04` has
+   resident workers keep scheduling across a supervisor replacement; here
+   the loop dies with the supervisor. Bounded rather than lossy: the
+   coalescing above means a restart produces one late fire, not a burst
+   and not permanent silence.
+2. **Head-of-line blocking between sessions.** The loop iterates
+   sequentially, so a session whose worker is wedged delays every other
+   session's schedules by up to `FENCE_HANDSHAKE_TIMEOUT`. Per-worker
+   schedulers would be isolated by construction.
+3. **Coarser timing.** A 5s global poll rather than a per-worker timer.
+
+Cost 2 is the one most worth revisiting if it ever bites -- firing
+sessions concurrently rather than sequentially would remove it without
+moving the scheduler at all.
+
+**One writer, no coordination needed.** `ScheduleAdd`/`ScheduleCancel` are
+handled entirely daemon-side (`handle_schedule_add`/`handle_schedule_cancel`),
+so the supervisor is `schedules.json`'s sole writer. A worker-side
+scheduler would have to take that ownership over and coordinate with the
+supervisor's own catalog scans -- more moving parts than the placement
+saves.
 
 ## Durable idempotency (`request_journal.rs`)
 
