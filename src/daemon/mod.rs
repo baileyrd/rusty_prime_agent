@@ -44,7 +44,15 @@ const SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// what it is -- a live worker answers a local socket round trip
 /// essentially instantly, even loaded -- but bounded, for the reason
 /// `Supervisor::handshake_response` documents.
-const FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// **Must stay strictly below `client::RESPONSE_TIMEOUT` (5s).** This
+/// was first written as 5s, exactly equal to it, which made the bound
+/// useless in the one case it exists for: a stalled handshake and the
+/// client's own patience expired at the same instant, so the caller saw
+/// the generic "daemon did not respond in time" instead of this layer's
+/// specific "its socket is reachable but nothing is serving it". The
+/// supervisor has to give up *first* for its diagnosis to reach anyone.
+const FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Recorded in `daemon.pid` across restarts so a replacement supervisor
 /// (Required Behavior's crash-recovery path) has a generation number to
