@@ -369,6 +369,14 @@ fn an_unfenced_worker_is_converged_onto_a_fence_by_the_next_supervisor() {
     );
     std::fs::remove_file(fence_path(state_dir.path(), &session_id)).unwrap();
 
+    // Clear the socket directory before hand-starting the worker, so the
+    // "is it listening yet?" wait below has an unambiguous signal. The
+    // force-killed worker above never got to unlink its own socket file,
+    // and a leftover one would make that wait pass instantly against a
+    // path nothing is bound to.
+    let sock_dir = state_dir.path().join("sock");
+    let _ = std::fs::remove_dir_all(&sock_dir);
+
     let mut unfenced = std::process::Command::new(common::bin())
         .args(["__worker-main", "--session-id", &session_id, "--state-root"])
         .arg(state_dir.path())
@@ -386,6 +394,28 @@ fn an_unfenced_worker_is_converged_onto_a_fence_by_the_next_supervisor() {
             Duration::from_secs(20)
         ),
         "the hand-started worker should record itself in state.json"
+    );
+    // Waiting for the recorded pid is NOT enough, and this is the whole
+    // reason this test was flaky: `AgentSession::recover` writes
+    // `worker_pid` into `state.json` *before* `worker::run` binds the
+    // private socket. Starting the daemon inside that window makes
+    // `adopt_worker`'s connect fail, adoption is non-fatal by design, and
+    // the fence file this test asserts on never gets written. Found by
+    // the nightly `process-stress` job on its first real run, at
+    // iteration 2 of 2 on ubuntu.
+    //
+    // Nothing in production hits this: a worker a replacement supervisor
+    // finds was spawned by an earlier supervisor that already waited for
+    // readiness (`worker::wait_ready`). Only a test that hand-starts a
+    // worker can observe the window.
+    assert!(
+        common::wait_until(
+            || std::fs::read_dir(&sock_dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false),
+            Duration::from_secs(20)
+        ),
+        "the hand-started worker should bind its private socket"
     );
     assert!(
         !fence_path(state_dir.path(), &session_id).exists(),
