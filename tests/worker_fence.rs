@@ -307,27 +307,21 @@ fn a_missing_fence_file_under_a_fenced_worker_fails_closed() {
     // The way back: the worker dying drops this onto the ordinary
     // worker-crash path, which respawns with a freshly minted fence.
     common::force_kill(worker_pid);
-    // Retried, and for a reason worth naming rather than papering over:
-    // the worker's *spawning* supervisor was force-killed earlier in this
-    // test, so nothing is left to `wait()` on the worker and it is an
-    // orphan being reparented to init. `procutil::is_alive` is a bare
-    // `kill(pid, 0)` with no zombie check, so during that window the
-    // supervisor still reads the dead worker as alive, skips the respawn,
-    // and fails to connect. That is a pre-existing gap in liveness
-    // detection (see `COMPARISON.md` §5), not a fencing behavior -- and
-    // it resolves itself within a tick. Each attempt now fails fast (a
-    // connect error, not a hang), so a retry window is cheap.
+    // A single blocking attempt, no retry window. This used to need one:
+    // the worker's spawning supervisor was force-killed earlier in this
+    // test, so the freshly killed worker sat unreaped, `procutil::is_alive`
+    // was a bare `kill(pid, 0)` that reads a zombie as alive, and the
+    // supervisor skipped the respawn until the kernel got around to
+    // reaping. `is_alive` now excludes zombies (`procutil::is_zombie`), so
+    // the very first attempt sees a dead worker and respawns.
+    let recovered = common::run(
+        state_dir.path(),
+        &["session", "prompt", &session_id, "after recovery"],
+    );
     assert!(
-        common::wait_until(
-            || common::run(
-                state_dir.path(),
-                &["session", "prompt", &session_id, "after recovery"],
-            )
-            .status
-            .success(),
-            Duration::from_secs(60)
-        ),
-        "killing the refusing worker must let the session recover normally"
+        recovered.status.success(),
+        "killing the refusing worker must let the session recover normally; got: {}",
+        String::from_utf8_lossy(&recovered.stderr)
     );
     let fence = read_fence(state_dir.path(), &session_id);
     assert_eq!(

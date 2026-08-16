@@ -37,6 +37,7 @@ use rusty_tokio::sync::broadcast;
 
 use crate::error::{Context, HarnessError, Result};
 use crate::paths::{self, now_ms};
+use crate::procutil;
 use crate::protocol::{
     BranchSummary, ChildUsageAttribution, CompactionState, ForkedFrom, GoalAction, GoalState,
     GoalStatus, HarnessAction, HarnessNote, HarnessSnapshot, HarnessState, Request, Role,
@@ -456,6 +457,14 @@ impl AgentSession {
             name,
             status: SessionStatus::Active,
             worker_pid: Some(std::process::id()),
+            // Taken for *this* process, at the moment it takes
+            // ownership -- see `SessionState::worker_start_fingerprint`.
+            // A failed reading is `None` (liveness falls back to the bare
+            // pid check), never a hard error: this narrows a race, it is
+            // not something a session should refuse to start over.
+            worker_start_fingerprint: procutil::start_fingerprint(std::process::id())
+                .ok()
+                .flatten(),
             generation: 1,
             last_sequence: 0,
             created_at_ms: now,
@@ -543,6 +552,12 @@ impl AgentSession {
         state.generation += 1;
         state.status = SessionStatus::Active;
         state.worker_pid = Some(std::process::id());
+        // Re-taken on every respawn, alongside `worker_pid` -- see
+        // `AgentSession::create`'s identical call for why a failed
+        // reading is `None` rather than an error.
+        state.worker_start_fingerprint = procutil::start_fingerprint(std::process::id())
+            .ok()
+            .flatten();
         state.updated_at_ms = now_ms();
 
         let session = AgentSession {
@@ -2497,6 +2512,10 @@ pub(crate) async fn seed_forked_session(
         name,
         status: SessionStatus::Active,
         worker_pid: None,
+        // No worker exists yet -- this state is written before one is
+        // spawned, so there is nothing to fingerprint. The worker fills
+        // both in for itself on startup (`AgentSession::recover`).
+        worker_start_fingerprint: None,
         generation: 0,
         last_sequence,
         created_at_ms: now,

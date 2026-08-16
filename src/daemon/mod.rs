@@ -1633,10 +1633,20 @@ impl Supervisor {
     }
 }
 
+/// Is the worker `state` records still running -- and still the *same*
+/// process that recorded itself there?
+///
+/// `is_same_process`, not a bare `is_alive`: this is the check that
+/// decides whether to respawn, and trusting the pid number alone means a
+/// dead worker whose pid an unrelated process has since been handed
+/// reads as healthy forever, leaving that session wedged with no live
+/// worker and nothing to notice. See `procutil::is_same_process` for
+/// which way the ambiguous cases resolve and why.
 fn is_worker_alive(state: &SessionState) -> Result<bool> {
     use crate::error::IoResultExt;
     match state.worker_pid {
         None => Ok(false),
-        Some(pid) => procutil::is_alive(pid).ctx(Context::Worker),
+        Some(pid) => procutil::is_same_process(pid, state.worker_start_fingerprint.as_deref())
+            .ctx(Context::Worker),
     }
 }

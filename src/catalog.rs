@@ -101,16 +101,18 @@ fn effective_status(state: &SessionState) -> SessionStatus {
     }
     match state.worker_pid {
         None => SessionStatus::Crashed,
-        Some(pid) => match procutil::is_alive(pid) {
-            Ok(true) => SessionStatus::Active,
-            Ok(false) => SessionStatus::Crashed,
-            Err(err) => {
-                eprintln!(
-                    "catalog: is_alive({pid}) failed for session {}: {err}",
-                    state.session_id
-                );
-                SessionStatus::Crashed
+        Some(pid) => {
+            match procutil::is_same_process(pid, state.worker_start_fingerprint.as_deref()) {
+                Ok(true) => SessionStatus::Active,
+                Ok(false) => SessionStatus::Crashed,
+                Err(err) => {
+                    eprintln!(
+                        "catalog: is_same_process({pid}) failed for session {}: {err}",
+                        state.session_id
+                    );
+                    SessionStatus::Crashed
+                }
             }
-        },
+        }
     }
 }

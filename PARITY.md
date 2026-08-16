@@ -74,6 +74,42 @@ environment:
 Would need a new subsystem, but one that composes with the existing
 daemon/worker split rather than requiring the Python control environment:
 
+- [x] **PID-reuse- and zombie-safe worker liveness** (`daemon.md`'s
+  `R-WRK-14` lease-owner check, plus `R-PROC-03`'s zombie carve-out).
+  `COMPARISON.md` §5 flagged the first half: `procutil::is_alive` was a
+  bare `kill(pid, 0)`, which answers "does *a* process hold this number",
+  not "is this still the worker that wrote `state.json`" -- so a
+  recovering supervisor reading a stale `worker_pid` an unrelated process
+  now holds would call the session healthy and never respawn it.
+  `SessionState::worker_start_fingerprint` now records an opaque
+  per-platform start-time reading beside `worker_pid` (taken by the worker
+  for itself), and `procutil::is_same_process` compares both.
+  `/proc/<pid>/stat` field 22 on Linux, `ps -o lstart=` on macOS/BSD,
+  `GetProcessTimes` on Windows -- one syscall rather than the PowerShell
+  shell-out `prime-agent` uses for the same reading.
+
+  Closing it surfaced a second, worse gap in the same check that no
+  fingerprint could have caught: **zombies**. A process that has exited
+  but not been reaped answers `kill(pid, 0)` successfully, and it has both
+  the same pid *and* the same start time as the process it is the remains
+  of. This was not hypothetical -- it wedged a real session while this
+  work was in progress: `daemon shutdown` exits the supervisor and its
+  worker at nearly the same moment, so the worker sat unreaped, liveness
+  said "yes", the supervisor skipped the respawn, and the next request got
+  `Connection refused` from a socket nobody was listening on. `is_alive`
+  now excludes zombies (`is_zombie`: `/proc/<pid>/stat` field 3 on Linux,
+  `ps -o state=` on macOS/BSD, always false on Windows, per `R-PROC-04`).
+  It had also been quietly costing `tests/worker_fence.rs` a retry loop,
+  which this let us delete.
+
+  Ambiguity resolves toward "alive" throughout: a missing fingerprint (a
+  pre-upgrade `state.json`) or an unreadable one falls back to the bare
+  liveness check. Being wrong that way costs the narrow reuse case; being
+  wrong the other way would declare a live worker dead and put a second
+  one on the same session. Tested in `tests/pid_reuse.rs` (4 tests,
+  forging the observable end state of a reuse since real reuse needs the
+  pid space to wrap) plus 5 `procutil` unit tests.
+
 - [x] **Generation-fenced per-worker tokens** (`daemon.md`: "private
   worker connections authenticate with a per-worker token fenced to the
   current supervisor generation, preventing a stale replacement
