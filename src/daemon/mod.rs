@@ -371,13 +371,36 @@ impl Supervisor {
     /// socket path. Never spawns a session that doesn't already exist on
     /// disk -- `SessionNew` is the only path that creates one.
     async fn ensure_worker_running(&self, session_id: &str) -> Result<PathBuf> {
-        let _guard = self.spawn_lock.lock().await;
         let session_dir = paths::session_dir(&self.state_root, session_id);
         let socket_path = paths::worker_socket_path(&self.state_root, session_id);
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
 
-        let alive = is_worker_alive(&state)?;
-        if alive {
+        // Fast path, deliberately outside `spawn_lock`. The lock exists
+        // to stop two requests spawning the same worker twice, so it is
+        // only needed on the path that actually spawns -- but it used to
+        // be taken before this check, which meant a request to a session
+        // whose worker was already up still queued behind an unrelated
+        // session's cold start. `spawn_lock` is supervisor-wide, and
+        // `fire_due_schedules` takes it every 5s, so the queue was not
+        // hypothetical: the wait could reach `WORKER_READY_TIMEOUT`
+        // while the answer ("it's alive, here's the socket") was already
+        // known and cost a single `read_session_state`.
+        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        if is_worker_alive(&state)? {
+            return Ok(socket_path);
+        }
+
+        let _guard = self.spawn_lock.lock().await;
+
+        // Re-read and re-check under the lock, rather than trusting the
+        // read above. Moving the lock down without this would defeat the
+        // point of having it: two requests could both miss the fast path
+        // for the same dead worker, both take the lock in turn, and the
+        // second would spawn a duplicate on top of the worker the first
+        // just started. The state file is the shared truth here, so it
+        // has to be re-read -- `state` above is a snapshot from before
+        // we waited.
+        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        if is_worker_alive(&state)? {
             return Ok(socket_path);
         }
 

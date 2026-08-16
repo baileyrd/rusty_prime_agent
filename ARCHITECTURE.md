@@ -1770,6 +1770,42 @@ warns about -- so an unbounded read there waits forever for a reply
 nobody will send. Adoption is a once-per-restart operation, so the round
 trip it costs is not on any hot path.
 
+### Timeout budgets nest, and the direction matters
+
+Four bounded waits interact, and each one is deliberately positioned
+relative to the wait that contains it. The rule is that the *outer*
+budget is strictly larger than the inner one, so whichever layer gives
+up first is the layer whose diagnosis is worth reading:
+
+| Wait | Bound | Sits inside | Why |
+|---|---|---|---|
+| `daemon::FENCE_HANDSHAKE_TIMEOUT` | 2s | client's 5s | supervisor gives up first, so its specific "fenced out" reaches the caller |
+| `transport::Listener::bind_with_retry` | 20s | `client::DAEMON_READY_TIMEOUT` 30s | CLI must not abandon `wait_ready` before the retry loop spends its budget |
+| `daemon::WORKER_READY_TIMEOUT` | 30s | `client::WORKER_REVIVE_RESPONSE_TIMEOUT` 45s | a cold worker start must not outlast the client waiting for it |
+| everything else | — | `client::RESPONSE_TIMEOUT` 5s | a genuinely dead daemon still fails fast |
+
+The third row was inverted until it was measured, and by 6x:
+`ensure_worker_running` would spend up to 30s waiting for a freshly
+spawned worker to bind while the client had already walked away at 5s.
+The symptom was `daemon did not respond in time` -- a message that
+names a dead daemon, reported while the daemon was working normally --
+attributed to whichever of the ten `resolve_worker` handlers happened
+to trigger the spawn. That is why the same fault appeared as three
+different "flaky tests" across three runs before anyone read the panic
+text. `RESPONSE_TIMEOUT` stays at 5s for every request that cannot
+revive a worker, which is what keeps `supervisor_restart_recovery`'s
+fast-fail check meaningful: it probes with `daemon status`, and that
+never reaches `resolve_worker`.
+
+`spawn_lock` is scoped to match. It exists only to stop two requests
+spawning the same worker twice, so it is taken *after* the liveness
+check rather than before it -- previously a request to an already-live
+worker queued behind an unrelated session's cold start, on a
+supervisor-wide lock that `fire_due_schedules` also takes every 5s. The
+check is repeated under the lock, re-reading `state.json` rather than
+trusting the pre-lock snapshot, since dropping that second read would
+trade the queueing problem for a double-spawn.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
