@@ -52,7 +52,7 @@ same thing (see §11).
 | Test files / functions | 424 files | 28 files / 394 test fns |
 | Resolved dependency graph | 463 lockfile entries | 39 lockfile crates |
 | Direct runtime deps | 23 (coding-agent) + 11 (ai) | 4 (+2 platform-gated) |
-| CI workflows | 4 | 1 (3-OS matrix) |
+| CI workflows | 4 | 2 (both 3-OS matrix) |
 | Packages / crates | 4 npm workspaces + 1 PyPI shim | 1 crate (lib + bin) |
 
 Per-package upstream breakdown: `coding-agent` 118,859 · `ai` 34,432 ·
@@ -506,11 +506,30 @@ it has already paid, since the Windows `AF_UNIX` stale-reclaim race that
 `bind_with_retry` exists for was found on real `windows-latest` CI, not
 in theory.
 
-**The gap:** no stress/soak dimension. Every recovery test here is a
-single deterministic scenario. Upstream's nightly stress job exists
-because process-lifecycle bugs are *frequency*-dependent — the
-`WSAENOBUFS` behavior documented in `transport.rs` is exactly the class of
-bug a deterministic test finds once and a stress job finds reliably.
+~~**The gap:** no stress/soak dimension.~~ **Closed** —
+`.github/workflows/nightly-stress.yml`.
+
+Every recovery test here was a single deterministic scenario, while
+process-lifecycle bugs are *frequency*-dependent: the `WSAENOBUFS`
+behavior documented in `transport.rs` is exactly the class a
+deterministic test finds once and then hides again. There are now two
+nightly jobs, and the split matters:
+
+- **`process-stress`** repeats the five suites that force-kill real
+  processes and rebind real sockets (`supervisor_restart_recovery`,
+  `worker_crash_recovery`, `worker_fence`, `pid_reuse`,
+  `session_lifecycle`), 20× each, **on all three OSes** — where upstream's
+  equivalent is ubuntu-only. These are expected to be deterministic, so
+  any failure gates.
+- **`flake-watch`** runs the full suite 5× and reports a per-test failure
+  *rate* without gating, so "that test is flaky" becomes a number rather
+  than a recollection. Deliberately separate: folding the known
+  wall-clock-budget offenders into the gating job would drown its signal
+  in noise it cannot act on.
+
+That second job is a direct response to how much time the ambient flakes
+cost during this work — the failure rate had to be measured by hand,
+twice, to tell a real regression from background noise.
 
 ---
 
@@ -609,11 +628,10 @@ Not "smaller but adequate" — actually better on its own terms:
    claim-and-advance semantics, or document why supervisor-side is right
    for a process-per-session topology. Both are defensible; silence is
    not.
-5. **Add a stress/soak CI job** (§11). Upstream's
-   `nightly-process-stress.yml` is the practice, not just the workflow:
-   loop the spawn/kill/recover cycle N times rather than once. The
-   Windows `AF_UNIX` race that already cost real investigation time is
-   precisely the class of bug this catches early.
+5. ~~**Add a stress/soak CI job**~~ (§11) — **done**, on all three OSes
+   rather than upstream's ubuntu-only, plus a non-gating `flake-watch`
+   job that measures the ambient failure rate instead of leaving it to
+   memory.
 6. **Bound kernel-boot concurrency before fan-out grows** (§7). Upstream
    measured ~28% boot success at 200 concurrent spawns. This project
    spawns a *worker process per RLM child*, so a wide `rlm()` fan-out is
