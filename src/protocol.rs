@@ -34,6 +34,36 @@ pub enum Request {
     /// "genuinely serving requests", used by both `daemon_start`'s
     /// idempotency check and every `wait_ready` retry loop.
     Ping,
+    /// **Private transport only.** The mandatory preamble on every
+    /// supervisor -> worker connection that isn't a bare [`Request::Ping`]:
+    /// the worker serves nothing else until it has seen this and matched
+    /// `supervisor` exactly against its own current fence. Answered with
+    /// [`Response::WorkerAuthOk`], or a `conflict: true`
+    /// [`Response::Error`] naming both identities when the fence rejects
+    /// it. See `crate::fence` for the whole mechanism and why it exists.
+    ///
+    /// Deliberately *not* accepted on the public transport: a client has
+    /// no business presenting a supervisor identity, and `daemon::
+    /// Supervisor::handle_public_connection` rejects it the same way it
+    /// rejects any other private-only variant.
+    WorkerAuth {
+        supervisor: crate::fence::SupervisorIdentity,
+    },
+    /// **Private transport only.** A replacement supervisor taking over a
+    /// still-live worker it did not itself spawn (`daemon::Supervisor::
+    /// recover_on_startup` -> `adopt_worker`). Unlike [`Request::WorkerAuth`]
+    /// this *advances* the fence, so it costs two things: presenting the
+    /// worker's own `worker_token` (read off the owner-only fence file,
+    /// which is what proves the caller is at least the same OS user with
+    /// access to this state root), and a supervisor identity whose
+    /// counter is strictly greater than the fence's current one (which is
+    /// what stops a *stale* supervisor -- who also has the token -- from
+    /// simply taking the worker back). Answered with
+    /// [`Response::WorkerAdopted`].
+    WorkerAdopt {
+        worker_token: String,
+        supervisor: crate::fence::SupervisorIdentity,
+    },
     DaemonStatus,
     /// `force: false` (the default, `daemon shutdown` with no flag) is
     /// the original behavior unchanged: send `Request::WorkerShutdown`
@@ -365,6 +395,19 @@ pub enum ScheduleKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Pong,
+    /// The worker accepted a [`Request::WorkerAuth`] preamble; the real
+    /// request follows on the same connection.
+    WorkerAuthOk,
+    /// The worker accepted a [`Request::WorkerAdopt`] and advanced its
+    /// fence to the presented identity. `previous` is the identity that
+    /// was displaced, purely so the adopting supervisor can log what it
+    /// took over from -- `None` when the worker was *unfenced* until now
+    /// (a session predating the fence mechanism, being converged onto one
+    /// by an in-place upgrade), where there is genuinely no predecessor
+    /// rather than a predecessor equal to the new owner.
+    WorkerAdopted {
+        previous: Option<crate::fence::SupervisorIdentity>,
+    },
     Error {
         message: String,
         /// True for an expected, structured condition (e.g.

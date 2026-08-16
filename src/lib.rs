@@ -40,6 +40,14 @@
 //! "Embeddable SDK" entry for the full design story.
 
 pub mod error;
+// Public only because `protocol::Request::WorkerAuth`/`WorkerAdopt`
+// name its types -- a public enum with an unnameable field type is a
+// wart, not a feature. Its *mechanics* (minting, adoption, the on-disk
+// fence file) stay `pub(crate)`: nothing outside this crate has a
+// legitimate reason to forge a supervisor identity, and the module doc
+// is explicit that this is process coordination rather than a privilege
+// boundary.
+pub mod fence;
 pub mod paths;
 pub mod protocol;
 pub mod provider;

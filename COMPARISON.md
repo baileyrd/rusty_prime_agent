@@ -217,13 +217,13 @@ real argument, but a narrower one than a filesystem lease.
 | Public framing | JSONL, versioned envelopes, **v4** | JSONL, `PROTOCOL_VERSION = 1` |
 | Private framing | **binary**: 4-byte header len + 4-byte payload len + JSON routing header + opaque payload | same JSONL as public |
 | Event cursor | `{generation, sequence}` | `{generation, sequence}` ✅ |
-| Generation identity | random **UUID per supervisor instance**; comparison is identity-equality only, never ordering (`R-PROTO-18`) | monotonic **`u64` counter** persisted in `daemon.pid` |
+| Generation identity | random **UUID per supervisor instance**; comparison is identity-equality only, never ordering (`R-PROTO-18`) | `(monotonic `u64` counter, 128 random bits)` pair — see §4.1 |
 | Capability negotiation | yes, per-command compat metadata | none |
 | Protocol vs schema versioning | tracked **independently** (`R-PROTO-07`) | single number |
 | Large snapshots | `begin`/`chunk`/`end` at 512 KiB target; supervisor never materializes a history-sized object | single `SessionEvent::Snapshot` |
 | Fanout cost | worker serializes each event **once**; supervisor forwards the same buffer | supervisor re-relays per connection |
 | Backpressure | explicit: no unbounded per-client queue; a blocked client stops receiving increments only | no stated policy |
-| Private-connection auth | per-worker token **fenced to supervisor generation** (`R-PROTO-11`) | none — bind exclusivity + filesystem permissions only |
+| Private-connection auth | per-worker token **fenced to supervisor generation** (`R-PROTO-11`) | ✅ per-worker token fenced to supervisor generation (`src/fence.rs`) |
 
 **What the JSONL-everywhere choice actually costs.** Upstream's binary
 private frame exists so the routing header can be parsed without touching
@@ -233,22 +233,38 @@ optimization at high client fanout; at this project's realistic fanout
 uniform-JSONL choice is defensible. The genuinely missing pieces are the
 ones that are about *correctness under stress*, not throughput:
 
-1. **Generation as counter, not fence.** Upstream's UUID generation is
-   not a version number — it is an authentication fence. A worker adopted
-   by supervisor generation *G* rejects any command carrying a token
-   fenced to a different generation, which resolves "is this supervisor
-   stale?" *architecturally*. This project's monotonic counter serves the
-   event-cursor role correctly, but there is no token, so a stale
-   replacement supervisor is prevented from commanding an adopted worker
-   only by liveness probing.
+1. ~~**Generation as counter, not fence.**~~ **Closed** — implemented in
+   `src/fence.rs`, `tests/worker_fence.rs`.
 
-   This is the same classification problem `transport::Listener::bind_with_retry`
-   solves empirically, at some length, with a real `Ping`/`Pong` round
-   trip and a 20-second budget, after a Windows `AF_UNIX` reclaim race
-   that took several rounds of upstream `rustils` fixes to characterize.
-   Token fencing would have made that question unaskable rather than
-   answerable. This is the highest-leverage single idea in the reference
-   design that this project has not adopted.
+   As originally written, this was the highest-leverage single idea in
+   the reference design this project had not adopted. Upstream's UUID
+   generation is not a version number, it is an authentication fence: a
+   worker adopted by supervisor generation *G* rejects any command
+   carrying a token fenced to a different generation, which resolves "is
+   this supervisor stale?" architecturally rather than empirically — the
+   same classification problem `transport::Listener::bind_with_retry`
+   answers with a real `Ping`/`Pong` round trip and a 20-second budget,
+   after a Windows `AF_UNIX` reclaim race that took several rounds of
+   upstream `rustils` fixes to characterize.
+
+   This project now has the mechanism, with one deliberate difference
+   forced by §3.3. Upstream compares generations by identity-equality
+   only, *never* ordering (`R-PROTO-18`), because its atomic launch lease
+   already guarantees a single legitimate supervisor. Absent that lease,
+   identity-equality alone would be unsound here: a stale supervisor can
+   read the worker token off disk and simply re-adopt the worker back.
+   So `SupervisorIdentity` is a `(counter, instance)` pair — the
+   monotonic `daemon.pid` counter, which adoption requires to be
+   **strictly greater**, plus 128 random bits that ordinary traffic
+   requires to match exactly. The residual weakness is a concurrent-
+   startup tie (two supervisors both writing `counter = N + 1`), which
+   fails closed in both directions rather than letting either command the
+   other's workers; closing it properly is item 4's launch lease, not a
+   change to the fence. `ARCHITECTURE.md`'s "Generation-fenced per-worker
+   tokens" section carries the full design.
+
+   `bind_with_retry` is unchanged and still needed. What the fence buys
+   is that being *wrong* about its verdict is now survivable.
 
 2. **No chunked snapshot.** A large transcript is one `Snapshot` event.
    Upstream chunks at 512 KiB specifically so the supervisor never builds
@@ -562,14 +578,13 @@ Not "smaller but adequate" — actually better on its own terms:
 
 ## 14. Recommendations, ranked by leverage
 
-1. **Adopt generation-fenced per-worker tokens** (§4.1). This is the
-   single highest-value idea in the reference design that is absent here.
-   It converts "is this supervisor stale?" from an empirical question —
-   the one `bind_with_retry` answers with a `Ping`/`Pong` probe and a
-   20-second budget after a multi-round Windows investigation — into a
-   structural one. Small change: a random UUID per supervisor instance,
-   written to the worker descriptor at spawn, checked on every private
-   connection.
+1. ~~**Adopt generation-fenced per-worker tokens**~~ (§4.1) — **done**.
+   `src/fence.rs` mints a per-worker token and a per-supervisor identity;
+   `Supervisor::connect_worker` is now the single chokepoint every
+   private connection goes through, and `Supervisor::adopt_worker`
+   handles takeover on supervisor restart. `tests/worker_fence.rs` covers
+   both directions, including the refusal path a passing happy path can
+   never demonstrate.
 2. **Make idempotency durable** (§5). The in-memory `request_id` cache
    fails in exactly the scenario it exists for. An append-only
    pre-dispatch journal keyed by `client_id + request_id`, with the
