@@ -90,6 +90,23 @@ pub struct Supervisor {
 pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
     paths::ensure_dir(Context::Daemon, &state_root)?;
     paths::ensure_dir(Context::Daemon, &paths::sessions_dir(&state_root))?;
+
+    // Pre-warm `rusty_tokio`'s blocking-thread pool with one thread
+    // before any real work needs it. `spawn_blocking` grows that pool
+    // by calling `std::thread::Builder::spawn()` *inline, on whatever
+    // thread called it* -- see `catalog::read_session_state`'s own doc
+    // comment. Every daemon here is a brand-new process with a cold
+    // pool, so without this, the very first `catalog`/`schedule` read
+    // (including the one two lines down, in `recover_on_startup`) pays
+    // that thread-creation cost on an async worker thread. Paying it
+    // here instead is free in the way that matters: `client::
+    // DAEMON_READY_TIMEOUT`'s `wait_ready` poll is already waiting on
+    // `daemon.sock` to bind, which happens well after this, so nothing
+    // client-visible is timed yet. One thread is enough for the common
+    // case (sequential requests reuse it without growing further); a
+    // genuine burst can still grow the pool same as before, just no
+    // longer guaranteed to on request one.
+    let _ = rusty_tokio::spawn_blocking(|| {}).await;
     let generation = record_daemon_pid(&state_root)?;
 
     let supervisor = Arc::new(Supervisor {
