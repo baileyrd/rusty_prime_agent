@@ -74,6 +74,36 @@ environment:
 Would need a new subsystem, but one that composes with the existing
 daemon/worker split rather than requiring the Python control environment:
 
+- [x] **Nightly process-stress CI** -- parity with `prime-agent`'s own
+  `nightly-process-stress.yml`, which `COMPARISON.md` §11 called out as
+  the clearest signal in that repo that its documented crash-recovery
+  behavior is a maintained property rather than a design claim. `ci.yml`
+  runs every test once, which is right for correctness but structurally
+  cannot find a *rate* bug -- and the process-lifecycle bugs this project
+  has actually hit are all rate bugs (the Windows `AF_UNIX` stale-reclaim
+  race behind `transport::Listener::bind_with_retry` was found on real CI
+  and did not reproduce every run).
+
+  `.github/workflows/nightly-stress.yml` adds two jobs, and the split is
+  the point. **`process-stress`** repeats the five suites that force-kill
+  real processes and rebind real sockets, 20x each, serialized
+  (`--test-threads=1`, so a failure is attributable to one test rather
+  than to whatever else was contending) -- on all three OSes, where
+  upstream's equivalent is ubuntu-only. Those suites are expected to be
+  deterministic, so any failure gates. **`flake-watch`** runs the full
+  suite 5x and reports a per-test failure *rate* to the step summary
+  without gating. Folding the known wall-clock-budget offenders
+  (`autonomous_stops_at_max_time_...`, `an_every_schedule_fires_more_than_once`,
+  both of which fail on `main` too) into the gating job would have
+  drowned its signal in noise it cannot act on; measuring them separately
+  turns "that test is flaky" into a number someone can check.
+
+  Both scripts were run locally before landing rather than trusted to
+  read correctly at 04:00 -- which caught two bugs: `declare -A` is a
+  syntax error on the bash 3.2 the macOS runners still ship (now plain
+  index-parallel arrays), and `wc -l` on an empty herestring reports 1,
+  so every clean run would have logged "1 failing".
+
 - [x] **PID-reuse- and zombie-safe worker liveness** (`daemon.md`'s
   `R-WRK-14` lease-owner check, plus `R-PROC-03`'s zombie carve-out).
   `COMPARISON.md` §5 flagged the first half: `procutil::is_alive` was a

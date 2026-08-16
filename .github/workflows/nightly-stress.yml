@@ -1,0 +1,186 @@
+# Frequency-dependent process bugs, which the ordinary CI run is
+# structurally unable to find.
+#
+# `ci.yml` runs each test once. That is the right shape for correctness,
+# but process-lifecycle bugs in this project are *rate* bugs: the Windows
+# AF_UNIX stale-reclaim race that `transport::Listener::bind_with_retry`
+# exists for was found on real `windows-latest` CI, not in theory, and it
+# did not reproduce every run. A deterministic suite finds that class of
+# bug once and then hides it again. Repetition is what makes it visible.
+#
+# Modeled on `prime-agent`'s own `nightly-process-stress.yml` -- one of
+# the clearest signals in that repo that its documented crash-recovery
+# behavior is a maintained property rather than a design claim. This
+# project's version runs on all three OSes rather than upstream's
+# ubuntu-only, for the same reason `ci.yml` does: the recovery paths are
+# where the platforms genuinely differ, and a cross-compile check cannot
+# force-kill a process or rebind a socket.
+name: Nightly process stress
+
+on:
+  schedule:
+    # 04:00 UTC. Nothing depends on the exact hour; it is simply outside
+    # the window when a push-triggered `ci.yml` run is likely to be
+    # competing for runners.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "How many times to repeat each process-lifecycle suite"
+        required: false
+        default: "20"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The gate. These five suites are the ones that force-kill real
+  # processes and rebind real sockets -- the whole reason this workflow
+  # exists -- and they are expected to be deterministic. A single failure
+  # across every iteration is a real finding, not noise, so this job
+  # fails the run.
+  process-stress:
+    name: Process stress (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Built once up front so the loop below times the tests rather than
+      # the compiler, and so a build break fails here with a clear message
+      # instead of on iteration 1 of 20.
+      - name: Build tests
+        run: cargo test --no-run --tests
+
+      - name: Stress process-lifecycle suites
+        shell: bash
+        run: |
+          set -uo pipefail
+          iterations="${{ github.event.inputs.iterations || '20' }}"
+          # Exactly the suites that force-kill a process or rebind a
+          # socket (`grep -l force_kill tests/*.rs`). Deliberately NOT the
+          # whole suite: `autonomous`/`scheduling` are wall-clock-budget
+          # tests that are already known to fail occasionally on a loaded
+          # runner, and folding them in here would drown this job's signal
+          # in noise it cannot act on. The `flake-watch` job below covers
+          # those separately, and reports rather than gates.
+          suites=(
+            supervisor_restart_recovery
+            worker_crash_recovery
+            worker_fence
+            pid_reuse
+            session_lifecycle
+          )
+
+          # Plain indexed arrays, not an associative array: the macOS
+          # runners still ship bash 3.2, where `declare -A` is a syntax
+          # error. `failures` is kept index-parallel to `suites`.
+          failures=()
+          for _ in "${suites[@]}"; do failures+=(0); done
+          total_failures=0
+
+          for i in $(seq 1 "$iterations"); do
+            for n in "${!suites[@]}"; do
+              s="${suites[$n]}"
+              # `--test-threads=1`: each of these spawns real daemons and
+              # workers, and serializing them makes a failure attributable
+              # to one test rather than to whatever else was contending
+              # for the runner at that moment.
+              if ! cargo test --test "$s" -- --test-threads=1; then
+                failures[$n]=$(( ${failures[$n]} + 1 ))
+                total_failures=$(( total_failures + 1 ))
+                echo "::error title=$s::failed on iteration $i of $iterations"
+              fi
+            done
+          done
+
+          {
+            echo "### Process stress — ${{ matrix.os }}"
+            echo
+            echo "\`$iterations\` iterations per suite."
+            echo
+            echo "| Suite | Failures |"
+            echo "|---|---:|"
+            for n in "${!suites[@]}"; do
+              echo "| \`${suites[$n]}\` | ${failures[$n]} / $iterations |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$total_failures" -ne 0 ]; then
+            echo "$total_failures failing runs across $iterations iterations"
+            exit 1
+          fi
+          echo "clean across $iterations iterations"
+
+  # The measurement. Runs the whole suite repeatedly and reports which
+  # tests failed and how often, without gating -- so "that test is flaky"
+  # becomes a number someone can check rather than a claim someone
+  # remembers. Two known offenders as of writing
+  # (`autonomous_stops_at_max_time_before_exhausting_a_large_turn_budget`,
+  # `an_every_schedule_fires_more_than_once`) both fail on `main` and are
+  # wall-clock-budget tests rather than logic failures; this job is how we
+  # find out if that changes, or if a third one appears.
+  #
+  # ubuntu-only on purpose: it is the leg where contention actually bites
+  # (the suite runs ~30 test binaries, each spawning daemons and workers),
+  # and running the full suite N times on three OSes buys little for the
+  # runner minutes it costs.
+  flake-watch:
+    name: Flake watch (full suite × 5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tests
+        run: cargo test --no-run --tests
+
+      - name: Run the full suite repeatedly
+        shell: bash
+        # Never fails the run: this job's output is a rate, and a rate
+        # that is merely non-zero is not by itself actionable. The
+        # `process-stress` job above is what gates.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          runs=5
+          : > /tmp/failed-tests.txt
+          clean=0
+          for i in $(seq 1 "$runs"); do
+            out=$(cargo test --no-fail-fast 2>&1) || true
+            # Failing test names are listed one per line, indented, under
+            # the trailing `failures:` block of each test binary.
+            names=$(grep -E '^    [a-z0-9_:]+$' <<<"$out" | tr -d ' ' | sort -u)
+            if [ -z "$names" ]; then
+              clean=$(( clean + 1 ))
+              echo "run $i: clean"
+            else
+              echo "$names" >> /tmp/failed-tests.txt
+              # Counted only in this branch: `wc -l` on an empty
+              # herestring reports 1, not 0, which would have made every
+              # clean run read as "1 failing".
+              echo "run $i: $(wc -l <<<"$names" | tr -d ' ') failing"
+            fi
+          done
+
+          {
+            echo "### Flake watch"
+            echo
+            echo "\`$runs\` full-suite runs, \`$clean\` completely clean."
+            echo
+            if [ -s /tmp/failed-tests.txt ]; then
+              echo "| Test | Runs failed |"
+              echo "|---|---:|"
+              sort /tmp/failed-tests.txt | uniq -c | sort -rn \
+                | awk '{printf "| `%s` | %s / '"$runs"' |\n", $2, $1}'
+            else
+              echo "No test failed in any run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
