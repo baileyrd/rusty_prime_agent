@@ -1468,7 +1468,7 @@ impl AgentSession {
             return Ok(false);
         }
         let child_dir = paths::session_dir(&self.state_root, child_id);
-        let child_state = crate::catalog::read_session_state(Context::Session, &child_dir)?;
+        let child_state = crate::catalog::read_session_state(Context::Session, &child_dir).await?;
         if child_state.parent_id.as_deref() != Some(self.state.session_id.as_str()) {
             return Ok(false);
         }
