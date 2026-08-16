@@ -566,14 +566,29 @@ async fn authorize_private_connection(
                 Some(current) if current.supervisor != supervisor => {
                     let current = current.supervisor.clone();
                     drop(guard);
+                    // Drained before answering, and the order matters.
+                    // The supervisor does not wait for an ack (see
+                    // `Supervisor::connect_worker`), so its real request
+                    // is already on its way; replying and closing without
+                    // consuming that line would race it into an `EPIPE`
+                    // on the supervisor's side, replacing this specific
+                    // "you are fenced out" message with a generic broken
+                    // -pipe error at exactly the moment the operator most
+                    // needs the specific one.
+                    let _ = conn.read_request(Context::Worker).await;
                     reject(conn, &current, &supervisor, "command").await?;
                     Ok(None)
                 }
                 // Fenced and matching, or unfenced (see `FenceCell`).
+                //
+                // No `WorkerAuthOk`: silence is acceptance. The
+                // supervisor never waits to hear it, so sending one would
+                // buy nothing and cost this worker an extra scheduling
+                // round per request -- see `Supervisor::connect_worker`
+                // for the measurement that made that a real problem
+                // rather than a stylistic one.
                 _ => {
                     drop(guard);
-                    conn.write_response(Context::Worker, &Response::WorkerAuthOk)
-                        .await?;
                     match conn.read_request(Context::Worker).await? {
                         Some(inner) => Ok(Some(inner)),
                         // Auth preamble then a clean disconnect: the

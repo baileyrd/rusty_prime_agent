@@ -37,10 +37,16 @@ pub enum Request {
     /// **Private transport only.** The mandatory preamble on every
     /// supervisor -> worker connection that isn't a bare [`Request::Ping`]:
     /// the worker serves nothing else until it has seen this and matched
-    /// `supervisor` exactly against its own current fence. Answered with
-    /// [`Response::WorkerAuthOk`], or a `conflict: true`
-    /// [`Response::Error`] naming both identities when the fence rejects
-    /// it. See `crate::fence` for the whole mechanism and why it exists.
+    /// `supervisor` exactly against its own current fence. See
+    /// `crate::fence` for the whole mechanism and why it exists.
+    ///
+    /// **Acceptance is silent.** There is no positive acknowledgement to
+    /// wait for -- the supervisor writes this line and its real request
+    /// back to back, keeping the exchange at one round trip (see
+    /// `daemon::Supervisor::connect_worker` for the measurement behind
+    /// that). A rejection arrives as a `conflict: true`
+    /// [`Response::Error`] naming both identities, in place of whatever
+    /// reply the following request would have produced.
     ///
     /// Deliberately *not* accepted on the public transport: a client has
     /// no business presenting a supervisor identity, and `daemon::
@@ -395,9 +401,6 @@ pub enum ScheduleKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Pong,
-    /// The worker accepted a [`Request::WorkerAuth`] preamble; the real
-    /// request follows on the same connection.
-    WorkerAuthOk,
     /// The worker accepted a [`Request::WorkerAdopt`] and advanced its
     /// fence to the presented identity. `previous` is the identity that
     /// was displaced, purely so the adopting supervisor can log what it

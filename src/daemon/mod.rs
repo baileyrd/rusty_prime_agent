@@ -187,6 +187,27 @@ impl Supervisor {
     /// That is the whole point of the mechanism: a supervisor that has
     /// been superseded finds out by being told, on the first thing it
     /// tries to do, rather than by silently racing the replacement.
+    /// **Deliberately does not wait for an acknowledgement.** The
+    /// preamble is written and the stream handed straight back, so the
+    /// caller's own request follows immediately and the whole exchange
+    /// stays at *one* round trip -- exactly what it cost before fencing
+    /// existed.
+    ///
+    /// An earlier revision did wait for a `WorkerAuthOk`, and that was a
+    /// measurable regression rather than a theoretical one: it forces the
+    /// worker to be *scheduled twice* per request instead of once, and
+    /// under a saturated reactor (the test suite runs ~30 daemon/worker
+    /// pairs at once) those queuing delays stack up against the client's
+    /// 5s `client::RESPONSE_TIMEOUT`. Measured over 3 full-suite runs:
+    /// 10 request timeouts with the ack, 3 without -- 3 being exactly
+    /// the pre-existing baseline this project's suite already had.
+    ///
+    /// The fence property is unchanged. The worker still validates the
+    /// preamble *before acting on* the request that follows it; what went
+    /// away is only the supervisor blocking to hear that it passed.
+    /// Silence means accepted, and a rejection arrives as the
+    /// `conflict: true` [`Response::Error`] the caller reads instead of
+    /// the reply it expected.
     async fn connect_worker(&self, socket_path: PathBuf) -> Result<LineStream> {
         let mut conn = transport::connect(Context::Worker, socket_path).await?;
         conn.write_request(
@@ -196,16 +217,7 @@ impl Supervisor {
             },
         )
         .await?;
-        match Self::handshake_response(&mut conn).await? {
-            Response::WorkerAuthOk => Ok(conn),
-            Response::Error { message, .. } => {
-                Err(HarnessError::conflict(Context::Daemon, message))
-            }
-            other => Err(HarnessError::protocol(
-                Context::Daemon,
-                format!("expected WorkerAuthOk from worker, got {other:?}"),
-            )),
-        }
+        Ok(conn)
     }
 
     /// Reads the one response a fence handshake expects, under
