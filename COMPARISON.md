@@ -295,7 +295,7 @@ Where they differ:
 | Recovery blast radius | one root tree | one session |
 | Recovery marker in transcript | yes | yes (`SessionEvent::RecoveryMarker`) |
 | Orphan subprocess tracking | append-only journal of pid + owner pid + start-time fingerprint | worker spawns no children of its own to track (documented) |
-| PID-reuse safety | start-time fingerprint (PowerShell ticks / `/proc/pid/stat` f22 / `ps -o lstart=`) | bare `kill(pid,0)` / `OpenProcess`+`GetExitCodeProcess` |
+| PID-reuse safety | start-time fingerprint (PowerShell ticks / `/proc/pid/stat` f22 / `ps -o lstart=`) | ✅ start-time fingerprint (`GetProcessTimes` / `/proc/pid/stat` f22 / `ps -o lstart=`) |
 
 Two of these are worth flagging as real, not cosmetic:
 
@@ -306,14 +306,24 @@ most. A client retrying after a dropped connection is *most* likely to be
 retrying because the worker died, which is precisely the case where the
 in-memory cache is gone and the retry double-sends.
 
-**PID reuse is unhandled.** This project's `procutil::is_alive` answers
-"does a process with this pid exist," not "is this the same process that
-wrote `state.json`." Upstream treats those as different questions
-(`R-WRK-14`) and pays for a per-platform start-time fingerprint to
-distinguish them. A recovering supervisor that reads a stale
-`worker_pid` now reused by an unrelated process will conclude the worker
-is alive and decline to respawn. Low probability, unbounded consequence,
-and the fix is well-specified upstream.
+~~**PID reuse is unhandled.**~~ **Closed** — `procutil::is_same_process`,
+`SessionState::worker_start_fingerprint`, `tests/pid_reuse.rs`.
+
+As written, this project's `is_alive` answered "does a process with this
+pid exist", not "is this the same process that wrote `state.json`", so a
+recovering supervisor reading a stale `worker_pid` now held by an
+unrelated process would conclude the worker was alive and decline to
+respawn. It now records a per-platform start-time fingerprint beside the
+pid and compares both, as upstream does (`R-WRK-14`).
+
+Closing it surfaced a **second** gap in the same check that upstream also
+covers and this project did not: **zombies** (`R-PROC-03`). A process
+that has exited but not been reaped answers `kill(pid, 0)` successfully,
+and no fingerprint can catch it — a zombie has the same pid *and* the
+same start time. That one was not hypothetical: it wedged a session
+during this work, `daemon shutdown` leaving a worker unreaped just long
+enough for the supervisor to skip the respawn and then hit `Connection
+refused`. `is_alive` now excludes zombies explicitly.
 
 ---
 
@@ -591,11 +601,9 @@ Not "smaller but adequate" — actually better on its own terms:
    explicit "uncertain, never replay" state, is a bounded increment and
    directly upgrades `tests/idempotent_replay.rs` from "same process" to
    "survives a crash."
-3. **Add start-time fingerprinting to `procutil::is_alive`** (§5). Bare
-   `kill(pid, 0)` cannot distinguish a live worker from a reused pid.
-   `/proc/<pid>/stat` field 22 on Linux, `ps -o lstart=` on macOS,
-   `GetProcessTimes` on Windows (cheaper than upstream's PowerShell
-   shell-out). Low probability, unbounded consequence.
+3. ~~**Add start-time fingerprinting to `procutil::is_alive`**~~ (§5) —
+   **done**, and it turned up a zombie-handling gap in the same check
+   that was actively wedging sessions. See §5.
 4. **Decide the scheduler's home explicitly** (§3.2, §12.3). Either move
    it worker-side to match `R-SUP-01`/`R-SCHED-01` and gain per-session
    claim-and-advance semantics, or document why supervisor-side is right

@@ -863,6 +863,19 @@ pub struct SessionState {
     pub name: Option<String>,
     pub status: SessionStatus,
     pub worker_pid: Option<u32>,
+    /// Paired with `worker_pid`, and written at the same moments: an
+    /// opaque `procutil::start_fingerprint` reading for that pid, taken
+    /// by the worker for *itself* as it takes ownership.
+    ///
+    /// Exists so a later liveness check can tell "that worker is still
+    /// running" from "that pid number now belongs to something else"
+    /// (`procutil::is_same_process`) -- parity with `prime-agent`'s own
+    /// PID-reuse-safe lease-owner check (`R-WRK-14`). `#[serde(default)]`
+    /// so a `state.json` written before this field existed still parses,
+    /// as `None`, which reduces liveness to the bare pid check it always
+    /// was rather than failing recovery.
+    #[serde(default)]
+    pub worker_start_fingerprint: Option<String>,
     /// Bumped every time a new worker process takes ownership of this
     /// session id (fresh spawn or crash-recovery respawn). Event cursors
     /// in the attach stream are `(generation, sequence)` pairs, mirroring

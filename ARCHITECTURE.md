@@ -32,7 +32,7 @@ project's current shape.
 | `catalog` | `session list`'s directory scan, cross-checked against process liveness |
 | `acp` | `harness acp [--model PROVIDER/MODEL]` -- the ACP (Agent Client Protocol) server, a bounded, schema-verified slice reusing `client::dispatch_one_shot` for every session operation rather than its own daemon-side handler -- see "ACP mode" below |
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
-| `procutil` | The narrow non-`rusty_tokio` OS surface -- see "Dependency Stack" below |
+| `procutil` | The narrow non-`rusty_tokio` OS surface -- detached spawn, and PID-reuse-/zombie-safe liveness for a pid this process did not spawn (`is_same_process`/`start_fingerprint`/`is_zombie`). See "Worker liveness" and "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
 | `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,worker-fence.json,schedules.json}`, `provider.{json,log}`) |
 | `provider` | `ModelProvider` trait (`respond(turns, tools) -> ProviderReply`) + `EchoProvider` (the default, ignores `tools`); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md`. Also owns the turn/tool wire types (`ChatTurn`/`TurnRole`/`ToolDef`/`ProviderReply`) the real tool-calling loop uses, hand-rolled to `rp-server`'s own shape |
@@ -1541,6 +1541,51 @@ repo, for the specific Windows dead-listener-reclaim race this exists
 alongside (fixed upstream in `rustils`' own `unix_listen`, not papered
 over here; `bind_with_retry`'s retry is about a real, load-bearing
 `AddrInUse` transient, not a substitute for that fix).
+
+## Worker liveness: PID reuse and zombies (`procutil.rs`)
+
+"Is the worker still running?" is the question that decides whether to
+respawn, and a bare `kill(pid, 0)` answers a different one: *does some
+process hold this number*. Two ways that diverges, both now handled, both
+matching `prime-agent`'s own lease-owner liveness check (`R-PROC-03`,
+`R-WRK-14`):
+
+- **PID reuse.** `SessionState::worker_start_fingerprint` records an
+  opaque per-platform start-time reading (`procutil::start_fingerprint`)
+  alongside `worker_pid`, taken by the worker for itself as it takes
+  ownership. `procutil::is_same_process` compares both, so a dead worker
+  whose pid an unrelated process now holds no longer reads as healthy
+  forever, wedging that session with nothing to notice. Sources:
+  `/proc/<pid>/stat` field 22 on Linux, `ps -o lstart=` on macOS/BSD,
+  `GetProcessTimes` on Windows (one syscall, rather than the PowerShell
+  shell-out `prime-agent` uses for the same reading).
+- **Zombies.** A process that has exited but not been reaped answers
+  `kill(pid, 0)` successfully, and a fingerprint cannot help -- a zombie
+  has the same pid *and* the same start time as the process it is the
+  remains of. `procutil::is_alive` now excludes them explicitly
+  (`is_zombie`: `/proc/<pid>/stat` field 3 on Linux, `ps -o state=` on
+  macOS/BSD, always false on Windows, which has no such concept).
+
+Neither is theoretical here. The zombie case is what wedged a session
+during development: `daemon shutdown` exits the supervisor and its worker
+at nearly the same moment, so the worker sat unreaped, liveness said
+"yes", and the next request got `Connection refused` from a socket
+nobody was listening on any more. It had also been quietly costing
+`tests/worker_fence.rs` a retry loop, which the fix let us delete.
+
+**Ambiguity resolves toward "alive", deliberately.** A missing
+fingerprint (a `state.json` predating the field) or an unreadable one
+reduces to the bare liveness check. Being wrong that way costs the narrow
+reuse case; being wrong the other way would declare a *live* worker dead
+and respawn a second one onto the same session -- much worse than the
+problem being solved.
+
+**Granularity is coarse and that is fine.** Linux ticks are ~10ms and
+macOS `lstart` resolves to the second, so two processes started within
+the same tick share a fingerprint. A reused pid necessarily arrives after
+the pid space wraps -- orders of magnitude longer -- so the window where
+two processes are indistinguishable never overlaps the window where reuse
+is possible.
 
 ## Generation-fenced per-worker tokens (`fence.rs`)
 
