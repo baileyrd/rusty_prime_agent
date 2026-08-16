@@ -351,29 +351,45 @@ pub struct AgentSession {
     /// call so a flag set (or left set) after one turn already finished
     /// can never leak into cancelling an unrelated later one.
     cancel_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Bounded first slice of idempotent replay protection
-    /// (`CLAIMS_AUDIT.md`'s own "Idempotent replay protection for
-    /// in-flight requests" entry) -- see
-    /// [`prompt_with_images_and_request_id`](Self::
-    /// prompt_with_images_and_request_id) for the actual dedup check.
-    /// In-memory only, never persisted to `state.json`/`transcript.
-    /// jsonl` -- lost on a worker crash/restart, the same "durability is
-    /// a separably larger step" bound the checklist entry itself states.
-    /// `recent_request_id_order` tracks insertion order so
-    /// `REQUEST_ID_CACHE_CAP` can evict the oldest entry first, keeping
-    /// a long-lived session's memory use bounded rather than growing
-    /// forever.
-    recent_request_ids: std::collections::HashMap<String, TranscriptEntry>,
-    recent_request_id_order: std::collections::VecDeque<String>,
+    /// Durable idempotent replay protection for `session prompt
+    /// --request-id <id>` -- see [`prompt_with_images_and_request_id`](Self::
+    /// prompt_with_images_and_request_id) for the dedup check and
+    /// `crate::request_journal` for the mechanism.
+    ///
+    /// This was an in-memory `HashMap<String, TranscriptEntry>` capped at
+    /// 64, whose own doc comment admitted it was "lost on a worker
+    /// crash/restart". That was the wrong bound to accept: a client
+    /// retrying after a dropped connection is most likely retrying
+    /// *because* the worker died, so the cache was empty in exactly the
+    /// case it existed for and the retry double-sent.
+    request_journal: crate::request_journal::RequestJournal,
 }
 
-/// How many distinct `request_id`s [`AgentSession::
-/// prompt_with_images_and_request_id`] remembers per session before
-/// evicting the oldest -- generous enough to absorb a real retry burst
-/// (a client backing off and retrying a handful of times) without
-/// growing unbounded over a long-lived session that's never actually
-/// crashed.
-const REQUEST_ID_CACHE_CAP: usize = 64;
+/// What [`AgentSession::prompt_with_images_and_request_id`] concluded.
+///
+/// Two outcomes rather than one entry, because "I don't know" is a real
+/// answer here and collapsing it into either success or failure would be
+/// a lie. See that method's own doc comment for when each arises.
+// `large_enum_variant` fires here on the `x86_64-pc-windows-msvc` target
+// (but not on this project's Linux host, so it is easy to miss until CI):
+// `Entry` carries a whole `TranscriptEntry` and `Uncertain` carries
+// nothing. Boxing to satisfy it would add an allocation on the prompt
+// return path to shrink a value that exists for microseconds and is never
+// collected in bulk -- the lint is aimed at enums held in quantity, which
+// this one never is. Allowed deliberately rather than papered over with an
+// indirection nobody benefits from.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum PromptOutcome {
+    /// The prompt ran, or an already-completed one was replayed from the
+    /// journal. Indistinguishable to the caller on purpose -- that is
+    /// what idempotency means.
+    Entry(TranscriptEntry),
+    /// The request was journaled as dispatched but never journaled a
+    /// result, and the transcript cannot settle it either. Reported, not
+    /// retried.
+    Uncertain,
+}
 
 /// Creation-time-only metadata for a brand-new session -- bundled so
 /// `AgentSession::create`/`worker::spawn`'s own argument lists don't keep
@@ -487,6 +503,12 @@ impl AgentSession {
             // transcripts.
             active_leaf_sequence: None,
         };
+        // Loaded before `session_dir` is moved into the struct, and
+        // before any prompt can run: an empty journal here would silently
+        // mean "no request has ever been seen", which is only true for a
+        // genuinely new session.
+        let request_journal =
+            crate::request_journal::RequestJournal::load(Context::Session, &session_dir)?;
         let session = AgentSession {
             state,
             transcript: Vec::new(),
@@ -500,8 +522,7 @@ impl AgentSession {
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
             cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            recent_request_ids: std::collections::HashMap::new(),
-            recent_request_id_order: std::collections::VecDeque::new(),
+            request_journal,
         };
         session.write_state().await?;
         // Opt-in, local-only telemetry -- see `telemetry`'s own module
@@ -560,6 +581,11 @@ impl AgentSession {
             .flatten();
         state.updated_at_ms = now_ms();
 
+        // Replayed from disk on every resume/recover -- this is the
+        // whole mechanism: the crashed worker's `begin` records are what
+        // tell this process which requests are uncertain.
+        let request_journal =
+            crate::request_journal::RequestJournal::load(Context::Session, &session_dir)?;
         let session = AgentSession {
             state,
             transcript,
@@ -573,8 +599,7 @@ impl AgentSession {
             registered_commands: std::collections::HashMap::new(),
             has_pre_tool_call_hook: false,
             cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            recent_request_ids: std::collections::HashMap::new(),
-            recent_request_id_order: std::collections::VecDeque::new(),
+            request_journal,
         };
         session.write_state().await?;
         Ok(session)
@@ -685,43 +710,65 @@ impl AgentSession {
         result
     }
 
-    /// Bounded first slice of idempotent replay protection
-    /// (`CLAIMS_AUDIT.md`'s own "Idempotent replay protection for
-    /// in-flight requests" entry) -- see `protocol::Request::
-    /// SessionPrompt::request_id`'s own doc comment for the wire-level
-    /// story. `request_id: None` (every existing caller) is exactly
-    /// [`prompt_with_images`](Self::prompt_with_images), unchanged.
-    /// `request_id: Some(id)` already present in
-    /// [`recent_request_ids`](Self::recent_request_ids) returns the same
-    /// cached `TranscriptEntry` again without prompting the provider a
-    /// second time -- what a caller retrying after a timed-out/dropped
-    /// connection needs, since it can't otherwise tell whether its first
-    /// attempt actually landed. A *new* `request_id` behaves exactly
-    /// like `prompt_with_images`, then remembers the result, evicting
-    /// the oldest remembered id once [`REQUEST_ID_CACHE_CAP`] is
-    /// exceeded.
+    /// Durable idempotent replay protection -- see `protocol::Request::
+    /// SessionPrompt::request_id` for the wire-level story and
+    /// `crate::request_journal` for the mechanism and its parity notes.
+    ///
+    /// `request_id: None` (every caller that does not opt in) is exactly
+    /// [`prompt_with_images`](Self::prompt_with_images), unchanged: no
+    /// journal write, no lookup, no cost.
+    ///
+    /// With an id, there are three cases, and the third is the one that
+    /// makes this worth having:
+    ///
+    /// - **Never seen.** Journal a `begin` (durably, *before* dispatch),
+    ///   prompt, journal the resulting sequence, return the entry.
+    /// - **Completed.** Return the same transcript entry again without
+    ///   prompting the provider a second time -- what a caller retrying
+    ///   after a dropped connection needs, since it cannot otherwise tell
+    ///   whether its first attempt landed.
+    /// - **Uncertain.** The request was dispatched and no result was ever
+    ///   journaled: the worker died mid-prompt. The first attempt may or
+    ///   may not have appended to the transcript, and nothing can now
+    ///   determine which. This reports [`PromptOutcome::Uncertain`] and
+    ///   **never re-executes** -- silently retrying would risk a
+    ///   duplicate turn, and silently returning success would claim a
+    ///   result that may not exist. Parity with `R-PROTO-03`.
     pub async fn prompt_with_images_and_request_id(
         &mut self,
         text: String,
         images: Option<Vec<String>>,
         request_id: Option<String>,
-    ) -> Result<TranscriptEntry> {
-        if let Some(id) = &request_id {
-            if let Some(cached) = self.recent_request_ids.get(id) {
-                return Ok(cached.clone());
-            }
-        }
-        let entry = self.prompt_with_images(text, images).await?;
-        if let Some(id) = request_id {
-            self.recent_request_ids.insert(id.clone(), entry.clone());
-            self.recent_request_id_order.push_back(id);
-            if self.recent_request_id_order.len() > REQUEST_ID_CACHE_CAP {
-                if let Some(oldest) = self.recent_request_id_order.pop_front() {
-                    self.recent_request_ids.remove(&oldest);
+    ) -> Result<PromptOutcome> {
+        let Some(id) = request_id else {
+            return Ok(PromptOutcome::Entry(
+                self.prompt_with_images(text, images).await?,
+            ));
+        };
+        match self.request_journal.lookup(&id) {
+            Some(crate::request_journal::Outcome::Completed(sequence)) => {
+                // Re-read rather than trust the journal blindly. The
+                // journal is `sync_all`ed and the transcript is only
+                // flushed (see `append_transcript_line`), so after a
+                // machine-level crash the journal can be strictly ahead
+                // of the transcript. A recorded sequence with no entry
+                // behind it is not a result to hand back -- it is exactly
+                // the uncertain case wearing a completed label.
+                match self.transcript.iter().find(|e| e.sequence == sequence) {
+                    Some(entry) => Ok(PromptOutcome::Entry(entry.clone())),
+                    None => Ok(PromptOutcome::Uncertain),
                 }
             }
+            Some(crate::request_journal::Outcome::Uncertain) => Ok(PromptOutcome::Uncertain),
+            None => {
+                self.request_journal.begin(Context::Session, &id).await?;
+                let entry = self.prompt_with_images(text, images).await?;
+                self.request_journal
+                    .record_result(Context::Session, &id, entry.sequence)
+                    .await?;
+                Ok(PromptOutcome::Entry(entry))
+            }
         }
-        Ok(entry)
     }
 
     async fn prompt_with_images_inner(
@@ -2621,6 +2668,18 @@ mod tests {
     use super::*;
     use crate::protocol::HarnessNoteKind;
 
+    /// Unwraps the ordinary case in tests. A `PromptOutcome::Uncertain`
+    /// here means the test set up a crashed-mid-prompt journal state,
+    /// which none of these tests intend to.
+    fn entry_of(outcome: PromptOutcome) -> TranscriptEntry {
+        match outcome {
+            PromptOutcome::Entry(entry) => entry,
+            PromptOutcome::Uncertain => {
+                panic!("expected a completed prompt, got PromptOutcome::Uncertain")
+            }
+        }
+    }
+
     fn entry(sequence: u64, text: &str) -> TranscriptEntry {
         TranscriptEntry {
             sequence,
@@ -4056,10 +4115,16 @@ mod tests {
         .await
         .expect("session creation should succeed");
 
-        let first = session
-            .prompt_with_images_and_request_id("hello".to_string(), None, Some("req-1".to_string()))
-            .await
-            .unwrap();
+        let first = entry_of(
+            session
+                .prompt_with_images_and_request_id(
+                    "hello".to_string(),
+                    None,
+                    Some("req-1".to_string()),
+                )
+                .await
+                .unwrap(),
+        );
         let second = session
             .prompt_with_images_and_request_id(
                 // Different text on purpose -- a genuine retry sends the
@@ -4073,6 +4138,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let second = entry_of(second);
 
         assert_eq!(
             first.sequence, second.sequence,
@@ -4163,36 +4229,126 @@ mod tests {
     }
 
     #[rusty_tokio::test]
-    async fn the_request_id_cache_evicts_the_oldest_entry_once_the_cap_is_exceeded() {
-        let root = temp_state_root("request-id-cap");
-        let mut session = AgentSession::create(
+    async fn a_completed_request_id_replays_across_a_reload() {
+        // The property the in-memory cache could not provide: the dedup
+        // answer has to survive the process that produced it. Simulated
+        // by dropping the session and recovering it from the same
+        // directory, which is exactly what a respawned worker does.
+        let root = temp_state_root("request-id-durable");
+        let session_id = "sess-request-id-durable".to_string();
+        let first_sequence = {
+            let mut session = AgentSession::create(
+                &root,
+                session_id.clone(),
+                NewSessionMeta::default(),
+                Box::new(crate::provider::EchoProvider),
+                Box::new(crate::tool_runtime::NoopToolRuntime),
+            )
+            .await
+            .expect("session creation should succeed");
+            entry_of(
+                session
+                    .prompt_with_images_and_request_id(
+                        "hello".to_string(),
+                        None,
+                        Some("req-durable".to_string()),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .sequence
+        };
+
+        let mut recovered = AgentSession::recover(
             &root,
-            "sess-request-id-cap".to_string(),
-            NewSessionMeta::default(),
+            &session_id,
             Box::new(crate::provider::EchoProvider),
             Box::new(crate::tool_runtime::NoopToolRuntime),
         )
         .await
-        .expect("session creation should succeed");
+        .expect("recovery should succeed");
 
-        for i in 0..=REQUEST_ID_CACHE_CAP {
-            session
+        let replayed = entry_of(
+            recovered
                 .prompt_with_images_and_request_id(
-                    format!("turn {i}"),
+                    "a different prompt entirely".to_string(),
                     None,
-                    Some(format!("req-{i}")),
+                    Some("req-durable".to_string()),
                 )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            replayed.sequence, first_sequence,
+            "a completed request id must replay the original entry after a restart"
+        );
+        assert_eq!(
+            recovered
+                .transcript
+                .iter()
+                .filter(|e| e.role == Role::User)
+                .count(),
+            1,
+            "the replay must not have enqueued a second prompt"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[rusty_tokio::test]
+    async fn a_request_dispatched_but_never_completed_reports_uncertain() {
+        // The case the whole mechanism exists for. Forged by journaling a
+        // `begin` with no matching result -- which is precisely the
+        // on-disk state a worker killed mid-prompt leaves behind -- then
+        // recovering, as its replacement would.
+        let root = temp_state_root("request-id-uncertain");
+        let session_id = "sess-request-id-uncertain".to_string();
+        {
+            let mut session = AgentSession::create(
+                &root,
+                session_id.clone(),
+                NewSessionMeta::default(),
+                Box::new(crate::provider::EchoProvider),
+                Box::new(crate::tool_runtime::NoopToolRuntime),
+            )
+            .await
+            .expect("session creation should succeed");
+            session
+                .request_journal
+                .begin(Context::Session, "req-interrupted")
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            session.recent_request_ids.len(),
-            REQUEST_ID_CACHE_CAP,
-            "the cache must stay bounded at the cap, not grow without limit"
-        );
+
+        let mut recovered = AgentSession::recover(
+            &root,
+            &session_id,
+            Box::new(crate::provider::EchoProvider),
+            Box::new(crate::tool_runtime::NoopToolRuntime),
+        )
+        .await
+        .expect("recovery should succeed");
+
+        let outcome = recovered
+            .prompt_with_images_and_request_id(
+                "retrying after the crash".to_string(),
+                None,
+                Some("req-interrupted".to_string()),
+            )
+            .await
+            .unwrap();
         assert!(
-            !session.recent_request_ids.contains_key("req-0"),
-            "the oldest entry should have been evicted"
+            matches!(outcome, PromptOutcome::Uncertain),
+            "a dispatched-but-unfinished request must report uncertain, not silently re-run"
+        );
+        assert_eq!(
+            recovered
+                .transcript
+                .iter()
+                .filter(|e| e.role == Role::User)
+                .count(),
+            0,
+            "reporting uncertain must never re-execute the prompt"
         );
 
         std::fs::remove_dir_all(&root).unwrap();

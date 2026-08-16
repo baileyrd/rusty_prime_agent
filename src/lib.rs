@@ -69,6 +69,7 @@ mod mcp_client;
 mod procutil;
 mod prompt_template;
 mod providers;
+mod request_journal;
 mod rp_server;
 mod schedule;
 mod self_update;

@@ -2304,6 +2304,27 @@ async fn send_prompt_with_images(
     .await?;
     match read_response_with_timeout(&mut conn, PROMPT_RESPONSE_TIMEOUT).await? {
         Response::SessionPromptAck { entry } => Ok(entry),
+        // A `Conflict`, not a protocol error: this is an expected,
+        // structured condition the caller has to make a judgement about,
+        // which is exactly what that variant means here. Programmatic
+        // callers (`--mode json`, `dispatch_one_shot`) still see the
+        // typed `Response::SessionPromptUncertain` and can branch on it;
+        // this is the rendering for the human path.
+        //
+        // Deliberately does *not* retry. Re-issuing under the same id
+        // would return this same answer forever, and re-issuing under a
+        // fresh one is a decision only the caller can make -- see that
+        // response variant's own doc comment.
+        Response::SessionPromptUncertain { request_id } => Err(HarnessError::conflict(
+            Context::Daemon,
+            format!(
+                "request {request_id} was dispatched but its result was never recorded -- \
+                 the worker died mid-prompt, so whether the turn landed is unknown. \
+                 Check the transcript (`session attach`/`session tree`) before deciding: \
+                 re-issuing under a *new* --request-id may duplicate the turn, and \
+                 re-issuing under this one will keep returning this answer."
+            ),
+        )),
         other => Err(unexpected_response(other)),
     }
 }

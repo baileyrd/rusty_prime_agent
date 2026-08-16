@@ -130,3 +130,127 @@ fn prompting_without_a_request_id_is_unaffected() {
 
     common::daemon_shutdown(state_dir.path());
 }
+
+/// The session's transcript, read straight off disk. Direct rather than
+/// via `session attach`: this only ever asks "did this text land", which
+/// the file answers deterministically and a stream answers on a timeout.
+fn transcript(state_dir: &std::path::Path, session_id: &str) -> String {
+    std::fs::read_to_string(
+        state_dir
+            .join("sessions")
+            .join(session_id)
+            .join("transcript.jsonl"),
+    )
+    .unwrap_or_default()
+}
+
+/// The property the in-memory cache could not provide, and the reason
+/// `COMPARISON.md` §5 flagged it: a client retrying after a dropped
+/// connection is most likely retrying *because* the worker died, which
+/// was precisely when the old cache was empty and the retry double-sent.
+#[test]
+fn a_completed_request_id_still_dedupes_after_the_worker_crashes() {
+    let state_dir = common::TempDir::new("idempotent-durable");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+
+    let first = common::run(
+        state_dir.path(),
+        &[
+            "session",
+            "prompt",
+            &session_id,
+            "--request-id",
+            "req-durable",
+            "the original prompt",
+        ],
+    );
+    common::assert_success("first --request-id prompt", &first);
+
+    // Kill the worker outright: no graceful shutdown, nothing flushed on
+    // the way out beyond what was already durable.
+    common::force_kill(common::worker_pid(state_dir.path(), &session_id));
+
+    // Same id, different text -- so a re-execution would be visible as a
+    // new turn rather than coincidentally identical output.
+    let retry = common::run(
+        state_dir.path(),
+        &[
+            "session",
+            "prompt",
+            &session_id,
+            "--request-id",
+            "req-durable",
+            "a completely different prompt",
+        ],
+    );
+    common::assert_success("retry after crash", &retry);
+    assert_eq!(
+        common::stdout_string(&first).trim(),
+        common::stdout_string(&retry).trim(),
+        "a retry after a worker crash must replay the original reply, not run again"
+    );
+
+    assert!(
+        !transcript(state_dir.path(), &session_id).contains("a completely different prompt"),
+        "the retried text must never have reached the transcript"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
+
+/// The other half: a request journaled as dispatched but never completed
+/// is reported *uncertain* and never silently re-run -- parity with
+/// `daemon.md`'s `R-PROTO-03`. Forged by writing the `begin` record a
+/// worker killed mid-prompt would have left behind.
+#[test]
+fn a_dispatched_but_unfinished_request_is_reported_uncertain() {
+    let state_dir = common::TempDir::new("idempotent-uncertain");
+    common::daemon_start(state_dir.path());
+    let session_id = common::session_new(state_dir.path(), None);
+    common::session_prompt(state_dir.path(), &session_id, "something first");
+
+    // Stop gracefully so the worker is not holding the session, then
+    // plant exactly what a crash between dispatch and completion leaves.
+    common::daemon_shutdown(state_dir.path());
+    let journal = state_dir
+        .path()
+        .join("sessions")
+        .join(&session_id)
+        .join("request-journal.jsonl");
+    std::fs::write(
+        &journal,
+        "{\"op\":\"begin\",\"v\":1,\"request_id\":\"req-interrupted\",\"at\":0}\n",
+    )
+    .unwrap();
+
+    common::daemon_start(state_dir.path());
+    let output = common::run(
+        state_dir.path(),
+        &[
+            "session",
+            "prompt",
+            &session_id,
+            "--request-id",
+            "req-interrupted",
+            "retrying after the crash",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "an uncertain request must not report success; got: {}",
+        common::stdout_string(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("never recorded") || stderr.contains("unknown"),
+        "the caller should be told the outcome is unknown, not given a generic error: {stderr}"
+    );
+
+    assert!(
+        !transcript(state_dir.path(), &session_id).contains("retrying after the crash"),
+        "reporting uncertain must never re-execute the prompt"
+    );
+
+    common::daemon_shutdown(state_dir.path());
+}
