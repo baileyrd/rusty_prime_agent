@@ -1806,6 +1806,39 @@ check is repeated under the lock, re-reading `state.json` rather than
 trusting the pre-lock snapshot, since dropping that second read would
 trade the queueing problem for a double-spawn.
 
+**The same message kept appearing after both of the above landed,
+at roughly the same rate.** Neither fix (the inversion or `spawn_lock`'s
+ordering) touched the actual bottleneck, because there wasn't a budget
+problem left to fix -- there was a scheduling one. `catalog::scan`/
+`catalog::read_session_state` (session listing, `GoalShow`, the
+liveness check inside `ensure_worker_running`, both background loops)
+and `schedule.rs`'s four functions ran a synchronous `std::fs` call
+directly inside an async handler, on this process's small
+(`available_parallelism()`-sized) `rusty_tokio` executor -- unlike every
+*write* path (`session::write_state`, `request_journal`), which already
+went through `spawn_blocking`. A blocking syscall fully occupies the OS
+thread it runs on for its whole duration; there is no cooperative
+preemption for that, only for CPU-bound work between `.await` points.
+Proven directly against the pinned `rusty_tokio` rev: occupying every
+worker thread with a 300ms blocking call delays an unrelated concurrent
+task's response by the same ~300ms, on a 2- or 4-thread runtime alike;
+moving that same work into `spawn_blocking` drops the delay to
+microseconds. Landing a request while every one of a daemon's few
+worker threads happens to be blocked this way -- realistic under this
+project's own full test suite, which runs dozens of daemons/workers
+doing real file I/O at once -- starves the executor entirely: no task,
+including an already-open client connection's own response, can run
+until a thread frees up. Past `RESPONSE_TIMEOUT`, that reads as `daemon
+did not respond in time` even though the daemon was never dead. The
+"sustained request loop" tests (`session autonomous`'s tight per-turn
+loop, `session repl`'s per-line dispatch, `wait_until`'s 25ms-interval
+polling of `session list`) are disproportionately affected because each
+one raises the number of near-simultaneous requests against a single
+daemon, which raises the odds a request lands during exactly this
+window. Fixed by routing every read in `catalog.rs`/`schedule.rs`
+through `spawn_blocking`, the same way the write paths already did --
+see those modules' own doc comments.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
