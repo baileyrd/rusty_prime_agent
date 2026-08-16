@@ -110,7 +110,7 @@ jobs:
             for n in "${!suites[@]}"; do
               echo "| \`${suites[$n]}\` | ${failures[$n]} / $iterations |"
             done
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ "$total_failures" -ne 0 ]; then
             echo "$total_failures failing runs across $iterations iterations"
@@ -121,11 +121,18 @@ jobs:
   # The measurement. Runs the whole suite repeatedly and reports which
   # tests failed and how often, without gating -- so "that test is flaky"
   # becomes a number someone can check rather than a claim someone
-  # remembers. Two known offenders as of writing
-  # (`autonomous_stops_at_max_time_before_exhausting_a_large_turn_budget`,
-  # `an_every_schedule_fires_more_than_once`) both fail on `main` and are
-  # wall-clock-budget tests rather than logic failures; this job is how we
-  # find out if that changes, or if a third one appears.
+  # remembers.
+  #
+  # That distinction is not hypothetical: this comment used to assert that
+  # `autonomous_stops_at_max_time_before_exhausting_a_large_turn_budget`
+  # and `an_every_schedule_fires_more_than_once` "both fail on `main`",
+  # carried over from hand-observation while the recovery work was in
+  # flight. The first run that actually produced output -- run 4, `main`
+  # at 4ce6b33 -- was 5/5 clean, neither of them among the failures,
+  # because there were none. Both are wall-clock-budget tests, so a quiet
+  # runner passing them five times running does not make them sound; it
+  # makes the earlier claim unmeasured. Read the rate this job reports
+  # rather than this paragraph.
   #
   # ubuntu-only on purpose: it is the leg where contention actually bites
   # (the suite runs ~30 test binaries, each spawning daemons and workers),
@@ -191,4 +198,10 @@ jobs:
             else
               echo "No test failed in any run."
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          # `tee -a`, not a plain append: `$GITHUB_STEP_SUMMARY` is only
+          # readable from the run page in the browser. Sending the same
+          # bytes to stdout puts the table in the job log, where the API
+          # can reach it -- which is the difference between "which tests
+          # are flaky" being answerable from a terminal and requiring
+          # someone to go click on the run.
+          } | tee -a "$GITHUB_STEP_SUMMARY"

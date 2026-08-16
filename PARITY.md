@@ -133,12 +133,20 @@ daemon/worker split rather than requiring the Python control environment:
   than to whatever else was contending) -- on all three OSes, where
   upstream's equivalent is ubuntu-only. Those suites are expected to be
   deterministic, so any failure gates. **`flake-watch`** runs the full
-  suite 5x and reports a per-test failure *rate* to the step summary
-  without gating. Folding the known wall-clock-budget offenders
-  (`autonomous_stops_at_max_time_...`, `an_every_schedule_fires_more_than_once`,
-  both of which fail on `main` too) into the gating job would have
-  drowned its signal in noise it cannot act on; measuring them separately
-  turns "that test is flaky" into a number someone can check.
+  suite 5x and reports a per-test failure *rate*, to both the step summary
+  and the job log. Folding the wall-clock-budget tests
+  (`autonomous_stops_at_max_time_...`, `an_every_schedule_fires_more_than_once`)
+  into the gating job would have drowned its signal in noise it cannot act
+  on; measuring them separately turns "that test is flaky" into a number
+  someone can check.
+
+  Worth stating plainly, since this entry previously asserted the
+  opposite: those two tests were described here as failing on `main`, on
+  the strength of having been seen to fail by hand during the recovery
+  work. The first `flake-watch` run that actually emitted anything was
+  5/5 clean. That does not clear them -- both are wall-clock-budget tests
+  and a quiet runner is exactly where they pass -- but it does mean the
+  claim was never measured. The rate the job reports is the record now.
 
   Both scripts were run locally before landing rather than trusted to
   read correctly at 04:00 -- which caught two bugs: `declare -A` is a
