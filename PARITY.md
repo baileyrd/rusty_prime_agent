@@ -1366,6 +1366,22 @@ daemon/worker split rather than requiring the Python control environment:
   pulled in for this). A recurring entry that's overdue by more than one
   interval (e.g. the daemon was down a while) skips forward to the next
   future fire time rather than firing a burst of catch-up prompts.
+
+  **Supervisor-side on purpose, against `R-SUP-01`.** `prime-agent` puts
+  the scheduler in the worker and says the supervisor must not run one.
+  That invariant is written for its *resident, per-root-tree* workers; a
+  worker there is always present to fire. This project's workers are
+  per-session and stoppable, and `fire_due_schedules` scans every session
+  regardless of status -- so a schedule fires for a `Stopped` or
+  `Crashed` session and respawns its worker. Worker-side scheduling would
+  silently drop exactly that. Two upstream properties hold here anyway,
+  across the process boundary, because the claim is durable on disk
+  rather than held in scheduler memory: `take_due` advances and persists
+  a tick before it is delivered (`R-SCHED-02`), and coalesces missed ones
+  (`R-SCHED-03`). What it costs -- no fires while the supervisor is down,
+  sequential firing across sessions, 5s granularity -- is written up in
+  `ARCHITECTURE.md`'s "Scheduler placement", along with the note that the
+  sequential-firing cost is removable without moving the scheduler.
 - [x] **Persistent goals** (`session new --goal <text>`, `session goal
   (set <text...>|show|pause|resume|complete|clear) <id>`, parity with
   `prime-agent --goal`/`/goal`). A durable `GoalState { text, status:
