@@ -81,7 +81,11 @@
 //! properly needs the on-disk supervisor launch lease `COMPARISON.md` §14
 //! item 4 tracks separately, not a change here.
 
-use std::path::{Path, PathBuf};
+// `Path` only: the one `PathBuf` below lives inside the `#[cfg(unix)]`
+// randomness arm and is spelled out there, since importing it here makes
+// it an unused import on Windows -- which CI's `-D warnings` treats as a
+// hard build failure.
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -228,7 +232,7 @@ pub(crate) fn random_hex_128(context: Context) -> Result<String> {
 #[cfg(unix)]
 fn fill_random(context: Context, buf: &mut [u8]) -> Result<()> {
     use std::io::Read as _;
-    let path = PathBuf::from("/dev/urandom");
+    let path = std::path::PathBuf::from("/dev/urandom");
     let mut f =
         std::fs::File::open(&path).map_err(|e| HarnessError::io(context, Some(path.clone()), e))?;
     f.read_exact(buf)
