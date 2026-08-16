@@ -676,7 +676,7 @@ pub async fn session_rpc(state_root: &Path, session_id: String) -> Result<()> {
     events_conn
         .write_request(Context::Daemon, &Request::SessionAttach { session_id })
         .await?;
-    match read_response(&mut events_conn).await? {
+    match read_response_reviving(&mut events_conn).await? {
         response @ Response::SessionAttachStarted { .. } => print_json(&response),
         other => return Err(unexpected_response(other)),
     }
@@ -786,7 +786,7 @@ pub async fn session_attach(state_root: &Path, session_id: String, mode: OutputM
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionAttach { session_id })
         .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionAttachStarted { .. } => match mode {
             OutputMode::Json => print_json(&response),
             OutputMode::Text => {
@@ -2352,7 +2352,7 @@ async fn send_extension_command(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         Response::SessionExtensionCommandResult { output } => Ok(output),
         other => Err(unexpected_response(other)),
     }
@@ -2583,7 +2583,7 @@ pub async fn session_rename(
         &Request::SessionRename { session_id, name },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionRenameAck { .. } => {
             match (&response, mode) {
                 (_, OutputMode::Json) => print_json(&response),
@@ -2617,7 +2617,7 @@ pub async fn session_compact(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionCompactAck { .. } => {
             match (&response, mode) {
                 (_, OutputMode::Json) => print_json(&response),
@@ -2719,7 +2719,7 @@ pub async fn session_interrupt(
     let mut conn = connect(state_root).await?;
     conn.write_request(Context::Daemon, &Request::SessionInterrupt { session_id })
         .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionInterruptAck => {
             match mode {
                 OutputMode::Json => print_json(&response),
@@ -2903,7 +2903,7 @@ pub async fn session_set_active_leaf(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionSetActiveLeafAck {
             active_leaf_sequence,
         } => {
@@ -2937,7 +2937,7 @@ pub async fn session_branch_summarize(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         response @ Response::SessionBranchSummarizeAck { .. } => {
             match (&response, mode) {
                 (_, OutputMode::Json) => print_json(&response),
@@ -3128,7 +3128,7 @@ async fn set_goal(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         Response::GoalUpdateAck { goal } => Ok(goal),
         other => Err(unexpected_response(other)),
     }
@@ -3205,7 +3205,7 @@ async fn set_harness(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         Response::HarnessUpdateAck { state } => Ok(state),
         other => Err(unexpected_response(other)),
     }
@@ -3329,7 +3329,7 @@ async fn fetch_session_snapshot(
         },
     )
     .await?;
-    match read_response(&mut conn).await? {
+    match read_response_reviving(&mut conn).await? {
         Response::SessionAttachStarted { .. } => {}
         other => return Err(unexpected_response(other)),
     }
@@ -3489,8 +3489,42 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// fast.
 const PROMPT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Response wait for requests whose daemon-side handler may have to
+/// revive a stopped worker first -- everything that reaches
+/// `daemon::Supervisor::resolve_worker`.
+///
+/// **Must stay strictly above `daemon::WORKER_READY_TIMEOUT` (30s).**
+/// That is the same "outer budget strictly larger than the inner one"
+/// rule `DAEMON_READY_TIMEOUT` already keeps against the supervisor's
+/// 20s `bind_with_retry`, and that `daemon::FENCE_HANDSHAKE_TIMEOUT`
+/// keeps in the other direction against `RESPONSE_TIMEOUT`.
+///
+/// It was inverted here, and by 6x: `ensure_worker_running` is willing
+/// to spend 30s waiting for a freshly spawned worker to bind its socket
+/// while the client walked away after 5, so a cold start that ran long
+/// surfaced as the generic "daemon did not respond in time" -- pointing
+/// at a dead daemon when the daemon was in fact working normally, and
+/// blaming whichever request happened to be the one that triggered the
+/// spawn. `tests/session_tree.rs`'s
+/// `set_active_leaf_followed_by_a_prompt_creates_a_real_fork` is one of
+/// the requests that can land on it.
+///
+/// `RESPONSE_TIMEOUT` deliberately stays at 5s for everything else, so
+/// the fast-fail-on-a-dead-daemon behaviour that
+/// `tests/supervisor_restart_recovery.rs` depends on is unchanged: that
+/// test probes with `daemon status`, which never reaches
+/// `resolve_worker`.
+const WORKER_REVIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
+
 async fn read_response(conn: &mut transport::LineStream) -> Result<Response> {
     read_response_with_timeout(conn, RESPONSE_TIMEOUT).await
+}
+
+/// See `WORKER_REVIVE_RESPONSE_TIMEOUT`. Used instead of
+/// `read_response` by every client call whose request can make the
+/// supervisor spawn a worker before it can answer.
+async fn read_response_reviving(conn: &mut transport::LineStream) -> Result<Response> {
+    read_response_with_timeout(conn, WORKER_REVIVE_RESPONSE_TIMEOUT).await
 }
 
 async fn read_response_with_timeout(
