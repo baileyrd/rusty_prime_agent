@@ -434,6 +434,24 @@ pub enum Response {
     SessionPromptAck {
         entry: TranscriptEntry,
     },
+    /// A `--request-id` prompt whose fate cannot be determined: the
+    /// journal recorded it as dispatched but never recorded a result, so
+    /// the worker died mid-prompt and nothing now knows whether the turn
+    /// landed.
+    ///
+    /// Parity with `daemon.md`'s `R-PROTO-03` -- "a command received but
+    /// lacking a durable result is reported uncertain and never blindly
+    /// replayed". Deliberately its own variant rather than a
+    /// `Response::Error`: this is not a failure (the prompt may well have
+    /// succeeded) and it is not a success either, and a caller that
+    /// retries on error would do exactly the double-send `--request-id`
+    /// exists to prevent. What to do about it -- inspect the transcript,
+    /// re-issue under a *fresh* id, or give up -- is the caller's call,
+    /// because only the caller knows whether a duplicate turn is worse
+    /// than a missing one.
+    SessionPromptUncertain {
+        request_id: String,
+    },
     /// Sent immediately, before any [`SessionEvent`] line, so the client
     /// can distinguish "attach accepted, snapshot incoming" from a
     /// terminal [`Response::Error`].

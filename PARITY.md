@@ -74,6 +74,48 @@ environment:
 Would need a new subsystem, but one that composes with the existing
 daemon/worker split rather than requiring the Python control environment:
 
+- [x] **Durable idempotent replay protection** (`daemon.md`'s
+  `R-PROTO-01`/`R-PROTO-02`/`R-PROTO-03`). The previous entry below shipped
+  the bounded first slice and said so; `COMPARISON.md` §5 named why the
+  bound was the wrong one to keep. The cache was in-memory, and a client
+  retrying after a dropped connection is most likely retrying *because*
+  the worker died -- so the dedup state was gone in exactly the case it
+  existed for, and the retry double-sent.
+
+  `src/request_journal.rs` is an append-only JSONL journal beside the
+  `transcript.jsonl` it protects: a `begin` record written and `sync_all`ed
+  *before* dispatch, a `result` record carrying the resulting transcript
+  sequence after. Replayed on every `AgentSession::create`/`recover`, so a
+  respawned worker inherits what its predecessor knew. Three outcomes, per
+  `PromptOutcome`: never-seen runs normally, completed replays the original
+  entry without prompting again, and dispatched-but-never-completed reports
+  `Response::SessionPromptUncertain` and **never** re-executes.
+
+  Three decisions worth recording. **Placement is per-session, not
+  per-supervisor** as upstream's is: the side effect being deduplicated is
+  a transcript append and the process that must not repeat it is the
+  worker, so a supervisor-side journal would be both further from the data
+  and unable to stop a respawned worker anyway. **Uncertain is its own wire
+  variant**, not a `Response::Error` -- it is neither success nor failure,
+  and a caller that retries on error would perform exactly the double-send
+  this prevents; what to do instead (inspect the transcript, re-issue under
+  a fresh id, give up) is a judgement only the caller can make.
+  **A `Completed` record whose sequence is missing from the transcript
+  degrades to uncertain** rather than being trusted: the journal is
+  `sync_all`ed and the transcript only flushed, so after a machine-level
+  crash the journal can be strictly ahead of the data it describes.
+
+  Compaction rewrites at 4096 records (upstream's own figure, `R-PROTO-15`)
+  keeping the most recent 256 ids, via write-temp-then-rename plus a
+  directory sync -- deliberately including the dir-fsync that upstream's
+  own audit found *missing* between two of its structurally similar
+  journals (`R-PROTO-17`). Tested by 4 journal unit tests, 2 session unit
+  tests, and 5 in `tests/idempotent_replay.rs` including a real
+  force-killed-worker retry. One bug caught by `unused_must_use` while
+  writing it: `append`'s inner I/O `Result` was being dropped, so a failed
+  `sync_all` would have reported success from the one mechanism whose whole
+  job is knowing what reached disk.
+
 - [x] **Nightly process-stress CI** -- parity with `prime-agent`'s own
   `nightly-process-stress.yml`, which `COMPARISON.md` §11 called out as
   the clearest signal in that repo that its documented crash-recovery

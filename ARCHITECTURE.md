@@ -34,7 +34,7 @@ project's current shape.
 | `transport` | JSONL framing over `rusty_tokio::io::{UnixListener, UnixStream}`, plus `bind_with_retry`/`probe`/`wait_ready` |
 | `procutil` | The narrow non-`rusty_tokio` OS surface -- detached spawn, and PID-reuse-/zombie-safe liveness for a pid this process did not spawn (`is_same_process`/`start_fingerprint`/`is_zombie`). See "Worker liveness" and "Dependency Stack" below |
 | `protocol` | The wire types (`Request`/`Response`/`SessionEvent`/`SessionState`) shared by every process this project spawns |
-| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,worker-fence.json,schedules.json}`, `provider.{json,log}`) |
+| `paths` | State-root layout (`daemon.sock`, `daemon.pid`, `sessions/<id>/{state.json,transcript.jsonl,worker.sock,worker-fence.json,request-journal.jsonl,schedules.json}`, `provider.{json,log}`) |
 | `provider` | `ModelProvider` trait (`respond(turns, tools) -> ProviderReply`) + `EchoProvider` (the default, ignores `tools`); `RustyProviderModel`, a real backend opt-in per session via `session new --model provider/model` -- see `PARITY.md`. Also owns the turn/tool wire types (`ChatTurn`/`TurnRole`/`ToolDef`/`ProviderReply`) the real tool-calling loop uses, hand-rolled to `rp-server`'s own shape |
 | `tools` | Built-in tools offered to a model via `session new --tools read` (`read_file`/`list_dir`, no path sandboxing), plus `execute_python_tool_def`'s `ToolDef` for `session new --runtime ipython` (its call is routed to `tool_runtime::ToolRuntime` by `AgentSession`, not to this module's own `execute`) -- see `PARITY.md`. A separate capability from `tool_runtime::ToolRuntime` below, not a second backend for it |
 | `mcp_client` | Minimal MCP (Model Context Protocol) client against `rp-server`'s own built-in `/mcp` gateway (`session new --tools mcp`) -- `initialize`/`notifications/initialized` + `tools/list` + `tools/call` only, hand-rolled to the exact wire behavior a direct probe of a real sidecar confirmed (SSE-framed responses, chunked transfer encoding, `Mcp-Session-Id` session affinity) -- see `PARITY.md` |
@@ -52,6 +52,7 @@ project's current shape.
 | `auth` | `<state_dir>/auth.json` read/parse plus `!command` key resolution (`load`/`resolve_key`) -- see below |
 | `providers` | `<state_dir>/providers.json` read/parse for custom/arbitrary OpenAI-compatible provider registration (`load`) -- see below |
 | `fence` | Generation-fenced per-worker tokens: `SupervisorIdentity` (the `(counter, instance)` pair a supervisor presents), `WorkerFence` (the per-session `worker-fence.json`), and the OS-randomness source both are minted from -- see "Generation-fenced per-worker tokens" below |
+| `request_journal` | Durable `--request-id` idempotency: an append-only per-session journal written before dispatch, with an explicit uncertain state -- see "Durable idempotency" below |
 | `error` | `HarnessError`/`Context`, the one error type every module maps into |
 
 ## Embeddable SDK
@@ -1541,6 +1542,58 @@ repo, for the specific Windows dead-listener-reclaim race this exists
 alongside (fixed upstream in `rustils`' own `unix_listen`, not papered
 over here; `bind_with_retry`'s retry is about a real, load-bearing
 `AddrInUse` transient, not a substitute for that fix).
+
+## Durable idempotency (`request_journal.rs`)
+
+`session prompt --request-id <id>` lets a caller retry a prompt without
+risking a duplicate turn. That guarantee used to be backed by a 64-entry
+in-memory map, which meant it held for a dropped connection and evaporated
+for a dead worker -- the more likely reason a client is retrying at all.
+
+**The mechanism.** An append-only JSONL journal at
+`sessions/<id>/request-journal.jsonl`, beside the transcript it protects:
+
+1. `begin` is written and `sync_all`ed **before** dispatch. A record that
+   only reached memory would leave a crashed request indistinguishable
+   from one that never arrived.
+2. The prompt runs.
+3. `result` records the resulting transcript sequence.
+
+`AgentSession::create`/`recover` replay it, so a respawned worker inherits
+what its predecessor knew. Three outcomes (`PromptOutcome`): never-seen
+runs normally; completed replays the original entry without prompting
+again; dispatched-but-never-completed reports
+`Response::SessionPromptUncertain` and never re-executes. Parity with
+`daemon.md`'s `R-PROTO-01`/`02`/`03`.
+
+**Per-session, not per-supervisor.** Upstream journals at the supervisor,
+where its `clientId + commandId` keying lives. Here the side effect being
+deduplicated *is* a transcript append and the process that must not repeat
+it is the worker, so the journal belongs next to the transcript. A
+supervisor-side journal would sit further from the data and still not stop
+a respawned worker from re-executing.
+
+**Uncertain is a distinct response, not an error.** It is neither success
+nor failure, and a caller that retries on error would perform exactly the
+double-send `--request-id` exists to prevent. Deciding what to do --
+inspect the transcript, re-issue under a fresh id, give up -- needs to
+know whether a duplicate turn is worse than a missing one, which only the
+caller knows.
+
+**The journal can outrun the transcript.** Journal appends are
+`sync_all`ed; `append_transcript_line` only flushes. That is the right
+level for the process-crash failure this project models, but it means a
+machine-level crash can leave a `result` record describing a transcript
+entry that never landed. So a `Completed` lookup re-reads the transcript
+and degrades to uncertain when the sequence is absent, rather than
+handing back a result that does not exist.
+
+**Compaction** rewrites at 4096 records (upstream's figure, `R-PROTO-15`)
+keeping the most recent 256 ids, write-temp-then-rename followed by a
+directory sync -- including the dir-fsync upstream's own audit found
+*missing* from one of its two structurally similar journals
+(`R-PROTO-17`). An evicted id behaves as never-seen, which is the same
+bound the old 64-entry cache had.
 
 ## Worker liveness: PID reuse and zombies (`procutil.rs`)
 

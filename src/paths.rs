@@ -9,6 +9,7 @@
 //!       transcript.jsonl   append-only event log (source of truth)
 //!       state.json         small recovery-pointer snapshot
 //!       worker-fence.json  supervisor generation fence + worker token
+//!       request-journal.jsonl  durable --request-id idempotency
 //!       worker.sock        private worker socket (supervisor <-> worker)
 //! ```
 //!
@@ -93,6 +94,18 @@ pub fn transcript_path(session_dir: &std::path::Path) -> PathBuf {
 
 pub fn state_file_path(session_dir: &std::path::Path) -> PathBuf {
     session_dir.join("state.json")
+}
+
+/// The durable idempotency journal (`crate::request_journal`) for
+/// `session prompt --request-id <id>`.
+///
+/// Beside the `transcript.jsonl` it protects rather than at the state
+/// root: the side effect being deduplicated is a transcript append, so
+/// the journal's lifetime is exactly the session's -- deleting a session
+/// directory should take its journal with it, and nothing outside that
+/// session ever consults it.
+pub fn request_journal_path(session_dir: &std::path::Path) -> PathBuf {
+    session_dir.join("request-journal.jsonl")
 }
 
 /// The worker's generation fence (`crate::fence::WorkerFence`) -- which

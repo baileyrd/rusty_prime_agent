@@ -288,9 +288,9 @@ Where they differ:
 
 | | `prime-agent` | `rusty_prime_agent` |
 |---|---|---|
-| Mutating-command idempotency | `clientId + commandId`, **append-only journal written before dispatch**, fsync per append, dir-fsync after compaction rename, compaction at 4096 records | **in-memory** `request_id` cache in the worker, `SessionPrompt` only, opt-in via `--request-id` |
-| "Did it happen?" for a lost result | explicit **uncertain** state, never blindly replayed (`R-PROTO-03`) | not represented |
-| Survives worker crash | yes (journal is on disk) | **no** — cache is in-memory, lost on restart |
+| Mutating-command idempotency | `clientId + commandId`, **append-only journal written before dispatch**, fsync per append, dir-fsync after compaction rename, compaction at 4096 records | ✅ append-only journal written before dispatch, fsync per append, dir-fsync after compaction rename, compaction at 4096 records — `SessionPrompt` only, opt-in via `--request-id` |
+| "Did it happen?" for a lost result | explicit **uncertain** state, never blindly replayed (`R-PROTO-03`) | ✅ `Response::SessionPromptUncertain`, never replayed |
+| Survives worker crash | yes (journal is on disk) | ✅ yes (journal is on disk) |
 | Recovery retry schedule | 250ms / 1s / 5s, third failure marks root failed | not staged this way |
 | Recovery blast radius | one root tree | one session |
 | Recovery marker in transcript | yes | yes (`SessionEvent::RecoveryMarker`) |
@@ -299,12 +299,23 @@ Where they differ:
 
 Two of these are worth flagging as real, not cosmetic:
 
-**Idempotency is not durable here.** `protocol.rs`'s own doc comment is
-admirably honest — "not durable, lost on worker crash/restart, a
-separately larger step" — but the gap matters exactly when it is needed
-most. A client retrying after a dropped connection is *most* likely to be
-retrying because the worker died, which is precisely the case where the
-in-memory cache is gone and the retry double-sends.
+~~**Idempotency is not durable here.**~~ **Closed** —
+`src/request_journal.rs`, `tests/idempotent_replay.rs`.
+
+The gap mattered exactly when it was needed most: a client retrying after
+a dropped connection is *most* likely retrying because the worker died,
+which is precisely the case where the in-memory cache was gone and the
+retry double-sent. There is now an append-only journal beside the
+transcript, `sync_all`ed before dispatch, replayed on every worker start.
+
+Two design points worth recording. It sits **per session** rather than at
+the supervisor, where upstream puts its equivalent: the side effect being
+deduplicated is a transcript append, and the process that must not repeat
+it is the worker. And a `Completed` record whose sequence is absent from
+the transcript degrades to *uncertain* rather than being trusted — the
+journal is `sync_all`ed while the transcript is only flushed, so after a
+machine-level crash the journal can be strictly ahead of the data it
+describes.
 
 ~~**PID reuse is unhandled.**~~ **Closed** — `procutil::is_same_process`,
 `SessionState::worker_start_fingerprint`, `tests/pid_reuse.rs`.
@@ -614,12 +625,9 @@ Not "smaller but adequate" — actually better on its own terms:
    handles takeover on supervisor restart. `tests/worker_fence.rs` covers
    both directions, including the refusal path a passing happy path can
    never demonstrate.
-2. **Make idempotency durable** (§5). The in-memory `request_id` cache
-   fails in exactly the scenario it exists for. An append-only
-   pre-dispatch journal keyed by `client_id + request_id`, with the
-   explicit "uncertain, never replay" state, is a bounded increment and
-   directly upgrades `tests/idempotent_replay.rs` from "same process" to
-   "survives a crash."
+2. ~~**Make idempotency durable**~~ (§5) — **done**. `tests/idempotent_replay.rs`
+   now covers "survives a crash" rather than only "same process", and the
+   uncertain case has its own wire response instead of being unrepresentable.
 3. ~~**Add start-time fingerprinting to `procutil::is_alive`**~~ (§5) —
    **done**, and it turned up a zombie-handling gap in the same check
    that was actively wedging sessions. See §5.

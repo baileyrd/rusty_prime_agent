@@ -785,13 +785,22 @@ async fn handle_private_connection(
             request_id,
             ..
         } => {
-            let entry = session
+            let outcome = session
                 .lock()
                 .await
-                .prompt_with_images_and_request_id(text, images, request_id)
+                .prompt_with_images_and_request_id(text, images, request_id.clone())
                 .await?;
-            conn.write_response(Context::Worker, &Response::SessionPromptAck { entry })
-                .await
+            let response = match outcome {
+                crate::session::PromptOutcome::Entry(entry) => Response::SessionPromptAck { entry },
+                // Never retried here, and never dressed up as success:
+                // the caller is the only one who can decide what to do
+                // about a request whose first attempt may or may not have
+                // landed. Parity with `daemon.md`'s `R-PROTO-03`.
+                crate::session::PromptOutcome::Uncertain => Response::SessionPromptUncertain {
+                    request_id: request_id.unwrap_or_default(),
+                },
+            };
+            conn.write_response(Context::Worker, &response).await
         }
         Request::SessionRename { name, .. } => {
             session.lock().await.rename(name.clone()).await?;
