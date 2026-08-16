@@ -29,6 +29,16 @@ on:
         description: "How many times to repeat each process-lifecycle suite"
         required: false
         default: "20"
+      flake_runs:
+        description: "How many full-suite passes the flake-watch job makes"
+        required: false
+        # 5 is a schedule default, not a statistically useful one: it is
+        # what fits in a nightly window alongside everything else. A 1/5
+        # reading is one observation, and the difference between a real
+        # flake and a coincidence needs a bigger denominator -- which is
+        # why this is dispatchable rather than fixed. Each pass is ~40s on
+        # ubuntu, so 20 runs is ~13 minutes.
+        default: "5"
 
 env:
   CARGO_TERM_COLOR: always
@@ -139,7 +149,7 @@ jobs:
   # and running the full suite N times on three OSes buys little for the
   # runner minutes it costs.
   flake-watch:
-    name: Flake watch (full suite × 5)
+    name: Flake watch (full suite × ${{ github.event.inputs.flake_runs || '5' }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -155,9 +165,19 @@ jobs:
         # that is merely non-zero is not by itself actionable. The
         # `process-stress` job above is what gates.
         continue-on-error: true
+        env:
+          # Overrides the workflow-level `RUST_BACKTRACE: 1` for this
+          # step only. These panics come through the shared
+          # `common::assert_success` helper, so the frames are identical
+          # unwind boilerplate on every failure while the message is what
+          # differs -- and 30 frames per panic would push the next
+          # message out of the `-A 6` window below. `process-stress`
+          # keeps backtraces: it gates, and a gating failure is one
+          # someone will actually debug from the log.
+          RUST_BACKTRACE: 0
         run: |
           set -uo pipefail
-          runs=5
+          runs="${{ github.event.inputs.flake_runs || '5' }}"
           : > /tmp/failed-tests.txt
           clean=0
           for i in $(seq 1 "$runs"); do
@@ -182,6 +202,22 @@ jobs:
               # herestring reports 1, not 0, which would have made every
               # clean run read as "1 failing".
               echo "run $i: $(wc -l <<<"$names" | tr -d ' ') failing"
+
+              # `$out` is captured, so without this the panic text is
+              # discarded and the job reports *which* test failed while
+              # throwing away *why*. That is not a hypothetical loss: a
+              # 1/20 failure here had to be re-reproduced locally purely
+              # to read one line of stderr, and that line ("daemon did
+              # not respond in time") was the whole diagnosis -- it
+              # identified a 5s client-side deadline rather than any
+              # fault in the test that happened to be holding the bag.
+              #
+              # Grouped so 20 runs of detail stay collapsed in the UI,
+              # and grepped rather than dumped because `$out` is a full
+              # ~30-binary suite log.
+              echo "::group::run $i failure detail"
+              grep -A 6 -E '^thread .* panicked at ' <<<"$out" || true
+              echo "::endgroup::"
             fi
           done
 
