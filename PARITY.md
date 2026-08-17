@@ -551,8 +551,12 @@ daemon/worker split rather than requiring the Python control environment:
   after further prompts on each, and `--mode json`'s `forked_from`
   provenance -- plus a manual pass in this sandbox confirming the same
   end to end against the real compiled binary.
-- [x] **Intra-session tree branching: `id`/`parentId`/active-leaf
-  transcript model** -- this item was previously written off ("one
+- [x] **Intra-session tree branching** -- parity with `session-format.md`'s
+  `id`/`parentId`/active-leaf transcript model, addressed via this
+  project's own `sequence`/`parent_sequence`/`active_leaf_sequence` scheme
+  rather than adopting upstream's field names (see the body below --
+  reworded 2026-08-17 so the header can't be skim-read as claiming this
+  project uses `id`/`parentId` itself). This item was previously written off ("one
   atomic, invasive change with no honest bounded slice to land first,"
   see the old "Needs a new subsystem" writeup this replaces) on the
   reasoning that `TranscriptEntry`'s `sequence: u64` is a total order
@@ -1212,12 +1216,18 @@ daemon/worker split rather than requiring the Python control environment:
   protocol change (a new `Request` variant plus daemon/worker handling
   to mutate an already-running session's model/thinking-level) that
   doesn't exist in any form today -- model and thinking level are fixed
-  at `session new` time, full stop. **`/usage`** needs a token/cost data
-  model that was never tracked in the first place: no
-  `usage_tokens`/`token_usage`/`cost_usd` field exists anywhere in
-  `protocol.rs`/`session.rs` (confirmed by direct search, not inferred),
-  so there's nothing for a `/usage` command to display even in a bounded
-  form. **`/mcp login|logout`** needs an MCP-server-scoped enable/disable
+  at `session new` time, full stop. **`/usage`** still needs work, but
+  less than this bullet used to claim. **Revalidation correction
+  (2026-08-17):** this used to say no token/cost data was tracked at all
+  ("no `usage_tokens`/`token_usage`/`cost_usd` field exists anywhere in
+  `protocol.rs`/`session.rs`") -- that's no longer true. `protocol::Usage`
+  (prompt/completion/total tokens, `Add` impl), `TranscriptEntry::usage`,
+  `session::AgentSession::attribute_child_usage`, and
+  `ChildUsageAttribution` (per-child + aggregate figures) all exist and
+  are populated today. What's genuinely still missing is narrower: **cost
+  in USD** (no `cost_usd` field or pricing model exists) and the
+  **`/usage` REPL command itself** -- the token data has nowhere to
+  surface yet. **`/mcp login|logout`** needs an MCP-server-scoped enable/disable
   primitive that doesn't exist either -- MCP tool access is unconditional
   today, on or off only at the whole-session `--tools mcp` level.
 
@@ -1627,8 +1637,21 @@ daemon/worker split rather than requiring the Python control environment:
   narrates a tool call as prose instead of emitting one), a known
   small-model limitation, not a plumbing gap -- `tests/ollama_provider.rs`'s
   own real-tool-call test is written to tolerate that.
-- [x] **MCP integration** (`session new --tools mcp`), parity with
-  `prime-agent`'s MCP support. Last revision of this file lumped this in
+- [x] **MCP integration** (`session new --tools mcp`), MCP-tool-calling
+  capability in the same spirit as `prime-agent`'s MCP support, via a
+  structurally different mechanism. **Revalidation correction
+  (2026-08-17):** this bullet's original "parity with `prime-agent`'s
+  MCP support" framing overstates the equivalence -- upstream isn't
+  MCP-free; it exposes MCP tools to the agent through OAuth-gated,
+  catalog-curated, kernel-side Python skill wrappers per third-party
+  server (Notion, Linear, ...; see `packages/ai/src/mcp/catalog.ts` and
+  `packages/coding-agent/src/core/mcp/mcp-manager.ts` upstream). This
+  project instead ships one generic client against `rp-server`'s own
+  single `/mcp` gateway -- no OAuth, no third-party catalog, and today's
+  demonstrated real-world use is introspecting `rp-server` itself, not a
+  Notion/Linear-style integration. The mechanics below are accurate;
+  read "parity" as "same category of capability," not "same mechanism."
+  Last revision of this file lumped this in
   with "Skills, extensions, themes" as not implemented -- `rp-server`
   already ships its own built-in MCP gateway (`crates/mcp/`): its native
   tools (`chat_completion`/`list_models`/`embeddings`) merged with
@@ -2220,7 +2243,31 @@ daemon/worker split rather than requiring the Python control environment:
   it yet -- a running cell still can't be cancelled mid-execution),
   kernel restart-on-crash, rich display data (DataFrames/plots/widgets --
   `execute_result`'s `data` only ever reads `text/plain` here), and
-  multi-kernel pooling beyond one kernel per session. Real `prime-agent`
+  multi-kernel pooling beyond one kernel per session. **Revalidation
+  addition (2026-08-17): three more gaps belong on this list that were
+  never named here**, surfaced independently of the ones above --
+  - **Prompt-as-a-variable.** The defining RLM idea -- the prompt and
+    context themselves exposed as a Python variable the model can slice,
+    summarize, and recurse into -- was never implemented. This project
+    has the execution half of an RLM (real kernel, real recursion via
+    `rlm()`) and not the abstraction half; a model here can run code and
+    spawn children, but it cannot manipulate its own context as data.
+  - **No kernel-boot admission control.** Upstream gates concurrent
+    kernel spawns with a semaphore independent of depth limiting
+    (`min(16, max(4, cores×2))`), empirically justified -- unthrottled
+    fan-out measured ~28% boot success at 200 concurrent spawns. This
+    project has zero `Semaphore` usage anywhere in `src/`; a wide `rlm()`
+    fan-out is unthrottled, and heavier here than upstream's besides,
+    since each RLM child gets its own worker process (see the "Recursive
+    subagents" entry above).
+  - **No managed Python venv.** Upstream bootstraps a Python 3.11 +
+    `ipykernel` + `prime-agent-runtime` venv via `uv`
+    (`~/.prime/agent/kernel-venv/`, `packages/coding-agent/docs/
+    rlm-runtime.md`). This project requires the user to `pip install
+    ipykernel` themselves -- zero bootstrap or dependency-management code
+    exists for it (see this file's own real-kernel test doc comments).
+
+  Real `prime-agent`
   "skills" (importable Python packages, `packages/coding-agent/docs/
   skills.md`) and `/heartbeat`/`rlm_heartbeat` (its manual re-entry
   triggers) both turned out to be tractable on top of this same kernel
@@ -2293,7 +2340,13 @@ daemon/worker split rather than requiring the Python control environment:
   dependency management, and skill-provided *tools* of their own -- a
   skill is code the model imports and calls itself inside
   `execute_python`, not a second tool-generation surface alongside
-  `--tools read|mcp`.
+  `--tools read|mcp`. **Revalidation addition (2026-08-17):** this list
+  should also name the tiers upstream's own `docs/skills.md` documents
+  that this project has no analog of at all, not just the project-local
+  one above -- a package tier (skills bundled with an installed npm
+  package), a `--skill`/CLI-supplied-path tier, a built-in tier, and a
+  settings-array-configured tier. Only the global tier
+  (`<state_dir>/skills/`) exists here.
 - [x] **`/heartbeat` and `rlm_heartbeat()`** -- the REPL-command and
   RLM-function manual entry points into the same "re-enter a session
   periodically" mechanism `session schedule` already covers server-side,
@@ -2402,7 +2455,11 @@ daemon/worker split rather than requiring the Python control environment:
   `RUSTY_PRIME_AGENT_COMPACT_TRIGGER_TOKENS`/
   `RUSTY_PRIME_AGENT_COMPACT_KEEP_RECENT_TOKENS`) -- exact enough to
   decide "should compaction fire", not exact enough to enforce a hard
-  budget a real token-aware client would. `EchoProvider` sessions
+  budget a real token-aware client would. **Revalidation addition
+  (2026-08-17):** a `compaction_enabled` settings.json/env-var off-switch
+  was added later (see the "A `settings.json` config file" entry above)
+  -- not mentioned here when this bullet was written, additive rather
+  than contradicting anything above. `EchoProvider` sessions
   (`state.model.is_none()`) never trigger it automatically and treat a
   manual `session compact`/`/compact` as a plain, honest no-op ("nothing
   to compact") -- there's no real model to ask for a summary, and
@@ -2612,13 +2669,21 @@ daemon/worker split rather than requiring the Python control environment:
 - [x] **A `settings.json` config file**, parity with `prime-agent`'s own
   persistent config layer -- global only, same cwd-visibility reason
   `skills::discover`/`read_context_file` are global-only (no project tier
-  attempted, and no merge between tiers to speak of as a result). Scoped
-  narrowly to the only two tunables that make sense as a persistent
-  default rather than a one-off override: the compaction thresholds
+  attempted, and no merge between tiers to speak of as a result). Started
+  scoped to the two compaction thresholds
   (`compact_trigger_tokens`/`compact_keep_recent_tokens`, previously
-  env-var-only). `prime-agent`'s own `settings.json` covers real estate
-  this project has no equivalent knob for at all (`enabled`/telemetry,
-  retry policy) and isn't attempted here.
+  env-var-only) and has since grown three more fields the same way:
+  `compaction_enabled` (parity with `prime-agent`'s `compaction.enabled`),
+  `theme` (parity with its `theme` key, see the "Themes" entry above),
+  and `telemetry_enabled` (parity with a bounded slice of its
+  `telemetry.*` family, see the "Telemetry" entry below). **Revalidation
+  correction (2026-08-17):** this bullet previously said settings.json was
+  scoped to "only two tunables" and that `enabled`/telemetry coverage
+  "isn't attempted here" -- both were true when written but are stale now;
+  `src/settings.rs` carries five fields today, not two, and telemetry
+  toggling is in fact covered. `prime-agent`'s own `settings.json` still
+  covers real estate this project has no equivalent knob for at all
+  (retry policy, `branchSummary.*`, ...) and isn't attempted here.
 
   Precedence, highest wins: an env var beats `settings.json`, which beats
   the hardcoded default -- the same order the compaction thresholds'
@@ -3274,7 +3339,15 @@ daemon/worker split rather than requiring the Python control environment:
   already established for the context-file system turn.
 
   **Idempotent replay protection for in-flight requests.** Bounded first
-  slice, exactly as the checklist scoped it: an in-memory (not durable --
+  slice, exactly as the checklist scoped it, and **since superseded** --
+  see the "Durable idempotent replay protection" entry near the top of
+  the "Medium-effort, real gaps" section above, which replaced everything
+  described below (the in-memory cache, `REQUEST_ID_CACHE_CAP`, and
+  `recent_request_ids` this bullet names no longer exist in source;
+  `AgentSession::request_journal`'s own doc comment explains why the
+  bound below was the wrong one to keep). Left here as a historical
+  record of the first slice, not a description of current behavior: an
+  in-memory (not durable --
   lost on a worker crash/restart, a separately larger step), per-session
   dedup keyed by a caller-supplied request id, rejecting an exact
   duplicate rather than double-enqueuing. `Request::SessionPrompt` gains
@@ -3368,13 +3441,20 @@ attempted here, and not silently implied by anything in
   session, so `/model <name>`/`/effort <level>` each need a real
   protocol change, not just REPL wiring (the bare, read-only `/model`
   that lists configured providers is done -- see the entry above).
-  `/usage` needs a token/cost data model that plainly doesn't exist: no
-  `usage_tokens`/`token_usage`/`cost_usd` field anywhere in
-  `protocol.rs`/`session.rs`, confirmed by direct search rather than
-  inferred from a missing command. `/mcp login|logout` needs an
-  MCP-server-scoped enable/disable primitive that also doesn't exist --
-  MCP tool access is unconditional today, on or off only at the whole-
-  session `--tools mcp` level.
+  `/usage` needs less new work than this bullet used to claim.
+  **Revalidation correction (2026-08-17):** this used to say no token/cost
+  data model existed at all ("no `usage_tokens`/`token_usage`/`cost_usd`
+  field anywhere in `protocol.rs`/`session.rs`, confirmed by direct
+  search") -- that's stale. `protocol::Usage`, `TranscriptEntry::usage`,
+  `AgentSession::attribute_child_usage`, and `ChildUsageAttribution` all
+  exist and are populated today (see this same correction on the "full
+  slash-command surface" bullet above, under this same section, for the
+  field-by-field citations). What's still missing, narrowly: **cost in USD** (no
+  `cost_usd` field or pricing model anywhere) and the **`/usage` command**
+  itself to surface the token data that does exist. `/mcp login|logout`
+  needs an MCP-server-scoped enable/disable primitive that also doesn't
+  exist -- MCP tool access is unconditional today, on or off only at the
+  whole-session `--tools mcp` level.
 - `/clone` (live-state duplication) stays out of scope for
   the reasons given above and in the medium-effort section's `session
   fork` entry -- a running kernel connection or MCP session dies with
