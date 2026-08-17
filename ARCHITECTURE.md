@@ -1881,6 +1881,26 @@ flake, against `main`'s `2/20` (10%) -- roughly half the rate, not zero.
 Real reduction, not proof of elimination; a wider sample would sharpen
 the confidence interval further before calling this fully closed.
 
+**What the residual `3/55` actually is, named rather than left as an
+unexplained rate.** All three: `repl_refine_command_adds_a_harness_note`
+(`session repl`, a line queued behind an in-flight reply),
+`autonomous_stops_at_max_turns_and_leaves_the_goal_active` (`session
+autonomous`'s tight per-turn loop), and
+`repl_heartbeat_every_with_an_active_goal_creates_a_recurring_schedule`
+(`session repl` plus a firing schedule). Not a scatter of unrelated
+tests -- every one is still the same "sustained request loop against one
+daemon" class this investigation started from. The fs-blocking-in-async
+bug above was *a* cause in that class, not the only one: what is left
+is a fixed 5-second client deadline occasionally losing a genuine race
+against dozens of real daemon/worker processes contending for a handful
+of vCPUs on a shared `ubuntu-latest` runner. Closing it further means
+either widening `RESPONSE_TIMEOUT` (ruled out on principle -- masks
+rather than fixes) or reducing what these specific loops ask of the
+daemon per turn (e.g. batching the repeated `GoalShow`/`session list`
+calls `session autonomous`/`wait_until`-style polling issues), which is
+unverified until it is measured the same way this section's other
+claims were.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
