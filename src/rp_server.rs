@@ -619,6 +619,36 @@ mod tests {
         );
     }
 
+    /// The bug this PR fixes: every `OPTIONAL_PROVIDERS` entry used to
+    /// hardcode `kind: "openai"`, so `[providers.anthropic]`/
+    /// `[providers.gemini]` in the generated `provider-config.toml` were
+    /// silently wrong -- `rp-server`'s real Anthropic/Gemini backends
+    /// aren't OpenAI-chat-completions-shaped, so any real
+    /// `--model anthropic/...`/`--model gemini/...` session sent a
+    /// malformed request regardless of whether an API key was
+    /// configured. `groq` staying `"openai"` is correct: it's a real
+    /// OpenAI-compatible endpoint, the same reasoning `providers.rs`'s
+    /// own module doc comment gives for why an arbitrary self-hosted
+    /// custom provider defaults to `kind = "openai"` too.
+    #[test]
+    fn all_providers_gives_each_built_in_provider_its_real_kind() {
+        let root = temp_state_root("all-providers-built-in-kinds");
+        let entries = all_providers(&root);
+        let kind_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("openai"), "openai");
+        assert_eq!(kind_of("anthropic"), "anthropic");
+        assert_eq!(kind_of("gemini"), "gemini");
+        assert_eq!(kind_of("groq"), "openai");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn all_providers_includes_a_registered_custom_provider() {
         let root = temp_state_root("all-providers-custom");
