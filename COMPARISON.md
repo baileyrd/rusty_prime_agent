@@ -11,6 +11,16 @@ codebases rather than from either project's own descriptive copy.
 | `PrimeIntellect-ai/prime-agent` | `97b994c3` (`main`, v0.7.2) | 2026-08-14 |
 | `baileyrd/rusty_prime_agent` | `6901258` (`main`) | 2026-08-16 |
 
+**Revalidation pass (2026-08-17).** Every claim below was independently
+re-derived from a fresh reading of both trees — `prime-agent` at `2c34b82f`
+(2026-08-16) and `rusty_prime_agent` at current `HEAD` — rather than
+re-checked against this document's own prior citations. Corrections are
+marked inline as **"Revalidation correction/finding"**; unmarked passages
+were re-confirmed unchanged. Two real errors surfaced (not just staleness):
+the dependency-audit claim in §2 (missed third-party transitives, wrong
+even at the original baseline) and the "control-channel host replies"
+bullet in §7 (claimed upstream-only; this project already has it).
+
 **How this document relates to the others.** [`PARITY.md`](PARITY.md)
 tracks *feature* parity as a per-item worklist, and
 [`CLAIMS_AUDIT.md`](CLAIMS_AUDIT.md) fact-checks upstream's descriptive
@@ -40,23 +50,45 @@ feature-by-feature score misleading:
   daemon/worker/session core and its failure semantics; everything else
   exists to keep that core honest by giving it real work to do.
 
-The size ratio is roughly **8:1** in non-test source, and roughly
-**24:1** in test volume — but the two test corpora are not measuring the
-same thing (see §11).
+The size ratio is roughly **7:1** in non-test source (was ~8:1 at the
+original revision — rusty_prime_agent grew faster than upstream over the
+intervening two days, from fence/idempotency work already narrated in §2
+and §5 but not previously reflected in this table), and roughly **22:1**
+in test volume (was ~24:1) — but the two test corpora are not measuring
+the same thing (see §11).
 
 | Metric | `prime-agent` | `rusty_prime_agent` |
 |---|---:|---:|
-| Non-test source LOC | 170,788 TS/TSX + 3,008 Py | 21,822 Rust |
-| Non-test source files | 359 (+23 `.py`) | 36 |
-| Test LOC | 157,952 | 6,565 (integration) + inline unit |
-| Test files / functions | 424 files | 28 files / 394 test fns |
+| Non-test source LOC | 172,024 TS/TSX + Py (see note) | 23,972 Rust |
+| Non-test source files | 360 (+23 `.py`) | 38 |
+| Test LOC | 158,190 | 7,349 (integration) + inline unit |
+| Test files / functions | 425 files | 30 files / 419 test fns |
 | Resolved dependency graph | 463 lockfile entries | 39 lockfile crates |
 | Direct runtime deps | 23 (coding-agent) + 11 (ai) | 4 (+2 platform-gated) |
 | CI workflows | 4 | 2 (both 3-OS matrix) |
 | Packages / crates | 4 npm workspaces + 1 PyPI shim | 1 crate (lib + bin) |
 
-Per-package upstream breakdown: `coding-agent` 118,859 · `ai` 34,432 ·
-`tui` 15,102 · `agent` 2,395.
+Rusty's row grew by 2 files / ~2,150 LOC (`fence.rs`, `request_journal.rs`)
+and 2 test files / ~784 test LOC (`worker_fence.rs`, `pid_reuse.rs`) since
+the original revision; upstream's TS/TSX drifted ~0.7%. Everything else in
+this table — dependency graph size, direct deps, CI workflow count,
+package count — is unchanged and re-confirmed exact.
+
+**Revalidation note on the Python figure.** The original 3,008 Py LOC
+could not be reproduced under any exclusion rule tried against the current
+tree (closest reproducible figure: 2,616, over 18 files under
+`prime-agent-runtime`); flagging as unverified rather than silently
+carrying it forward.
+
+Per-package upstream breakdown: `coding-agent` 119,026 · `ai` 35,501 ·
+`tui` 15,102 · `agent` 2,395 (was 118,859 / 34,432 / 15,102 / 2,395 — `ai`
+moved ~3% from a model-catalog-refresh commit; `coding-agent` moved
+&lt;1%; `tui`/`agent` exact). Two independent revalidation passes measured
+`ai` differently (35,501 vs. 37,989) using different `find` globs; 35,501
+is reported here because it matches this document's own stated methodology
+(§ Appendix: `packages/*/src`, excluding the separately-located
+`packages/*/test`), while the higher figure appears to sweep in non-source
+paths under `packages/ai` beyond `src/`.
 
 ---
 
@@ -69,17 +101,27 @@ choice on both sides rather than an accident of maturity.
 `@aws-sdk/client-bedrock-runtime`, `@google/genai`,
 `@mistralai/mistralai`, `openai`, `proxy-agent`, `undici`; `coding-agent`
 adds `zeromq`, `@agentclientprotocol/sdk`, `typebox`, `proper-lockfile`,
-`photon-node`, `jiti`, `marked`, and sixteen more. 463 resolved packages.
+`@silvia-odwyer/photon-node`, `jiti`, `marked`, and sixteen more. 463
+resolved packages.
 Each one is a vendor-maintained implementation of a protocol upstream
 therefore doesn't have to own.
 
 **This project owns its stack down to the syscall.** The entire resolved
-graph is 39 crates, and of those, the only ones not authored by this
-repo's owner are `serde`, `serde_json`, `thiserror`, `windows-sys`, and
-their proc-macro/`libc` transitives. Everything else — the async runtime
-(`rusty_tokio`), the std layer (`rusty_std`), libc bindings
+graph is 39 crates. Most are authored by this repo's owner — the async
+runtime (`rusty_tokio`), the std layer (`rusty_std`), libc bindings
 (`rusty_libc`), Win32 bindings (`rusty_win32`), the platform abstraction
-(`platform-*`) — is first-party.
+(`platform-*`) — but the third-party set is larger than previously stated
+here. **Revalidation correction:** this section previously claimed the
+only non-first-party crates were `serde`, `serde_json`, `thiserror`,
+`windows-sys`, and their proc-macro/`libc` transitives. Reading each
+`[[package]]`'s `source =` field in `Cargo.lock` directly shows that's
+incomplete — `bytes`, `crossbeam-deque`, `crossbeam-epoch`, and
+`crossbeam-utils` are also genuinely third-party, pulled in as transitives
+of the first-party `rusty_tokio`. This was wrong at the document's
+original baseline too, not new drift — the same four crates are present in
+the lockfile at commit `6901258`. The audit-surface claim in the next
+paragraph (39-crate, tractable-afternoon read) still holds numerically,
+but "only four named crates are foreign" undersold it by four.
 
 Three consequences worth naming, because they are the actual trade:
 
@@ -142,15 +184,22 @@ one OS process per child instead of one per tree, and daemon round trips
 on the spawn hot path where upstream has a function call. Upstream gets
 the reverse.
 
-**Notable convergence.** Upstream's newest commit at the compared
-revision (`#1387`, "supervisor-owned rlm spawn ledger as family
-authority") moves family topology — parent/child edges, depths, names —
-out of writer-owned session state and into a supervisor-owned append-only
-JSONL ledger (`modes/daemon/rlm-ledger.ts`). That is a step *toward* this
-project's "the daemon is the authority on family structure" model, from
-the opposite direction. Worth tracking: if upstream keeps moving family
-authority supervisor-ward, this project's topology stops looking like a
-simplification and starts looking like an early arrival.
+**Notable convergence.** Upstream has since added `modes/daemon/rlm-ledger.ts`,
+an append-only JSONL ledger that moves family topology — parent/child
+edges, depths, names — out of writer-owned session state. **Revalidation
+correction:** this was previously described as "supervisor-owned"; reading
+the file shows it is not. Its own header comment states the supervisor
+*and* each session worker hold independent instances over the same file —
+it's daemon-owned and multi-writer, not supervisor-exclusive. (The
+originating PR number could not be re-verified — the upstream clone used
+for this pass is shallow and does not carry that history.) The convergence
+is still real in shape: family topology is moving toward a shared,
+ledger-backed source of truth rather than living solely in writer-owned
+session state, which is a step *toward* this project's "the daemon is the
+authority on family structure" model, from the opposite direction. Worth
+tracking: if upstream keeps moving family authority daemon-ward, this
+project's topology stops looking like a simplification and starts looking
+like an early arrival.
 
 ### 3.2 Scheduler placement: supervisor vs worker
 
@@ -245,7 +294,7 @@ real argument, but a narrower one than a filesystem lease.
 
 | Dimension | `prime-agent` | `rusty_prime_agent` |
 |---|---|---|
-| Public framing | JSONL, versioned envelopes, **v4** | JSONL, `PROTOCOL_VERSION = 1` |
+| Public framing | JSONL, versioned envelopes, **v7** (drifted from v4 since this document's compared revision — `DAEMON_PROTOCOL_VERSION` in `daemon-protocol.ts`) | JSONL, `PROTOCOL_VERSION = 1` |
 | Private framing | **binary**: 4-byte header len + 4-byte payload len + JSON routing header + opaque payload | same JSONL as public |
 | Event cursor | `{generation, sequence}` | `{generation, sequence}` ✅ |
 | Generation identity | random **UUID per supervisor instance**; comparison is identity-equality only, never ordering (`R-PROTO-18`) | `(monotonic `u64` counter, 128 random bits)` pair — see §4.1 |
@@ -375,9 +424,10 @@ Structurally close, which is a good sign for the mirroring effort:
 
 - Both: JSONL transcript, one type-tagged object per line, tree-linked
   via parent pointers, in-place branching without a new file.
-- Upstream addresses entries by `id`/`parentId` with a **closed 15-member
-  entry-type union** and versioned auto-migration (v1 linear → v2 tree →
-  v3 `hookMessage`→`custom`).
+- Upstream addresses entries by `id`/`parentId` with a **closed 14-member
+  entry-type union** (re-verified against current `session-manager.ts`;
+  previously miscounted as 15) and versioned auto-migration (v1 linear →
+  v2 tree → v3 `hookMessage`→`custom`).
 - This project addresses by **`sequence`** with `parent_sequence` +
   `active_leaf_sequence`, and uses a **single flat `TranscriptEntry`**
   with optional fields (`usage`, `child_usage_attributed`,
@@ -408,11 +458,14 @@ concept.
 (`zmtp.rs` + `sha256.rs`), verified byte-exact against a real
 `ipykernel`. Variables and imports persist across calls. The kernel gets
 `rlm(task, name, model)` as a real callable coroutine, `rlm_heartbeat()`,
-`rlm_list_subagents()`, `rlm_delete_subagent()`. Depth limiting
-(`RLM_DEPTH`/`RLM_MAX_DEPTH`, default 1) matches `R-RLM-01`. Child usage
-attribution matches `R-RLM-08`'s shape: a `child_usage_attributed`
-transcript entry carrying target sequence, child usage, and the running
-aggregate.
+`rlm_list_subagents()`, `rlm_delete_subagent()`. Depth limiting matches
+`R-RLM-01`'s default-1 ceiling (`DEFAULT_RLM_MAX_DEPTH: u32 = 1` in
+`session.rs`) — **revalidation correction:** this is set by the
+`--rlm-max-depth` CLI flag, not an `RLM_DEPTH`/`RLM_MAX_DEPTH` environment
+variable as previously stated; no such env var is read anywhere in
+`session.rs`. Child usage attribution matches `R-RLM-08`'s shape: a
+`child_usage_attributed` transcript entry carrying target sequence, child
+usage, and the running aggregate.
 
 Reimplementing ZMTP by hand and getting it byte-exact against a real
 kernel is, on its own terms, the most impressive single piece of
@@ -439,14 +492,22 @@ structurally cannot find (they exist only in upstream source):
   and because this project puts each RLM child in its own worker process
   (§3.1), a wide fan-out spawns *more* processes than upstream's would,
   not fewer.
-- **Control-channel host replies** (`R-RLM-05`): upstream routes
-  host-request admission replies over Jupyter's control channel rather
-  than shell, because IPython processes shell messages serially and a
-  cell awaiting admission would deadlock. Any future in-kernel
-  synchronous host request here inherits that constraint.
 - **Kernel Python resolution / managed venv** (`R-RLM-11`): upstream
   bootstraps a Python 3.11 + `ipykernel` + `prime-agent-runtime` venv via
   `uv`. This project requires the user to have `ipykernel` installed.
+
+**Revalidation correction: control-channel host replies were wrongly
+listed here as upstream-only.** An earlier revision of this section
+included "upstream routes host-request admission replies over Jupyter's
+control channel rather than shell, because IPython processes shell
+messages serially and a cell awaiting admission would deadlock" as
+machinery this project has no analog of. That's wrong: `ipython_runtime.rs`
+already implements the identical mechanism, for the identical reason — its
+own header comment states the control channel "was added specifically to
+carry `comm_open`/`comm_msg` host-request replies without deadlocking a
+running `shell` cell," and the reply is actually sent over control
+(`self.send_control("comm_msg", ...)`). This is parity, not a gap, and the
+other two bullets above should be read as the genuinely upstream-only ones.
 
 ---
 
@@ -454,7 +515,10 @@ structurally cannot find (they exist only in upstream source):
 
 The largest single-subsystem asymmetry, and a genuine architectural fork.
 
-**Upstream:** `packages/ai`, 34,432 LOC in-process. Thirteen provider
+**Upstream:** `packages/ai`, 35,501 LOC in-process as of this revalidation
+pass (drifted from 34,432 at this document's original compared revision —
+a model-catalog-refresh commit; see §1's per-package breakdown for a note
+on a measurement discrepancy between two revalidation passes). Thirteen provider
 implementations (Anthropic, OpenAI Responses/Completions/Codex-Responses,
 Google direct + Vertex, Bedrock, Azure OpenAI Responses, Mistral,
 Cloudflare, Copilot header handling, a `faux` test provider), OAuth,
@@ -489,12 +553,12 @@ than something this project can reason about.
 
 | | `prime-agent` | `rusty_prime_agent` |
 |---|---|---|
-| Interactive | full-screen TUI (`packages/tui`, 15,102 LOC): diff rendering, image display, components | line-oriented REPL (`session repl`) on a hand-rolled raw-mode layer (`termctl.rs`, 261 LOC) with multi-line editing, `@` fuzzy search, Tab completion, image paste, themes (`theme.rs`, 528 LOC) |
+| Interactive | full-screen TUI (`packages/tui`, 16,011 LOC as of this revalidation, up from 15,102): diff rendering, image display, components | line-oriented REPL (`session repl`) on a hand-rolled raw-mode layer (`termctl.rs`, 261 LOC — TTY mode/raw-mode plumbing only) whose editing surface (`client.rs`: `read_raw_line` multi-line input, `complete_repl_line`/`fuzzy_matches` for `@` fuzzy search and Tab completion, `/file` image attach-by-path) and themes (`theme.rs`, 528 LOC) actually implement the features |
 | One-shot | `-p`/`--print` | `-p`/`--print` ✅ (incl. daemon auto-start, piped stdin merge, `--no-session`) |
-| JSON mode | event-per-line | ✅ `--json` output mode |
+| JSON mode | event-per-line | ✅ `--mode json` (previously mis-cited as a `--json` flag; no such flag exists in `cli.rs`) |
 | RPC mode | JSONL over stdin/stdout until EOF | ✅ `session rpc` |
 | ACP mode | `@agentclientprotocol/sdk` | ✅ `src/acp.rs` (526 LOC), bounded schema-verified subset |
-| SDK embedding | `sdk.ts`, non-serializable extension factories | ✅ real `lib.rs` public API (355 LOC), `tests/embedded_session.rs` |
+| SDK embedding | `sdk.ts`, non-serializable extension factories | ✅ real `lib.rs` public API (364 LOC, previously cited as 355), `tests/embedded_session.rs` |
 | Connection abstraction | `AgentConnection` with `Daemon`/`InProcess` implementations and a **test-enforced boundary invariant** | no equivalent named seam; `ToolRuntime` is the one deliberate ports-and-adapters trait |
 
 The connection-boundary invariant is worth calling out as an upstream
@@ -532,7 +596,8 @@ as parity with it.
 Counts are not comparable, but the *strategies* are, and they are
 different in an interesting way.
 
-**Upstream** runs 424 vitest files (157,952 LOC), a contribution gate, a
+**Upstream** runs 424 vitest files (157,952 LOC; 425 files / 158,190 LOC
+as of this revalidation pass — expected drift, not a correction), a contribution gate, a
 binaries build, and — notably — a **`nightly-process-stress.yml`**
 workflow: a dedicated recurring stress test for process/daemon behavior.
 That workflow is the strongest signal in the upstream repo that the
@@ -591,7 +656,9 @@ since each implies a small follow-up.
    `ChildUsageAttribution` carries per-child and aggregate figures. The
    *token* half of the data model is done; only **cost in USD** and the
    `/usage` REPL command itself are actually missing. The bullet should
-   be narrowed accordingly.
+   be narrowed accordingly. **Revalidation: still open** — `PARITY.md`
+   still carries the unnarrowed original claim verbatim as of this pass;
+   the recommendation stands.
 
 2. **Cost, specifically, has no model at all** — and unlike tokens, it
    cannot be built locally, because pricing lives in the provider layer
@@ -599,7 +666,13 @@ since each implies a small follow-up.
    generates a cost catalog in `packages/ai`. Closing `/usage` fully here
    means either teaching `rp-server` to report cost or maintaining a
    pricing table in this repo. Worth deciding explicitly rather than
-   leaving implied.
+   leaving implied. **Revalidation finding:** this is *slightly* less true
+   than stated — `rp_server::ModelCatalogEntry` already carries a raw
+   `pricing: Option<serde_json::Value>` passthrough field (used by `model
+   list --detailed`), which is not a cost-accounting model but does mean
+   provider-side pricing data is already reachable from `rp-server` — one
+   of the two options this finding poses. Worth factoring into the
+   decision, not a reason to close the finding.
 
 3. ~~**`ARCHITECTURE.md`'s scheduler description doesn't flag the
    divergence.**~~ **Closed** — `ARCHITECTURE.md` now has a "Scheduler
@@ -620,9 +693,11 @@ since each implies a small follow-up.
 
 Not "smaller but adequate" — actually better on its own terms:
 
-- **Auditability.** 39 crates, four of them third-party. A full read of
-  everything this binary links is a tractable afternoon. Upstream's 463
-  packages are not.
+- **Auditability.** 39 crates, eight of them third-party (`serde`,
+  `serde_json`, `thiserror`, `windows-sys`, `bytes`, `crossbeam-deque`,
+  `crossbeam-epoch`, `crossbeam-utils` — see §2's revalidation correction).
+  A full read of everything this binary links is a tractable afternoon.
+  Upstream's 463 packages are not.
 - **Cross-platform recovery testing is first-class.** *Every* upstream
   job in all four workflows runs on `ubuntu-latest` — its CI matrix is
   per-package, not per-OS, and even `build-binaries.yml` cross-builds the
@@ -698,3 +773,15 @@ genuinely disjoint). Upstream invariant IDs (`R-ARCH-*`, `R-SUP-*`,
 upstream source where the comparison depended on it — in particular
 `AgentCronScheduler`'s construction site (§3.2), `rlm-ledger.ts` (§3.1),
 and `session-lease.ts` (§3.3).
+
+**Explicit note added during the 2026-08-17 revalidation pass, because
+multiple independent re-readings flagged the same ambiguity:** these
+`R-XXX-NN` strings (and `SG-5`) are this project's own shorthand labels for
+the spec-tree extraction, not literal identifiers that appear in upstream
+source or docs — a repo-wide grep for the pattern in `prime-agent` returns
+zero hits. The *substance* behind every cited ID was independently
+re-verified against real upstream source in this pass (constructor sites,
+doc prose, actual behavior); only the ID string itself is this project's
+paraphrase, not a verbatim citation. Read them as "the invariant this
+project extracted and labeled X," not as "upstream's own name for this
+rule."
