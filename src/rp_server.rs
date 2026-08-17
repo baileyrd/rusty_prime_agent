@@ -134,19 +134,31 @@ fn pick_free_port() -> Result<u16> {
 /// being set in this process's own environment -- see this module's own
 /// doc comment for why that's sufficient to reach the spawned
 /// `rp-server` too.
-const OPTIONAL_PROVIDERS: &[(&str, &str, &str)] = &[
-    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+const OPTIONAL_PROVIDERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "openai",
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+        "openai",
+    ),
     (
         "anthropic",
         "https://api.anthropic.com",
         "ANTHROPIC_API_KEY",
+        "anthropic",
     ),
     (
         "gemini",
         "https://generativelanguage.googleapis.com",
         "GEMINI_API_KEY",
+        "gemini",
     ),
-    ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    (
+        "groq",
+        "https://api.groq.com/openai/v1",
+        "GROQ_API_KEY",
+        "openai",
+    ),
 ];
 
 /// One resolved provider `write_config`/`known_providers`/
@@ -186,11 +198,11 @@ fn custom_provider_api_key_env(name: &str) -> String {
 fn all_providers(state_root: &Path) -> Vec<ProviderEntry> {
     let mut entries: Vec<ProviderEntry> = OPTIONAL_PROVIDERS
         .iter()
-        .map(|(name, base_url, api_key_env)| ProviderEntry {
+        .map(|(name, base_url, api_key_env, kind)| ProviderEntry {
             name: name.to_string(),
             base_url: base_url.to_string(),
             api_key_env: api_key_env.to_string(),
-            kind: "openai".to_string(),
+            kind: kind.to_string(),
         })
         .collect();
     for (name, custom) in crate::providers::load(state_root) {
@@ -605,6 +617,36 @@ mod tests {
             custom_provider_api_key_env("company.proxy"),
             "COMPANY_PROXY_API_KEY"
         );
+    }
+
+    /// The bug this PR fixes: every `OPTIONAL_PROVIDERS` entry used to
+    /// hardcode `kind: "openai"`, so `[providers.anthropic]`/
+    /// `[providers.gemini]` in the generated `provider-config.toml` were
+    /// silently wrong -- `rp-server`'s real Anthropic/Gemini backends
+    /// aren't OpenAI-chat-completions-shaped, so any real
+    /// `--model anthropic/...`/`--model gemini/...` session sent a
+    /// malformed request regardless of whether an API key was
+    /// configured. `groq` staying `"openai"` is correct: it's a real
+    /// OpenAI-compatible endpoint, the same reasoning `providers.rs`'s
+    /// own module doc comment gives for why an arbitrary self-hosted
+    /// custom provider defaults to `kind = "openai"` too.
+    #[test]
+    fn all_providers_gives_each_built_in_provider_its_real_kind() {
+        let root = temp_state_root("all-providers-built-in-kinds");
+        let entries = all_providers(&root);
+        let kind_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("openai"), "openai");
+        assert_eq!(kind_of("anthropic"), "anthropic");
+        assert_eq!(kind_of("gemini"), "gemini");
+        assert_eq!(kind_of("groq"), "openai");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
