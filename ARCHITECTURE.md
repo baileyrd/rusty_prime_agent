@@ -1867,12 +1867,19 @@ thread-creation cost off the client-visible critical path entirely:
 happens well after this. One thread is enough for the common case,
 since sequential requests reuse an already-alive pool thread rather
 than growing it further; a genuine burst can still grow the pool same
-as it always could, just no longer guaranteed to on request one. Same
-`flake-watch` measurement, same 20-run budget: 19/20 clean, one target
-flake hit instead of two. Best of the three measurements, though a
-single 20-run sample is still a small denominator -- read the rate a
-future `flake_runs=50`+ dispatch reports before treating this as fully
-closed.
+as it always could, just no longer guaranteed to on request one.
+
+`flake-watch` measurement, first 20-run pass: 19/20 clean, one target
+flake hit instead of two. A `flake_runs=50` follow-up dispatch to
+tighten the sample hit `flake-watch`'s own 45-minute job timeout mid-run
+(today's runner ran roughly 2x slower per pass than the first
+measurement) and produced no usable number -- cancelled mid-loop, before
+its own summary line ever printed. Re-dispatched at `flake_runs=35`,
+which finished inside budget: 33/35 clean, 2 target-flake hits. Combined
+across both completed measurements: `52/55` clean, `3/55` (5.5%) target
+flake, against `main`'s `2/20` (10%) -- roughly half the rate, not zero.
+Real reduction, not proof of elimination; a wider sample would sharpen
+the confidence interval further before calling this fully closed.
 
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
