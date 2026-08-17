@@ -19,7 +19,18 @@ use crate::error::{Context, HarnessError, Result};
 use crate::paths;
 use crate::protocol::{ScheduleEntry, ScheduleKind};
 
-pub fn read_all(session_dir: &Path) -> Result<Vec<ScheduleEntry>> {
+/// Async: see `catalog::read_session_state`'s doc comment for why every
+/// blocking file read the daemon supervisor's own async handlers and
+/// background loops make -- this included -- has to go through
+/// `spawn_blocking` rather than running inline.
+pub async fn read_all(session_dir: &Path) -> Result<Vec<ScheduleEntry>> {
+    let session_dir = session_dir.to_path_buf();
+    rusty_tokio::spawn_blocking(move || read_all_sync(&session_dir))
+        .await
+        .map_err(|_| HarnessError::protocol(Context::Session, "schedule read task panicked"))?
+}
+
+fn read_all_sync(session_dir: &Path) -> Result<Vec<ScheduleEntry>> {
     let path = paths::schedules_path(session_dir);
     match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text)
@@ -46,8 +57,15 @@ fn new_schedule_id() -> String {
     format!("sched-{nanos:x}")
 }
 
-pub fn add(session_dir: &Path, text: String, kind: ScheduleKind) -> Result<String> {
-    let mut entries = read_all(session_dir)?;
+pub async fn add(session_dir: &Path, text: String, kind: ScheduleKind) -> Result<String> {
+    let session_dir = session_dir.to_path_buf();
+    rusty_tokio::spawn_blocking(move || add_sync(&session_dir, text, kind))
+        .await
+        .map_err(|_| HarnessError::protocol(Context::Session, "schedule add task panicked"))?
+}
+
+fn add_sync(session_dir: &Path, text: String, kind: ScheduleKind) -> Result<String> {
+    let mut entries = read_all_sync(session_dir)?;
     let schedule_id = new_schedule_id();
     let next_fire_ms = match kind {
         ScheduleKind::Once { at_ms } => at_ms,
@@ -64,8 +82,16 @@ pub fn add(session_dir: &Path, text: String, kind: ScheduleKind) -> Result<Strin
     Ok(schedule_id)
 }
 
-pub fn cancel(session_dir: &Path, schedule_id: &str) -> Result<bool> {
-    let mut entries = read_all(session_dir)?;
+pub async fn cancel(session_dir: &Path, schedule_id: &str) -> Result<bool> {
+    let session_dir = session_dir.to_path_buf();
+    let schedule_id = schedule_id.to_string();
+    rusty_tokio::spawn_blocking(move || cancel_sync(&session_dir, &schedule_id))
+        .await
+        .map_err(|_| HarnessError::protocol(Context::Session, "schedule cancel task panicked"))?
+}
+
+fn cancel_sync(session_dir: &Path, schedule_id: &str) -> Result<bool> {
+    let mut entries = read_all_sync(session_dir)?;
     let before = entries.len();
     entries.retain(|e| e.schedule_id != schedule_id);
     let found = entries.len() != before;
@@ -83,8 +109,15 @@ pub fn cancel(session_dir: &Path, schedule_id: &str) -> Result<bool> {
 /// on disk before the caller does anything that could itself fail (a
 /// worker that's slow to respond must not cause the same entry to fire
 /// twice on the next poll).
-pub fn take_due(session_dir: &Path, now_ms: u64) -> Result<Vec<(String, String)>> {
-    let mut entries = read_all(session_dir)?;
+pub async fn take_due(session_dir: &Path, now_ms: u64) -> Result<Vec<(String, String)>> {
+    let session_dir = session_dir.to_path_buf();
+    rusty_tokio::spawn_blocking(move || take_due_sync(&session_dir, now_ms))
+        .await
+        .map_err(|_| HarnessError::protocol(Context::Session, "schedule due-check task panicked"))?
+}
+
+fn take_due_sync(session_dir: &Path, now_ms: u64) -> Result<Vec<(String, String)>> {
+    let mut entries = read_all_sync(session_dir)?;
     if entries.is_empty() {
         return Ok(Vec::new());
     }

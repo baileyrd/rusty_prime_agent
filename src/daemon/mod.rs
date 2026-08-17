@@ -90,6 +90,23 @@ pub struct Supervisor {
 pub async fn run(state_root: PathBuf, exe_path: PathBuf) -> Result<()> {
     paths::ensure_dir(Context::Daemon, &state_root)?;
     paths::ensure_dir(Context::Daemon, &paths::sessions_dir(&state_root))?;
+
+    // Pre-warm `rusty_tokio`'s blocking-thread pool with one thread
+    // before any real work needs it. `spawn_blocking` grows that pool
+    // by calling `std::thread::Builder::spawn()` *inline, on whatever
+    // thread called it* -- see `catalog::read_session_state`'s own doc
+    // comment. Every daemon here is a brand-new process with a cold
+    // pool, so without this, the very first `catalog`/`schedule` read
+    // (including the one two lines down, in `recover_on_startup`) pays
+    // that thread-creation cost on an async worker thread. Paying it
+    // here instead is free in the way that matters: `client::
+    // DAEMON_READY_TIMEOUT`'s `wait_ready` poll is already waiting on
+    // `daemon.sock` to bind, which happens well after this, so nothing
+    // client-visible is timed yet. One thread is enough for the common
+    // case (sequential requests reuse it without growing further); a
+    // genuine burst can still grow the pool same as before, just no
+    // longer guaranteed to on request one.
+    let _ = rusty_tokio::spawn_blocking(|| {}).await;
     let generation = record_daemon_pid(&state_root)?;
 
     let supervisor = Arc::new(Supervisor {
@@ -327,7 +344,7 @@ impl Supervisor {
     /// session's respawn failing must not stop the supervisor from
     /// coming up and serving every other session.
     async fn recover_on_startup(&self) {
-        let summaries = match catalog::scan(&self.state_root) {
+        let summaries = match catalog::scan(&self.state_root).await {
             Ok(s) => s,
             Err(err) => {
                 eprintln!("daemon: startup recovery scan failed: {err}");
@@ -384,7 +401,7 @@ impl Supervisor {
         // hypothetical: the wait could reach `WORKER_READY_TIMEOUT`
         // while the answer ("it's alive, here's the socket") was already
         // known and cost a single `read_session_state`.
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir).await?;
         if is_worker_alive(&state)? {
             return Ok(socket_path);
         }
@@ -399,7 +416,7 @@ impl Supervisor {
         // just started. The state file is the shared truth here, so it
         // has to be re-read -- `state` above is a snapshot from before
         // we waited.
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir).await?;
         if is_worker_alive(&state)? {
             return Ok(socket_path);
         }
@@ -655,7 +672,8 @@ impl Supervisor {
     }
 
     async fn handle_daemon_status(&self, conn: &mut LineStream) -> Result<()> {
-        let sessions_active = catalog::scan(&self.state_root)?
+        let sessions_active = catalog::scan(&self.state_root)
+            .await?
             .iter()
             .filter(|s| s.status == SessionStatus::Active)
             .count();
@@ -673,7 +691,7 @@ impl Supervisor {
 
     async fn handle_daemon_shutdown(&self, conn: &mut LineStream, force: bool) -> Result<()> {
         if !force {
-            let sessions = catalog::scan(&self.state_root)?;
+            let sessions = catalog::scan(&self.state_root).await?;
             for summary in sessions
                 .iter()
                 .filter(|s| s.status == SessionStatus::Active)
@@ -739,7 +757,7 @@ impl Supervisor {
                     )
                     .await;
             }
-            let parent_state = catalog::read_session_state(Context::Daemon, &parent_dir)?;
+            let parent_state = catalog::read_session_state(Context::Daemon, &parent_dir).await?;
             meta.rlm_depth = Some(parent_state.rlm_depth + 1);
             meta.rlm_max_depth = Some(parent_state.rlm_max_depth);
         } else {
@@ -961,7 +979,7 @@ impl Supervisor {
     }
 
     async fn handle_session_list(&self, conn: &mut LineStream) -> Result<()> {
-        let sessions = catalog::scan(&self.state_root)?;
+        let sessions = catalog::scan(&self.state_root).await?;
         conn.write_response(Context::Daemon, &Response::SessionList { sessions })
             .await
     }
@@ -973,7 +991,7 @@ impl Supervisor {
         text: String,
         kind: crate::protocol::ScheduleKind,
     ) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -986,13 +1004,13 @@ impl Supervisor {
                 )
                 .await;
         }
-        let schedule_id = crate::schedule::add(&session_dir, text, kind)?;
+        let schedule_id = crate::schedule::add(&session_dir, text, kind).await?;
         conn.write_response(Context::Daemon, &Response::ScheduleAdded { schedule_id })
             .await
     }
 
     async fn handle_schedule_list(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1005,7 +1023,7 @@ impl Supervisor {
                 )
                 .await;
         }
-        let entries = crate::schedule::read_all(&session_dir)?;
+        let entries = crate::schedule::read_all(&session_dir).await?;
         conn.write_response(Context::Daemon, &Response::ScheduleList { entries })
             .await
     }
@@ -1016,7 +1034,7 @@ impl Supervisor {
         session_id: String,
         schedule_id: String,
     ) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1029,7 +1047,7 @@ impl Supervisor {
                 )
                 .await;
         }
-        let found = crate::schedule::cancel(&session_dir, &schedule_id)?;
+        let found = crate::schedule::cancel(&session_dir, &schedule_id).await?;
         conn.write_response(Context::Daemon, &Response::ScheduleCancelAck { found })
             .await
     }
@@ -1039,7 +1057,7 @@ impl Supervisor {
     /// same reasoning as `recover_on_startup`: one session's schedule
     /// misbehaving must not stop every other session's from firing.
     async fn fire_due_schedules(&self) {
-        let summaries = match catalog::scan(&self.state_root) {
+        let summaries = match catalog::scan(&self.state_root).await {
             Ok(s) => s,
             Err(err) => {
                 eprintln!("daemon: schedule scan failed: {err}");
@@ -1049,7 +1067,7 @@ impl Supervisor {
         let now = paths::now_ms();
         for summary in summaries {
             let session_dir = paths::session_dir(&self.state_root, &summary.session_id);
-            let due = match crate::schedule::take_due(&session_dir, now) {
+            let due = match crate::schedule::take_due(&session_dir, now).await {
                 Ok(d) => d,
                 Err(err) => {
                     eprintln!(
@@ -1092,7 +1110,7 @@ impl Supervisor {
     /// already absorbed the real attribution -- see `PARITY.md`'s own
     /// entry for why this was accepted rather than engineered around.
     async fn attribute_pending_child_usage(&self) {
-        let summaries = match catalog::scan(&self.state_root) {
+        let summaries = match catalog::scan(&self.state_root).await {
             Ok(s) => s,
             Err(err) => {
                 eprintln!("daemon: child-usage-attribution scan failed: {err}");
@@ -1196,12 +1214,12 @@ impl Supervisor {
     /// prefix and a genuinely unknown one end up reported identically,
     /// a real but bounded imprecision, not a distinction this bounded
     /// slice attempts).
-    fn resolve_session_id(&self, partial: &str) -> String {
+    async fn resolve_session_id(&self, partial: &str) -> String {
         let session_dir = paths::session_dir(&self.state_root, partial);
         if paths::state_file_path(&session_dir).exists() {
             return partial.to_string();
         }
-        let Ok(sessions) = catalog::scan(&self.state_root) else {
+        let Ok(sessions) = catalog::scan(&self.state_root).await else {
             return partial.to_string();
         };
         let mut matches = sessions
@@ -1227,7 +1245,7 @@ impl Supervisor {
         conn: &mut LineStream,
         session_id: &str,
     ) -> Result<Option<PathBuf>> {
-        let session_id = &self.resolve_session_id(session_id);
+        let session_id = &self.resolve_session_id(session_id).await;
         let session_dir = paths::session_dir(&self.state_root, session_id);
         if !paths::state_file_path(&session_dir).exists() {
             conn.write_response(
@@ -1295,7 +1313,7 @@ impl Supervisor {
     /// could observe "no live worker" just before the other request
     /// finishes spawning one, then never stop it.
     async fn handle_session_stop(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1309,7 +1327,7 @@ impl Supervisor {
                 .await;
         }
         let _guard = self.spawn_lock.lock().await;
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir).await?;
         if !is_worker_alive(&state)? {
             return conn
                 .write_response(
@@ -1584,7 +1602,7 @@ impl Supervisor {
     }
 
     async fn handle_goal_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1597,7 +1615,7 @@ impl Supervisor {
                 )
                 .await;
         }
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir).await?;
         conn.write_response(Context::Daemon, &Response::GoalShow { goal: state.goal })
             .await
     }
@@ -1632,7 +1650,7 @@ impl Supervisor {
     }
 
     async fn handle_harness_show(&self, conn: &mut LineStream, session_id: String) -> Result<()> {
-        let session_id = self.resolve_session_id(&session_id);
+        let session_id = self.resolve_session_id(&session_id).await;
         let session_dir = paths::session_dir(&self.state_root, &session_id);
         if !paths::state_file_path(&session_dir).exists() {
             return conn
@@ -1645,7 +1663,7 @@ impl Supervisor {
                 )
                 .await;
         }
-        let state = catalog::read_session_state(Context::Daemon, &session_dir)?;
+        let state = catalog::read_session_state(Context::Daemon, &session_dir).await?;
         conn.write_response(
             Context::Daemon,
             &Response::HarnessShow {

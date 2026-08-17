@@ -1806,6 +1806,101 @@ check is repeated under the lock, re-reading `state.json` rather than
 trusting the pre-lock snapshot, since dropping that second read would
 trade the queueing problem for a double-spawn.
 
+**The same message kept appearing after both of the above landed,
+at roughly the same rate.** Neither fix (the inversion or `spawn_lock`'s
+ordering) touched the actual bottleneck, because there wasn't a budget
+problem left to fix -- there was a scheduling one. `catalog::scan`/
+`catalog::read_session_state` (session listing, `GoalShow`, the
+liveness check inside `ensure_worker_running`, both background loops)
+and `schedule.rs`'s four functions ran a synchronous `std::fs` call
+directly inside an async handler, on this process's small
+(`available_parallelism()`-sized) `rusty_tokio` executor -- unlike every
+*write* path (`session::write_state`, `request_journal`), which already
+went through `spawn_blocking`. A blocking syscall fully occupies the OS
+thread it runs on for its whole duration; there is no cooperative
+preemption for that, only for CPU-bound work between `.await` points.
+Proven directly against the pinned `rusty_tokio` rev: occupying every
+worker thread with a 300ms blocking call delays an unrelated concurrent
+task's response by the same ~300ms, on a 2- or 4-thread runtime alike;
+moving that same work into `spawn_blocking` drops the delay to
+microseconds. Landing a request while every one of a daemon's few
+worker threads happens to be blocked this way -- realistic under this
+project's own full test suite, which runs dozens of daemons/workers
+doing real file I/O at once -- starves the executor entirely: no task,
+including an already-open client connection's own response, can run
+until a thread frees up. Past `RESPONSE_TIMEOUT`, that reads as `daemon
+did not respond in time` even though the daemon was never dead. The
+"sustained request loop" tests (`session autonomous`'s tight per-turn
+loop, `session repl`'s per-line dispatch, `wait_until`'s 25ms-interval
+polling of `session list`) are disproportionately affected because each
+one raises the number of near-simultaneous requests against a single
+daemon, which raises the odds a request lands during exactly this
+window. Fixed by routing every read in `catalog.rs`/`schedule.rs`
+through `spawn_blocking`, the same way the write paths already did --
+see those modules' own doc comments.
+
+**First attempt at this fix measured worse, and was reverted before it
+was understood why.** `rusty_tokio`'s `spawn_blocking` grows its
+blocking-thread pool by calling `std::thread::Builder::spawn()`
+synchronously, inline, on whatever thread called `spawn_blocking` --
+i.e. on one of this process's own async worker threads, the exact
+resource this fix protects. Every test here spins a brand-new,
+short-lived daemon process, so that pool starts cold every time;
+routing `catalog.rs`/`schedule.rs`'s reads through it without warming
+it first meant nearly every request in nearly every test had a real
+chance of paying an OS thread-creation cost on the request path that
+the original direct-inline read never did -- multiplied across the ~30
+test binaries `flake-watch` runs concurrently, more total
+thread-creation activity contending for the same constrained runner,
+not less blocking-on-the-executor. Measured on `nightly-stress`'s own
+`flake-watch` job before landing (the same discipline this document
+asks of every claim in this section): 16/20 clean on `main`, 13/20
+clean with the unwarmed fix -- worse, and not merely unclaimed to be
+better.
+
+**Fixed properly by pre-warming the pool once, at supervisor startup,
+before `recover_on_startup`'s own first read** (`daemon::run`, right
+after the state directories are created) -- `let _ =
+rusty_tokio::spawn_blocking(|| {}).await;`. That pays the one
+thread-creation cost off the client-visible critical path entirely:
+`client::wait_ready`'s poll is waiting on `daemon.sock` to bind, which
+happens well after this. One thread is enough for the common case,
+since sequential requests reuse an already-alive pool thread rather
+than growing it further; a genuine burst can still grow the pool same
+as it always could, just no longer guaranteed to on request one.
+
+`flake-watch` measurement, first 20-run pass: 19/20 clean, one target
+flake hit instead of two. A `flake_runs=50` follow-up dispatch to
+tighten the sample hit `flake-watch`'s own 45-minute job timeout mid-run
+(today's runner ran roughly 2x slower per pass than the first
+measurement) and produced no usable number -- cancelled mid-loop, before
+its own summary line ever printed. Re-dispatched at `flake_runs=35`,
+which finished inside budget: 33/35 clean, 2 target-flake hits. Combined
+across both completed measurements: `52/55` clean, `3/55` (5.5%) target
+flake, against `main`'s `2/20` (10%) -- roughly half the rate, not zero.
+Real reduction, not proof of elimination; a wider sample would sharpen
+the confidence interval further before calling this fully closed.
+
+**What the residual `3/55` actually is, named rather than left as an
+unexplained rate.** All three: `repl_refine_command_adds_a_harness_note`
+(`session repl`, a line queued behind an in-flight reply),
+`autonomous_stops_at_max_turns_and_leaves_the_goal_active` (`session
+autonomous`'s tight per-turn loop), and
+`repl_heartbeat_every_with_an_active_goal_creates_a_recurring_schedule`
+(`session repl` plus a firing schedule). Not a scatter of unrelated
+tests -- every one is still the same "sustained request loop against one
+daemon" class this investigation started from. The fs-blocking-in-async
+bug above was *a* cause in that class, not the only one: what is left
+is a fixed 5-second client deadline occasionally losing a genuine race
+against dozens of real daemon/worker processes contending for a handful
+of vCPUs on a shared `ubuntu-latest` runner. Closing it further means
+either widening `RESPONSE_TIMEOUT` (ruled out on principle -- masks
+rather than fixes) or reducing what these specific loops ask of the
+daemon per turn (e.g. batching the repeated `GoalShow`/`session list`
+calls `session autonomous`/`wait_until`-style polling issues), which is
+unverified until it is measured the same way this section's other
+claims were.
+
 **Failure surfacing.** A rejection is a `Conflict`, and
 `handle_public_connection` converts a `Conflict` into a terminal
 `Response::Error` so the client is told what happened rather than
