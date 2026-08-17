@@ -672,7 +672,8 @@ impl Supervisor {
     }
 
     async fn handle_daemon_status(&self, conn: &mut LineStream) -> Result<()> {
-        let sessions_active = catalog::scan(&self.state_root).await?
+        let sessions_active = catalog::scan(&self.state_root)
+            .await?
             .iter()
             .filter(|s| s.status == SessionStatus::Active)
             .count();
